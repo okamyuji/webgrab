@@ -11,5 +11,6 @@ pub mod netguard;
 pub mod output;
 pub mod pipeline;
 pub mod render;
+pub mod renderproxy;
 pub mod robots;
 pub mod tokens;

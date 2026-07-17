@@ -2,24 +2,93 @@
 
 use crate::error::{ExitCode, Result, WebgrabError};
 
-/// HTMLをMarkdownへ変換する。
+/// HTMLをMarkdownへ変換する。危険なリンクスキームは無害化する。
 pub fn to_markdown(html: &str) -> Result<String> {
-    htmd::convert(html).map_err(|e| {
+    let md = htmd::convert(html).map_err(|e| {
         WebgrabError::new(ExitCode::Internal, "markdown convert failed").with_detail(e.to_string())
-    })
+    })?;
+    Ok(sanitize_link_schemes(&md))
+}
+
+/// Markdownリンク/画像ターゲット `](...)` のうち、クリックでスクリプトが走りうる
+/// 実行系スキームだけを`unsafe-`接頭辞で無害化する（A03）。通常のURLや
+/// `data:image/png`等の非実行データURLはそのまま残す。
+fn sanitize_link_schemes(md: &str) -> String {
+    const DANGER: &[&str] = &[
+        "javascript:",
+        "vbscript:",
+        "data:text/html",
+        "data:image/svg+xml",
+    ];
+    let mut out = String::with_capacity(md.len());
+    let mut rest = md;
+    while let Some(pos) = rest.find("](") {
+        out.push_str(&rest[..pos + 2]);
+        let after = &rest[pos + 2..];
+        let lower = after.to_ascii_lowercase();
+        if DANGER.iter().any(|d| lower.starts_with(d)) {
+            out.push_str("unsafe-");
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// HTMLからタグを除去したプレーンテキストを得る（--format text用）。
-/// Markdownへ変換した後、記法記号を最小限そのまま残す簡易実装。
+/// Markdownへ変換した後、行頭の見出し/引用/箇条書きの「記法」だけを落とす。
+/// 本文そのものが `--` や `###` で始まる場合は削らない（データ欠損防止）。
 pub fn to_text(html: &str) -> Result<String> {
-    // htmdのMarkdownを土台に、行頭の見出し記号・強調記号を軽く落とす。
     let md = to_markdown(html)?;
     let text = md
         .lines()
-        .map(|l| l.trim_start_matches(['#', '>', '-', '*', ' ']))
+        .map(clean_text_line)
         .collect::<Vec<_>>()
         .join("\n");
     Ok(text)
+}
+
+/// 1行から行頭のMarkdown記法のみを除去し、htmdの行頭エスケープを1つ解除する。
+fn clean_text_line(line: &str) -> String {
+    let t = line.trim_start_matches(' ');
+    let stripped = if let Some(r) = strip_atx_heading(t) {
+        r
+    } else if let Some(r) = t.strip_prefix("> ") {
+        r
+    } else if let Some(r) = t
+        .strip_prefix("- ")
+        .or_else(|| t.strip_prefix("* "))
+        .or_else(|| t.strip_prefix("+ "))
+    {
+        r.trim_start_matches(' ')
+    } else {
+        t
+    };
+    unescape_leading_backslash(stripped)
+}
+
+/// `#`×1-6 + 空白 で始まる見出しなら、記号を除いた本文を返す。
+fn strip_atx_heading(s: &str) -> Option<&str> {
+    let hashes = s.chars().take_while(|&c| c == '#').count();
+    if (1..=6).contains(&hashes) && s[hashes..].starts_with(' ') {
+        Some(s[hashes..].trim_start_matches(' '))
+    } else {
+        None
+    }
+}
+
+/// htmdが記法衝突回避のため付与した行頭の `\`（直後がASCII記号）を1つだけ外す。
+fn unescape_leading_backslash(s: &str) -> String {
+    let mut chars = s.chars();
+    if chars.next() == Some('\\')
+        && chars
+            .clone()
+            .next()
+            .is_some_and(|c| c.is_ascii_punctuation())
+    {
+        return s[1..].to_string();
+    }
+    s.to_string()
 }
 
 #[cfg(test)]
@@ -36,6 +105,30 @@ mod tests {
     }
 
     #[test]
+    fn dangerous_link_schemes_neutralized() {
+        // クリックでスクリプト実行しうるスキームだけ無害化（A03）。
+        let md = to_markdown(r#"<a href="javascript:alert(1)">x</a>"#).unwrap();
+        assert!(md.contains("](unsafe-javascript:"), "js未無害化: {md}");
+        assert!(!md.contains("](javascript:"));
+
+        let md2 = to_markdown(r#"<a href="VBScript:msgbox(1)">y</a>"#).unwrap();
+        assert!(md2.to_ascii_lowercase().contains("](unsafe-vbscript:"));
+
+        let md3 = to_markdown(r#"<a href="data:text/html,<script>1</script>">z</a>"#).unwrap();
+        assert!(md3.contains("](unsafe-data:text/html"));
+    }
+
+    #[test]
+    fn safe_links_and_data_images_untouched() {
+        let md = to_markdown(r#"<a href="https://ok.test/p">o</a>"#).unwrap();
+        assert!(md.contains("](https://ok.test/p)"));
+        assert!(!md.contains("unsafe-"));
+        // data:image/png は実行系でないため触らない
+        let md2 = to_markdown(r#"<img src="data:image/png;base64,iVBORw0KGgo=">"#).unwrap();
+        assert!(!md2.contains("unsafe-"), "data:imageを誤って無害化: {md2}");
+    }
+
+    #[test]
     fn converts_table() {
         let html = "<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>";
         let md = to_markdown(html).unwrap();
@@ -49,5 +142,30 @@ mod tests {
         let t = to_text(html).unwrap();
         assert!(t.contains("Title"));
         assert!(!t.contains("# Title"));
+    }
+
+    #[test]
+    fn text_preserves_literal_leading_dashes() {
+        // 本文が "--" で始まる場合に先頭が削られないこと（データ欠損の回帰ガード）。
+        let html = "<p>-- END OF REPORT --</p>";
+        let t = to_text(html).unwrap();
+        assert!(t.contains("-- END OF REPORT --"), "先頭が欠損: {t:?}");
+    }
+
+    #[test]
+    fn text_unescapes_leading_backslash() {
+        // htmdが付与した行頭エスケープ "\#" 等の生バックスラッシュを残さない。
+        let html = "<p>### literal text</p>";
+        let t = to_text(html).unwrap();
+        assert!(!t.contains('\\'), "バックスラッシュ残存: {t:?}");
+        assert!(t.contains("### literal text"), "本文欠損: {t:?}");
+    }
+
+    #[test]
+    fn text_strips_list_marker() {
+        let html = "<ul><li>item one</li></ul>";
+        let t = to_text(html).unwrap();
+        assert!(t.contains("item one"));
+        assert!(!t.trim_start().starts_with('*'));
     }
 }

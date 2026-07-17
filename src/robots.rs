@@ -69,32 +69,33 @@ impl Robots {
         }
         flush(&mut groups, &mut cur_agents, &mut cur_rules);
 
-        // 製品トークン一致グループを優先、無ければ `*` グループ
-        let mut chosen: Option<Vec<Rule>> = None;
-        for (agents, rules) in &groups {
-            if agents.iter().any(|a| a == PRODUCT_TOKEN) {
-                chosen = Some(rules.clone());
-                break;
-            }
-        }
-        if chosen.is_none() {
-            for (agents, rules) in &groups {
-                if agents.iter().any(|a| a == "*") {
-                    chosen = Some(rules.clone());
-                    break;
-                }
-            }
-        }
-        Robots {
-            rules: chosen.unwrap_or_default(),
-        }
+        // 製品トークン一致グループを優先、無ければ `*` グループ。
+        // RFC 9309 §2.2.1: 同一UAにマッチする全グループのルールを結合(union)する。
+        // 一致グループが存在すれば（規則ゼロでも）それを採用し、`*`へはフォールバックしない。
+        let matching = |token: &str| -> Option<Vec<Rule>> {
+            let mut found = false;
+            let rules: Vec<Rule> = groups
+                .iter()
+                .filter(|(agents, _)| agents.iter().any(|a| a == token))
+                .inspect(|_| found = true)
+                .flat_map(|(_, rules)| rules.iter().cloned())
+                .collect();
+            found.then_some(rules)
+        };
+        let chosen = matching(PRODUCT_TOKEN)
+            .or_else(|| matching("*"))
+            .unwrap_or_default();
+        Robots { rules: chosen }
     }
 
     /// パスが取得許可されているか。最長一致・同長Allow優先。
     pub fn allowed(&self, path: &str) -> bool {
+        // RFC 9309 §2.2.2: percent-encodingを正規化してから比較する。
+        let path = percent_decode(path);
         let mut best: Option<(&Rule, usize)> = None;
         for r in &self.rules {
-            if let Some(len) = match_len(&r.pattern, path) {
+            let pattern = percent_decode(&r.pattern);
+            if let Some(len) = match_len(&pattern, &path) {
                 let better = match best {
                     None => true,
                     Some((cur, cur_len)) => {
@@ -111,6 +112,28 @@ impl Robots {
             Some((r, _)) => r.allow,
         }
     }
+}
+
+/// `%XX` を対応バイトへデコードし、UTF-8としてロス変換する（RFC 9309 §2.2.2の正規化）。
+/// 不正な `%` シーケンスはそのまま残す。`*`/`$` はそもそもエンコードされないため保持される。
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// パターンがpathの先頭にマッチするか。マッチすればマッチした「特異度」
@@ -242,5 +265,38 @@ mod tests {
     fn no_matching_group_allows_all() {
         let r = Robots::parse("User-agent: googlebot\nDisallow: /");
         assert!(r.allowed("/anything")); // webgrabにも*にも該当グループなし
+    }
+
+    #[test]
+    fn same_agent_multiple_groups_are_merged() {
+        // RFC 9309 §2.2.1: 同一UAの複数グループはunionされる。
+        let txt = "User-agent: webgrab\nDisallow: /a\n\nUser-agent: webgrab\nDisallow: /b";
+        let r = Robots::parse(txt);
+        assert!(!r.allowed("/a/x"), "1つ目のグループのDisallowが効くべき");
+        assert!(
+            !r.allowed("/b/x"),
+            "2つ目のグループのDisallowも結合されるべき"
+        );
+    }
+
+    #[test]
+    fn same_star_group_multiple_are_merged() {
+        let txt = "User-agent: *\nDisallow: /a\n\nUser-agent: *\nDisallow: /b";
+        let r = Robots::parse(txt);
+        assert!(!r.allowed("/a/x"));
+        assert!(!r.allowed("/b/x"));
+    }
+
+    #[test]
+    fn percent_encoded_path_normalized() {
+        // RFC 9309 §2.2.2: percent-encodingを正規化して比較する。
+        let r = Robots::parse("User-agent: *\nDisallow: /caf%C3%A9");
+        assert!(
+            !r.allowed("/café"),
+            "percent-encodedパターンは生UTF-8パスと一致すべき"
+        );
+        // 逆方向: パスがpercent-encoded、パターンが生
+        let r2 = Robots::parse("User-agent: *\nDisallow: /café");
+        assert!(!r2.allowed("/caf%C3%A9"));
     }
 }

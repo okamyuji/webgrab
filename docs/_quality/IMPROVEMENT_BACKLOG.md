@@ -61,6 +61,42 @@
 - L1 tests/integration.rsのfmt差分→ cargo fmt適用
 - L2 netguardのis_broadcast追加拒否→ 安全側の追加として記録のみ（変更なし）
 
+## 実装敵対的レビュー Round 2（2026-07-18、複数rust-reviewer + セキュリティ視点）
+
+判定Block。OWASP対応（A03:Injection / A10:SSRF）と確認済みバグを修正、各々に回帰テスト新設。全90テスト・clippy緑。
+
+### 修正済み（テスト付き）
+
+- [CRITICAL/A10] netguard: 6to4/NAT64/Teredoに埋め込まれた内部IPv4、及びマルチキャスト(224/4, ff00::/8)・予約(240/4)未拒否 → `embedded_v4`と判定追加。テスト`embedded_v4_transitions_denied`他
+- [CRITICAL] robots: 同一UAの複数グループが非結合でDisallow無視（RFC 9309 §2.2.1違反）→ union実装。テスト`same_agent_multiple_groups_are_merged`
+- [CRITICAL/A10] render: DNS解決失敗時fail-open → fail-closedに（fetchと対称）。テスト`unresolvable_host_is_fail_closed`他
+- [CRITICAL] extract: 深いネストHTMLでdom_smoothieが3乗的にハング(DoS) → 線形の深さガード(上限1000)。テスト`deeply_nested_html_is_rejected_fast`
+- [CRITICAL/A03] output: 本文中のESC/OSC等C0制御文字が素通しで端末インジェクション → `strip_terminal_controls`。テスト`body_terminal_escapes_stripped`
+- [CRITICAL/A10] render: DNSリバインディングTOCTOU完全対処 → 検証・IPピン留めローカルプロキシ`src/renderproxy.rs`を新設し、`--proxy-server`+`--proxy-bypass-list=<-loopback>`でChromeの全接続（loopback含む）を経由させ、プロキシ側で解決→netguard判定→検証済みIPへ接続固定。Chromeに再解決させないため原理的にTOCTOUを閉じる。単体8テスト+実機検証（metadata宛exit 8遮断／example.com正常レンダリング）
+- [HIGH/A03] output: 非信頼titleの改行でfrontmatter YAMLキー/markdown偽メタ行を注入 → `sanitize_line`+`yaml_scalar`。テスト`frontmatter_title_newline_injection_neutralized`他
+- [HIGH/A03] budget: 継続コマンドのURL未クォートでコピペ時シェル誤動作/注入 → `shell_quote`。テスト`continue_command_quotes_url_with_query_string`
+- [HIGH] output: `--max-chars 0`で自己参照する継続コマンド生成→LLM無限ループ → メタのみ時フッタ抑止。テスト`max_chars_zero_has_no_self_referential_continue`
+- [HIGH] fetch: robots.txt取得が`resp.bytes()`でメモリ非上限(DoS) → ストリーミング上限`read_capped_robots`
+- [HIGH] robots: percent-encoding非正規化で拒否対象を許可 → `percent_decode`で正規化。テスト`percent_encoded_path_normalized`
+- [MEDIUM] decode: `<meta>`外の`charset=`(canonicalリンク等)を誤採用し本文文字化け → `<meta>`タグ内限定走査。テスト`charset_in_non_meta_tag_is_ignored`
+- [MEDIUM] decode: BOM上書き後の返却エンコーディング名が実態と不一致 → `decode`の第2戻り値を返却。テスト`bom_overrides_declared_encoding_and_label_matches`
+- [MEDIUM] fetch: Content-Type大小区別で`TEXT/HTML`を誤拒否 → `is_supported_media_type`で小文字化。テスト`media_type_check_is_case_insensitive`
+- [MEDIUM] convert: `to_text`が本文先頭の`--`/`###`を誤除去しデータ欠損 → 記法プレフィックス限定除去+行頭バックスラッシュ解除。テスト`text_preserves_literal_leading_dashes`他
+
+### 設計整合（2026-07-18、機能追加系）→ 対応済み（テスト+実機確認）
+
+- [HIGH/DoS] render経路の`--max-bytes`適用 → SSRFプロキシで全接続のダウンロード総量を計上し超過を終了コード4に。実機確認（`--max-bytes 500`でexit 4）。設計§3.1・パラメータ表を更新
+- [MEDIUM] 設計§5「短い本文」stdoutマーカー → 全形式で本文末尾に`[webgrab:short-content N chars — …]`を付与（jsonは`short_content`フィールド）。テスト`short_content_marker_appended_markdown_and_json`+ローカルサーバ実機確認（chars=98）
+- [MEDIUM] 設計§7「文字コード判定失敗時のstderr警告」 → `decode`が`had_errors`を返し、pipelineが`warn=decode-replacement`を出力。テスト`invalid_bytes_report_had_errors`+実機確認（Shift_JISをUTF-8偽装で警告発火）
+- [LOW] 未使用依存`thiserror`をCargo.tomlから削除、設計§4のerror.rs注記を「手書き実装」に修正。あわせてrenderproxyが直接使う`tokio`の`net`/`io-util` featureを明示追加
+- 設計文書の整合: Content-Type大小無視・要素ネスト深さ上限（終了コード4）を§7異常系表に明記
+
+### 残3点（2026-07-18、過剰にしない最小設計で対応）→ 対応済み（テスト+実機確認）
+
+- [MEDIUM] `--render`時のrobots非対称 → `fetch::robots_precheck`を追加し、renderの前にトップURLのrobots.txtを確認（静的経路と同じ範囲、`--no-robots`でスキップ）。実機確認（全拒否robotsで`--render`→exit 5、`--no-robots`→exit 0）
+- [MEDIUM/A03] 危険スキームリンク → `convert::sanitize_link_schemes`で`javascript:`/`vbscript:`/`data:text/html`/`data:image/svg+xml`のみ`unsafe-`接頭辞化。通常URL・`data:image/png`は不変。テスト`dangerous_link_schemes_neutralized`/`safe_links_and_data_images_untouched`+実機確認
+- [LOW] DNS解決ハング → `resolve_checked`のgetaddrinfoを`--timeout`で囲む。無応答DNSでの無期限ハングを防止（超過は終了コード3）
+
 ## 依存の注記（2026-07-17）
 
 - 直接依存はすべて最新。transitiveのgeneric-array 0.14.7のみ上流のsemver制約で0.14.9より後方（cargo update --verboseで確認）

@@ -34,6 +34,37 @@ fn v4_compatible(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     }
 }
 
+fn seg_pair_to_v4(hi: u16, lo: u16) -> Ipv4Addr {
+    Ipv4Addr::new(
+        (hi >> 8) as u8,
+        (hi & 0xff) as u8,
+        (lo >> 8) as u8,
+        (lo & 0xff) as u8,
+    )
+}
+
+/// IPv6遷移アドレスに埋め込まれたIPv4を抽出する（SSRFバイパス対策）。
+/// 6to4(2002::/16)・NAT64 well-known(64:ff9b::/96)・Teredo(2001:0::/32)。
+/// Teredoのクライアントアドレスは0xffffでXOR難読化されているため復号する。
+fn embedded_v4(v6: Ipv6Addr) -> Vec<Ipv4Addr> {
+    let s = v6.segments();
+    let mut out = Vec::new();
+    if s[0] == 0x2002 {
+        // 6to4: ビット16-47にIPv4
+        out.push(seg_pair_to_v4(s[1], s[2]));
+    }
+    if s[0] == 0x0064 && s[1] == 0xff9b {
+        // NAT64 well-known prefix: 末尾32ビットにIPv4
+        out.push(seg_pair_to_v4(s[6], s[7]));
+    }
+    if s[0] == 0x2001 && s[1] == 0x0000 {
+        // Teredo: サーバIPv4(seg2,3)とクライアントIPv4(seg6,7をXOR復号)
+        out.push(seg_pair_to_v4(s[2], s[3]));
+        out.push(seg_pair_to_v4(!s[6], !s[7]));
+    }
+    out
+}
+
 fn is_denied_v4(a: Ipv4Addr) -> bool {
     let o = a.octets();
     a.is_loopback()                        // 127.0.0.0/8
@@ -41,15 +72,19 @@ fn is_denied_v4(a: Ipv4Addr) -> bool {
         || a.is_private()                  // 10/8, 172.16/12, 192.168/16
         || a.is_broadcast()
         || a.is_unspecified()              // 0.0.0.0
+        || a.is_multicast()                // 224.0.0.0/4
         || o[0] == 0                       // 0.0.0.0/8
+        || o[0] >= 240                     // 240.0.0.0/4 予約
         || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 CGN
 }
 
 fn is_denied_v6(a: Ipv6Addr) -> bool {
     a.is_loopback()                        // ::1
         || a.is_unspecified()              // ::
+        || a.is_multicast()                // ff00::/8
         || (a.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
         || (a.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
+        || embedded_v4(a).into_iter().any(is_denied_v4) // 遷移アドレス埋め込みv4
 }
 
 /// 与えられたIPが内部アドレス（取得を拒否すべき）か判定する。
@@ -136,6 +171,33 @@ mod tests {
     #[test]
     fn public_v6_allowed() {
         assert!(!is_internal(ip("2606:4700:4700::1111"))); // cloudflare
+    }
+
+    #[test]
+    fn embedded_v4_transitions_denied() {
+        // 6to4 (2002::/16) に 127.0.0.1 / 10.0.0.1 を埋め込む → 内部扱い
+        assert!(is_internal(ip("2002:7f00:0001::"))); // 127.0.0.1
+        assert!(is_internal(ip("2002:0a00:0001::"))); // 10.0.0.1
+        // NAT64 well-known prefix 64:ff9b::/96 に内部v4を埋め込む
+        assert!(is_internal(ip("64:ff9b::7f00:1"))); // 127.0.0.1
+        assert!(is_internal(ip("64:ff9b::a00:1"))); // 10.0.0.1
+        // 6to4 に公開v4 (8.8.8.8) → 許可
+        assert!(!is_internal(ip("2002:0808:0808::"))); // 8.8.8.8
+        // NAT64 に公開v4 → 許可
+        assert!(!is_internal(ip("64:ff9b::808:808"))); // 8.8.8.8
+    }
+
+    #[test]
+    fn multicast_and_reserved_v4_denied() {
+        assert!(is_internal(ip("224.0.0.1"))); // マルチキャスト
+        assert!(is_internal(ip("239.255.255.250"))); // SSDP マルチキャスト
+        assert!(is_internal(ip("240.0.0.1"))); // 予約 240/4
+        assert!(is_internal(ip("255.255.255.255"))); // ブロードキャスト(既存is_broadcast)
+    }
+
+    #[test]
+    fn multicast_v6_denied() {
+        assert!(is_internal(ip("ff02::1"))); // リンクローカル全ノードマルチキャスト
     }
 
     #[test]

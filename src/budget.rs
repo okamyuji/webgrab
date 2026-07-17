@@ -64,12 +64,19 @@ pub fn slice(body: &str, start_index: usize, max_chars: usize) -> Slice {
     }
 }
 
+/// POSIXシェル向けに単一引用符でクォートする。埋め込みの `'` は `'\''` へ。
+/// 継続コマンドはコピペ実行されうるため、URL中の `&`/`?`/空白等による
+/// 誤動作・コマンド注入(A03)を防ぐ。
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 /// 継続コマンドを生成する（設計§6）。
 /// - --start-indexは新オフセットに置換
 /// - -o/--outputは除外
 /// - それ以外の非デフォルトフラグ(extra_flags)を再現
 pub fn continue_command(url: &str, next_start: usize, extra_flags: &[String]) -> String {
-    let mut parts = vec![String::from("webgrab"), url.to_string()];
+    let mut parts = vec![String::from("webgrab"), shell_quote(url)];
     parts.extend(extra_flags.iter().cloned());
     parts.push(format!("--start-index {next_start}"));
     parts.join(" ")
@@ -87,6 +94,11 @@ pub fn truncated_footer(url: &str, s: &Slice, extra_flags: &[String]) -> String 
 /// 終端フッタ（設計§6、start_index末尾超過時）。
 pub fn end_footer(total: usize) -> String {
     format!("[webgrab:end total {total} chars]")
+}
+
+/// 短い本文の自己記述マーカー（設計§5、抽出後1〜199文字時）。
+pub fn short_content_marker(total: usize) -> String {
+    format!("[webgrab:short-content {total} chars — if unexpected, retry with --render]")
 }
 
 #[cfg(test)]
@@ -145,6 +157,23 @@ mod tests {
     }
 
     #[test]
+    fn continue_command_quotes_url_with_query_string() {
+        // クエリ文字列中の & はシェルに貼ると誤動作するため、URLはクォートされるべき（A03）。
+        let cmd = continue_command("https://x.test/p?a=1&b=2", 100, &[]);
+        assert!(
+            cmd.contains("'https://x.test/p?a=1&b=2'"),
+            "URLが単一引用符で囲まれていない: {cmd}"
+        );
+    }
+
+    #[test]
+    fn continue_command_escapes_single_quote_in_url() {
+        let cmd = continue_command("https://x.test/a'b", 0, &[]);
+        // 埋め込みの ' は '\'' へエスケープされ、シェルインジェクションを防ぐ。
+        assert!(cmd.contains(r"'\''"), "single quote未エスケープ: {cmd}");
+    }
+
+    #[test]
     fn continue_command_replaces_start_index_and_reproduces_flags() {
         let cmd = continue_command(
             "https://x.test",
@@ -153,7 +182,7 @@ mod tests {
         );
         assert_eq!(
             cmd,
-            "webgrab https://x.test --render --format json --start-index 48000"
+            "webgrab 'https://x.test' --render --format json --start-index 48000"
         );
     }
 
