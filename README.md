@@ -1,6 +1,6 @@
 # webgrab
 
-LLM（Claude Code / Codex CLI / Kimi CLI など）向けのWeb情報取得CLIです。Webページの本文を欠損なく、制御可能な量で、LLMが読みやすいMarkdownとして標準出力に返します。
+LLM（Claude Code / Codex CLI / Kimi CLI など）向けのWeb情報取得CLIです。Webページの本文を切り捨てずに、制御可能な量で、LLMが読みやすいMarkdownとして標準出力に返します。
 
 ## なぜ作ったか
 

@@ -11,7 +11,7 @@ pub enum FormatArg {
     Html,
 }
 
-/// webgrab — LLM向けWeb情報取得ツール。ページ本文を欠損なくMarkdownで返す。
+/// webgrab — LLM向けWeb情報取得ツール。ページ本文を切り捨てずにMarkdownで返す。
 #[derive(Debug, Parser)]
 #[command(name = "webgrab", version, about, long_about = None)]
 #[command(after_help = EXIT_CODE_HELP)]
