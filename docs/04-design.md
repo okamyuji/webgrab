@@ -75,7 +75,7 @@ URL → [netguard] → [robots] → [fetch | render] → 生バイト+ヘッダ 
 - fetch（src/fetch.rs）は静的取得（reqwest）。--render指定時はrender（src/render.rs、chromiumoxide）がDOM安定後のHTMLを返す。Chrome未検出・起動失敗時は終了コード7で失敗し、stderrに静的取得への切替コマンドを提示する（暗黙フォールバックはしない）
 - render.rsは一時user-data-dirを生成し、正常・異常終了ともDropガードでChromeプロセスをkillして一時ディレクトリを削除する
 - decode（src/decode.rs）は charset判定を「HTTPヘッダ → HTML先頭1024バイトのmeta → chardetng推定」の順で行う。--render経路はCDPが常にUTF-8のDOM文字列を返すためdecodeをスキップする
-- extract（src/extract.rs）はdom_smoothieで本文・title・公開日時を抽出。--raw指定時はスキップ
+- extract（src/extract.rs）はdom_smoothieで本文・title・公開日時を抽出。--raw指定時はスキップし、代わりにconvertの`strip_non_content`で`<script>`/`<style>`/`<noscript>`だけを除去する（JSコード・CSSの本文混入を防ぐ）。一覧/インデックスページなど本文抽出が向かないページは--raw（JS描画なら--render併用）を使う
 - convert（src/convert.rs）はhtmdでMarkdown化。クリックでスクリプトが走りうる実行系スキーム（javascript:・vbscript:・data:text/html・data:image/svg+xml）のリンク先は`unsafe-`接頭辞で無害化する。通常URLや非実行データURL（data:image/png等）はそのまま残す
 - budget（src/budget.rs）は--start-index/--max-charsで文字スライスし、tiktoken-rsで出力スライスの概算トークン数を計測（--no-tokens時は省略）。切り詰め発生時は自己記述フッタを付与
 - output（src/output.rs）は形式（markdown / frontmatter / json / text / html）に整形。本文はプロンプトインジェクション緩和として、端末制御文字を除去し、webgrab自身の制御マーカー`[webgrab:`の偽造を`[quoted-webgrab:`へ無害化する。完全防御はツール単体では不可能で、消費側エージェントの権限分離・自動実行禁止・人間確認が前提（信頼モデルはREADME/SKILL参照）
@@ -123,8 +123,8 @@ webgrab <URL> [OPTIONS]
 | -o, --output | パス | なし（stdout） | ファイル出力。書き込み失敗は終了コード1 |
 
 - stdoutには本文のみ、診断・警告・進捗はstderrのみに出す
-- stderrのエラー・警告の先頭行は機械可読の固定書式とする（例: `webgrab: error=http status=503 retryable=true`、`webgrab: warn=short-content chars=42 hint=--render`）
-- 抽出後の本文が1文字以上200文字未満の場合、stdout本文の末尾に自己記述行`[webgrab:short-content 42 chars — if unexpected, retry with --render]`を付け、stderrにも同内容の警告を出す（終了コードは0）。0文字の場合は7章のとおり終了コード6
+- stderrのエラー・警告の先頭行は機械可読の固定書式とする（例: `webgrab: error=http status=503 retryable=true`、`webgrab: warn=short-content chars=42 hint=--render/--raw`）
+- 抽出後の本文が1文字以上200文字未満の場合、stdout本文の末尾に自己記述行`[webgrab:short-content 42 chars — if unexpected, retry with <提案>]`を付け、stderrにも同内容の警告を出す（終了コードは0）。提案は状況に応じて変える。静的取得なら`--render or --raw`（JS描画ページか一覧ページの可能性）、--render時なら`--raw`（抽出が一覧等を落としている可能性）。--render時も抑制せず通知する。0文字の場合は7章のとおり終了コード6
 
 ### 終了コード表（--helpに全掲載）
 

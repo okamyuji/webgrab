@@ -22,6 +22,8 @@ pub struct Meta {
     pub tokens: Option<usize>,
     /// 抽出後1〜199文字の短い本文のとき、その総char数（設計§5の自己記述マーカー用）。
     pub short_content: Option<usize>,
+    /// 短い本文時に提案する再試行フラグ（例: "--render or --raw" / "--raw"）。
+    pub short_content_suggest: &'static str,
     /// --fence時、本文を非信頼コンテンツフェンスで囲む（プロンプトインジェクション対策）。
     pub fence: bool,
 }
@@ -189,7 +191,10 @@ fn render_markdown(
     }
     if let Some(total) = meta.short_content {
         out.push('\n');
-        out.push_str(&budget::short_content_marker(total));
+        out.push_str(&budget::short_content_marker(
+            total,
+            meta.short_content_suggest,
+        ));
     }
     out
 }
@@ -241,7 +246,10 @@ fn render_plain(
     }
     if let Some(total) = meta.short_content {
         out.push('\n');
-        out.push_str(&wrap_marker(&budget::short_content_marker(total), is_html));
+        out.push_str(&wrap_marker(
+            &budget::short_content_marker(total, meta.short_content_suggest),
+            is_html,
+        ));
     }
     out
 }
@@ -265,6 +273,7 @@ mod tests {
             published_time: Some("2026-01-01T00:00:00Z".into()),
             tokens: Some(42),
             short_content: None,
+            short_content_suggest: "",
             fence: false,
         }
     }
@@ -456,14 +465,17 @@ mod tests {
 
     #[test]
     fn short_content_marker_appended_markdown_and_json() {
-        // 設計§5: 短い本文はstdout末尾に自己記述マーカーを付ける。
+        // 設計§5: 短い本文はstdout末尾に自己記述マーカーを付ける。提案文言はsuggestに従う。
         let mut m = meta();
         m.short_content = Some(42);
+        m.short_content_suggest = "--render or --raw";
         let s = slc("short body", false, false, 42);
         let md = render(Format::Markdown, &m, &s, false, &[]);
         assert!(
-            md.contains("[webgrab:short-content 42 chars — if unexpected, retry with --render]"),
-            "markdownに短文マーカーが無い: {md}"
+            md.contains(
+                "[webgrab:short-content 42 chars — if unexpected, retry with --render or --raw]"
+            ),
+            "markdownに短文マーカー(suggest反映)が無い: {md}"
         );
         // text
         let txt = render(Format::Text, &m, &s, false, &[]);
@@ -475,6 +487,17 @@ mod tests {
         let js = render(Format::Json, &m, &s, false, &[]);
         let v: serde_json::Value = serde_json::from_str(&js).unwrap();
         assert_eq!(v["short_content"], 42);
+    }
+
+    #[test]
+    fn short_content_suggest_raw_in_render_mode() {
+        // --render時に短いときは --raw を提案する（pipelineがsuggestに"--raw"を渡す想定）。
+        let mut m = meta();
+        m.short_content = Some(95);
+        m.short_content_suggest = "--raw";
+        let s = slc("bio only", false, false, 95);
+        let md = render(Format::Markdown, &m, &s, false, &[]);
+        assert!(md.contains("retry with --raw]"), "--raw提案が無い: {md}");
     }
 
     #[test]

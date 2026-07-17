@@ -97,8 +97,9 @@ pub fn end_footer(total: usize) -> String {
 }
 
 /// 短い本文の自己記述マーカー（設計§5、抽出後1〜199文字時）。
-pub fn short_content_marker(total: usize) -> String {
-    format!("[webgrab:short-content {total} chars — if unexpected, retry with --render]")
+/// `suggest`は状況に応じた再試行フラグ（例: "--render or --raw" / "--raw"）。
+pub fn short_content_marker(total: usize, suggest: &str) -> String {
+    format!("[webgrab:short-content {total} chars — if unexpected, retry with {suggest}]")
 }
 
 #[cfg(test)]

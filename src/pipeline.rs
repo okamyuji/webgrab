@@ -72,8 +72,10 @@ pub async fn run(cli: &Cli) -> Result<String> {
     let _ = header_title;
 
     // 2. 抽出 or raw
+    //    --rawは抽出をスキップするが、script/style/noscriptだけは除去して
+    //    JSコード・CSSが本文に混入するのを防ぐ。
     let (title, published, body_html) = if cli.raw {
-        (None, None, html.clone())
+        (None, None, convert::strip_non_content(&html))
     } else {
         let ex = extract::extract(&html, &final_url)?;
         (ex.title, ex.published_time, ex.content_html)
@@ -104,17 +106,24 @@ pub async fn run(cli: &Cli) -> Result<String> {
         Some(tokens::count(&slice.content))
     };
 
-    // 7. 短い本文の通知（設計§5、1〜199文字かつ静的取得時）。
-    //    stderrに警告し、stdout本文末尾にも自己記述マーカーを付ける。
+    // 7. 短い本文の通知（設計§5、抽出後1〜199文字）。--render時も抑制せず通知する。
+    //    静的で短い＝JS描画(--render)か一覧ページ(--raw)の可能性→両方提案。
+    //    --renderでも短い＝抽出が一覧等を落としている可能性→--rawを提案。
     let content_len = slice.content.chars().count();
-    let short_content = if !cli.raw && !cli.render && content_len > 0 && slice.total < 200 {
+    let (short_content, short_content_suggest) = if !cli.raw && content_len > 0 && slice.total < 200
+    {
+        let (hint, suggest): (&str, &'static str) = if cli.render {
+            ("--raw", "--raw")
+        } else {
+            ("--render/--raw", "--render or --raw")
+        };
         eprintln!(
-            "webgrab: warn=short-content chars={} hint=--render",
+            "webgrab: warn=short-content chars={} hint={hint}",
             slice.total
         );
-        Some(slice.total)
+        (Some(slice.total), suggest)
     } else {
-        None
+        (None, "")
     };
 
     let meta = Meta {
@@ -123,6 +132,7 @@ pub async fn run(cli: &Cli) -> Result<String> {
         published_time: published,
         tokens: tok,
         short_content,
+        short_content_suggest,
         fence: cli.fence,
     };
     let extra = cli::extra_flags(cli);

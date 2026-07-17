@@ -2,6 +2,47 @@
 
 use crate::error::{ExitCode, Result, WebgrabError};
 
+/// --raw変換の前処理として、`<script>` / `<style>` / `<noscript>` を要素ごと除去する。
+/// これらの中身（JSコード・CSS）が本文に混入するのを防ぐ。抽出経路(dom_smoothie)は
+/// 自前で除去するため、この関数は --raw のときだけ呼ぶ。
+pub fn strip_non_content(html: &str) -> String {
+    let mut out = html.to_string();
+    for tag in ["script", "style", "noscript"] {
+        out = remove_element(&out, tag);
+    }
+    out
+}
+
+/// `<tag ...>...</tag>` を要素ごと除去する（大小無視、複数対応）。
+/// 開始タグ名の直後が区切り（空白/`>`/`/`）であることを確認し、`<scripts>`等の別タグは残す。
+fn remove_element(html: &str, tag: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut out = String::with_capacity(html.len());
+    let mut i = 0;
+    while i < html.len() {
+        if lower[i..].starts_with(&open) {
+            let boundary = lower[i + open.len()..].chars().next();
+            let is_tag = matches!(boundary, Some(' ' | '\t' | '\n' | '\r' | '>' | '/') | None);
+            if is_tag {
+                match lower[i..].find(&close) {
+                    Some(rel) => {
+                        i += rel + close.len();
+                        continue;
+                    }
+                    // 閉じタグが無い場合は以降をすべて捨てる（壊れたHTMLの防御）
+                    None => break,
+                }
+            }
+        }
+        let ch = html[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 /// HTMLをMarkdownへ変換する。危険なリンクスキームは無害化する。
 pub fn to_markdown(html: &str) -> Result<String> {
     let md = htmd::convert(html).map_err(|e| {
@@ -126,6 +167,45 @@ mod tests {
         // data:image/png は実行系でないため触らない
         let md2 = to_markdown(r#"<img src="data:image/png;base64,iVBORw0KGgo=">"#).unwrap();
         assert!(!md2.contains("unsafe-"), "data:imageを誤って無害化: {md2}");
+    }
+
+    #[test]
+    fn strip_non_content_removes_script_style_noscript() {
+        // --raw変換前に script/style/noscript を要素ごと除去する（本文ノイズ対策）。
+        let html = "<style>@font-face{src:url(x)}</style><p>本文テキスト</p>\
+            <script>var a=1; function f(){}</script><noscript>NOSCRIPT</noscript>";
+        let out = strip_non_content(html);
+        assert!(out.contains("本文テキスト"));
+        assert!(!out.contains("font-face"), "styleが残存: {out}");
+        assert!(!out.contains("function"), "scriptが残存: {out}");
+        assert!(!out.contains("NOSCRIPT"), "noscriptが残存: {out}");
+        assert!(!out.to_ascii_lowercase().contains("<script"));
+    }
+
+    #[test]
+    fn strip_non_content_case_insensitive_and_attrs() {
+        let html = "<SCRIPT type=\"text/js\">x</SCRIPT><STYLE>y</STYLE><p>keep</p>";
+        let out = strip_non_content(html);
+        assert!(out.contains("keep"));
+        assert!(!out.to_ascii_lowercase().contains("script"));
+        assert!(!out.to_ascii_lowercase().contains("style"));
+    }
+
+    #[test]
+    fn strip_non_content_keeps_similar_tags() {
+        // <scripts> や <article> のような別タグは削らない。
+        let html = "<article>本文</article>";
+        assert_eq!(strip_non_content(html), "<article>本文</article>");
+    }
+
+    #[test]
+    fn to_markdown_raw_page_has_no_script_noise() {
+        let html = "<html><head><style>@font-face{a:b}</style></head>\
+            <body><script>function f(){}</script><p>本文だけ残す</p></body></html>";
+        let md = to_markdown(&strip_non_content(html)).unwrap();
+        assert!(md.contains("本文だけ残す"));
+        assert!(!md.contains("function"));
+        assert!(!md.contains("font-face"));
     }
 
     #[test]
