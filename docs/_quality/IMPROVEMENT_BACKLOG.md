@@ -97,6 +97,16 @@
 - [MEDIUM/A03] 危険スキームリンク → `convert::sanitize_link_schemes`で`javascript:`/`vbscript:`/`data:text/html`/`data:image/svg+xml`のみ`unsafe-`接頭辞化。通常URL・`data:image/png`は不変。テスト`dangerous_link_schemes_neutralized`/`safe_links_and_data_images_untouched`+実機確認
 - [LOW] DNS解決ハング → `resolve_checked`のgetaddrinfoを`--timeout`で囲む。無応答DNSでの無期限ハングを防止（超過は終了コード3）
 
+## プロンプトインジェクション緩和（2026-07-18）→ 対応済み（テスト+文書）
+
+完全防御はツール単体では不可能（消費側の責務）という前提のもと、攻撃面の縮小と来歴明示を実装。
+
+- [A] 本文からのwebgrab制御マーカー偽造防止 → `[webgrab:`を`[quoted-webgrab:`へ無害化（常時ON、大小無視）。テスト`body_cannot_forge_reserved_marker`/`real_footer_marker_still_uses_reserved_prefix`
+- [B] `--fence`で本文を`[webgrab:untrusted-content ...]`〜`untrusted-content-end`で囲む。境界に予約マーカー名前空間を使い、本文からは閉じマーカーを偽造不可。テスト`fence_wraps_body_and_body_cannot_close_it`/`fence_html_uses_comments`
+- [C] エージェント用途はJSON出力（本文がフィールド分離）を推奨 → README/SKILLに明記
+- [D] 信頼モデル（取得内容は非信頼・指示の自動実行禁止・破壊操作は人間確認）→ README/SKILLに明記
+- 根本の説得型テキスト注入は消費側（権限分離・自動実行禁止・人間確認）でのみ緩和可、と各文書に明記
+
 ## 依存の注記（2026-07-17）
 
 - 直接依存はすべて最新。transitiveのgeneric-array 0.14.7のみ上流のsemver制約で0.14.9より後方（cargo update --verboseで確認）

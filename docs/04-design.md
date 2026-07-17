@@ -78,7 +78,7 @@ URL → [netguard] → [robots] → [fetch | render] → 生バイト+ヘッダ 
 - extract（src/extract.rs）はdom_smoothieで本文・title・公開日時を抽出。--raw指定時はスキップ
 - convert（src/convert.rs）はhtmdでMarkdown化。クリックでスクリプトが走りうる実行系スキーム（javascript:・vbscript:・data:text/html・data:image/svg+xml）のリンク先は`unsafe-`接頭辞で無害化する。通常URLや非実行データURL（data:image/png等）はそのまま残す
 - budget（src/budget.rs）は--start-index/--max-charsで文字スライスし、tiktoken-rsで出力スライスの概算トークン数を計測（--no-tokens時は省略）。切り詰め発生時は自己記述フッタを付与
-- output（src/output.rs）は形式（markdown / frontmatter / json / text / html）に整形
+- output（src/output.rs）は形式（markdown / frontmatter / json / text / html）に整形。本文はプロンプトインジェクション緩和として、端末制御文字を除去し、webgrab自身の制御マーカー`[webgrab:`の偽造を`[quoted-webgrab:`へ無害化する。完全防御はツール単体では不可能で、消費側エージェントの権限分離・自動実行禁止・人間確認が前提（信頼モデルはREADME/SKILL参照）
 
 ### モジュール構成
 
@@ -117,6 +117,7 @@ webgrab <URL> [OPTIONS]
 | --no-robots | フラグ | off | robots.txt確認をスキップ |
 | --allow-private | フラグ | off | netguardの内部アドレス拒否を解除 |
 | --no-tokens | フラグ | off | Tokensヘッダの計測・出力を省略 |
+| --fence | フラグ | off | 本文を非信頼コンテンツフェンス`[webgrab:untrusted-content ...]`〜`[webgrab:untrusted-content-end]`で囲む（プロンプトインジェクション緩和）。jsonは本文がフィールド分離済みのため対象外 |
 | --user-agent | String | `webgrab/<version> (+https://github.com/okamyuji/webgrab)` | UA上書き |
 | --max-bytes | u64 | 20971520 (20MiB) | 取得データの上限。静的経路は圧縮転送の展開後バイト数に対しストリーミング読みで適用し超過時点で中断（終了コード4）。--render経路はSSRFプロキシがChromeの全接続のダウンロード総量を計上し、超過を検出したら終了コード4とする |
 | -o, --output | パス | なし（stdout） | ファイル出力。書き込み失敗は終了コード1 |

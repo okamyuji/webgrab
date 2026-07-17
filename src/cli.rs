@@ -59,6 +59,10 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub no_tokens: bool,
 
+    /// 本文を非信頼コンテンツフェンスで囲む（プロンプトインジェクション緩和）
+    #[arg(long, default_value_t = false)]
+    pub fence: bool,
+
     /// User-Agentの上書き
     #[arg(long)]
     pub user_agent: Option<String>,
@@ -120,6 +124,9 @@ pub fn extra_flags(cli: &Cli) -> Vec<String> {
     }
     if cli.no_tokens {
         v.push("--no-tokens".into());
+    }
+    if cli.fence {
+        v.push("--fence".into());
     }
     if cli.allow_private {
         v.push("--allow-private".into());

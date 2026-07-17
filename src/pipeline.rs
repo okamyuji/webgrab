@@ -123,6 +123,7 @@ pub async fn run(cli: &Cli) -> Result<String> {
         published_time: published,
         tokens: tok,
         short_content,
+        fence: cli.fence,
     };
     let extra = cli::extra_flags(cli);
     Ok(output::render(fmt, &meta, &slice, max_chars_zero, &extra))
