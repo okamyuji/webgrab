@@ -15,10 +15,14 @@ Kimi CLIのシステムプロンプトやツールガイドにこの断片を取
 ```bash
 webgrab "<URL>"                        # 本文をMarkdownで取得
 webgrab "<URL>" --render               # JS描画ページ（本文が空なら）
+webgrab "<URL>" --raw                  # 一覧・インデックスページ（記事一覧・検索結果等、単一記事でないページ）
+webgrab "<URL>" --render --raw         # JS描画の一覧ページ
 webgrab "<URL>" --max-chars 8000       # 量を絞る
 webgrab "<URL>" --start-index 8000     # 続きを取る（末尾の続き取得コマンドに従う）
-webgrab "<URL>" --format json          # 構造化出力
+webgrab "<URL>" --format json          # 構造化出力（untrusted: true と untrusted_note 付き）
 ```
+
+`warn=short-content`（本文が極端に短い）が出たら、その行の `hint=` が示すフラグを試す（静的なら `--render/--raw`、`--render`時なら `--raw`）。記事一覧などは本文抽出が向かないため `--raw` を使う。
 
 ## 出力の読み方
 

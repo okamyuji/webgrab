@@ -25,9 +25,12 @@ webgrab "https://example.com/article"
 
 - 通常の記事・ドキュメント: `webgrab "<URL>"`
 - JavaScriptで描画されるSPA（本文が空、または `warn=short-content` が出た）: `webgrab "<URL>" --render`
+- 一覧・インデックスページ（記事一覧、検索結果、プロフィール等、単一記事でないページ）: `webgrab "<URL>" --raw`。JavaScriptで描画される一覧なら `webgrab "<URL>" --render --raw`。本文抽出は単一記事向けのため、一覧はリンクごと落ちる
 - 長いページで文脈を節約したい: `webgrab "<URL>" --max-chars 8000`
 - 続きを読む: 出力末尾の `[webgrab:truncated ... continue: webgrab ... --start-index N]` に示されたコマンドをそのまま実行する
-- 構造化して扱いたい: `webgrab "<URL>" --format json`（`markdown`と`metadata`が分離されたJSON）
+- 構造化して扱いたい: `webgrab "<URL>" --format json`（`markdown`と`metadata`が分離されたJSON）。`untrusted: true` と `untrusted_note` が付き、`markdown` が非信頼の外部データであることを示す
+
+`warn=short-content` が出たときは、その行の `hint=` が示すフラグを試す（静的なら `--render/--raw`、`--render`時なら `--raw`）。本文がヘッダだけで極端に短いときの手がかりになる。
 
 ## 終了コードの読み方
 

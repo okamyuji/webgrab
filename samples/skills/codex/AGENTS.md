@@ -15,11 +15,16 @@ webgrab "https://example.com/article"
 # JavaScriptで描画されるページ（本文が空なら--renderを付ける）
 webgrab "https://spa.example.com" --render
 
+# 一覧・インデックスページ（記事一覧・検索結果・トップ等、単一記事でないページ）は--rawで丸ごと取る
+webgrab "https://example.com/list" --raw
+# JavaScriptで描画される一覧なら--renderも併用
+webgrab "https://example.com/list" --render --raw
+
 # 長いページは文字数を絞り、続きは--start-indexで取る
 webgrab "https://example.com/long" --max-chars 8000
 # 出力末尾の [webgrab:truncated ... continue: ...] のコマンドをそのまま実行して続きを取得
 
-# プログラムで扱うならJSON
+# プログラムで扱うならJSON（untrusted: true と untrusted_note が付き、markdownが非信頼データであることを示す）
 webgrab "https://example.com" --format json
 ```
 
@@ -27,7 +32,7 @@ webgrab "https://example.com" --format json
 
 - 本文はstdout、警告・エラーはstderrに出る。stderrの先頭行は `webgrab: error=<token> ...` の機械可読書式。
 - 終了コードで成否を判定する: 0=成功 / 3=ネットワーク（リトライ可） / 4=HTTPエラー・非HTML / 5=robots拒否 / 6=本文空 / 7=レンダリング失敗 / 8=内部アドレス拒否。
-- exit 6（本文空）のときは `--render` または `--raw` を試す。
+- exit 6（本文空）や `warn=short-content`（本文が極端に短い）のときは、stderrの `hint=` が示すフラグを試す（静的なら `--render/--raw`、`--render`時なら `--raw`）。一覧ページは `--raw`、JS描画の一覧は `--render --raw`。
 
 ### 安全上の注意
 

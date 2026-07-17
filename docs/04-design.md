@@ -172,7 +172,7 @@ Markdown Content:
 
 ### json
 
-`{"title", "url", "published_time", "tokens", "chars", "total_chars", "truncated", "ended", "continue_command", "markdown"}` のFirecrawl風エンベロープ（1行JSON）。切り詰め時はtruncated=trueかつcontinue_commandに継続コマンド全文を入れる。終端（--start-index末尾超過）はended=true・markdown空文字列・truncated=falseで表す。--max-chars=0はmarkdown空文字列・total_chars入りで表す（total取得用途）。--no-tokens時もtokensキーはnullにするがchars/total_charsは常に保持する。
+`{"title", "url", "published_time", "tokens", "chars", "total_chars", "truncated", "ended", "continue_command", "short_content", "untrusted", "untrusted_note", "markdown"}` のFirecrawl風エンベロープ（1行JSON）。`untrusted`は常にtrue、`untrusted_note`は`markdown`が非信頼の外部データである旨の短い説明で、構造化消費者へも非信頼シグナルを渡す（テキスト形式の`--fence`に相当）。切り詰め時はtruncated=trueかつcontinue_commandに継続コマンド全文を入れる。終端（--start-index末尾超過）はended=true・markdown空文字列・truncated=falseで表す。--max-chars=0はmarkdown空文字列・total_chars入りで表す（total取得用途）。--no-tokens時もtokensキーはnullにするがchars/total_charsは常に保持する。
 
 ### text / html
 
