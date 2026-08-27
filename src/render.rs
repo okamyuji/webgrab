@@ -65,7 +65,10 @@ async fn render_inner(url_str: &str, opts: &RenderOptions) -> Result<String> {
     // DNSリバインディング(TOCTOU)を原理的に閉じる。<-loopback>でloopback宛も
     // バイパスさせず、内部アドレスへの直結を防ぐ。
     let (proxy_addr, proxy_state, proxy_handle) =
-        renderproxy::spawn(opts.allow_private, opts.max_bytes)
+        renderproxy::spawn(
+            Arc::new(renderproxy::HostCache::new(opts.allow_private)),
+            opts.max_bytes,
+        )
             .await
             .map_err(|e| {
                 WebgrabError::new(ExitCode::Render, "ssrf proxy start failed")
