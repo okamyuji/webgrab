@@ -5,6 +5,8 @@
 //! 第二層は[`renderproxy`]の検証・IPピン留めプロキシで、Chromeの全接続を経由させ、
 //! 判定と接続のIP一致を保証してDNSリバインディング(TOCTOU)を閉じる。
 
+pub mod wait;
+
 use crate::error::{ExitCode, Result, WebgrabError};
 use crate::{netguard, renderproxy};
 use chromiumoxide::browser::{Browser, BrowserConfig};
