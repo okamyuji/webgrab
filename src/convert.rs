@@ -153,11 +153,11 @@ pub fn visible_text_len(html: &str) -> usize {
     }
     let text = text
         .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
-        .replace("&#39;", "'");
+        .replace("&#39;", "'")
+        .replace("&amp;", "&");
     let trimmed = text.trim();
     let mut count = 0usize;
     let mut last_was_space = true;
@@ -309,5 +309,7 @@ mod tests {
         assert_eq!(visible_text_len(html), 12);
         assert_eq!(visible_text_len(""), 0);
         assert_eq!(visible_text_len("<div id=\"app\"></div>"), 0);
+        // 二重エスケープ: &amp;lt; は &lt; であって < ではない（4文字）。
+        assert_eq!(visible_text_len("<p>&amp;lt;</p>"), 4);
     }
 }
