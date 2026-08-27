@@ -20,6 +20,7 @@ pub struct InFlight {
     live: HashSet<String>,
     live_order: VecDeque<String>,
     tombstones: HashMap<String, Instant>,
+    tombstone_order: VecDeque<String>,
 }
 
 impl Default for InFlight {
@@ -30,7 +31,7 @@ impl Default for InFlight {
 
 impl InFlight {
     pub fn new() -> Self {
-        Self { live: HashSet::new(), live_order: VecDeque::new(), tombstones: HashMap::new() }
+        Self { live: HashSet::new(), live_order: VecDeque::new(), tombstones: HashMap::new(), tombstone_order: VecDeque::new() }
     }
 
     pub fn on_request(&mut self, id: &str, _is_redirect: bool, now: Instant) {
@@ -48,10 +49,14 @@ impl InFlight {
     pub fn on_done(&mut self, id: &str, now: Instant) {
         self.expire(now);
         self.live.remove(id);
+        if self.tombstones.contains_key(id) {
+            return;
+        }
         if self.tombstones.len() >= MAX_TRACKED {
-            self.tombstones.clear();
+            self.tombstone_order.pop_front().map(|oldest| self.tombstones.remove(&oldest));
         }
         self.tombstones.insert(id.to_string(), now);
+        self.tombstone_order.push_back(id.to_string());
     }
 
     pub fn is_idle(&mut self, now: Instant) -> bool {
@@ -70,6 +75,7 @@ impl InFlight {
     fn expire(&mut self, now: Instant) {
         let ttl = Duration::from_millis(TOMBSTONE_MS);
         self.tombstones.retain(|_, t| now.duration_since(*t) < ttl);
+        self.tombstone_order.retain(|id| self.tombstones.contains_key(id));
         self.live_order.retain(|id| self.live.contains(id));
     }
 }
@@ -183,5 +189,23 @@ mod tests {
         assert!(is_main_navigation(&ResourceType::Document, &main, &main));
         assert!(!is_main_navigation(&ResourceType::Document, &other, &main));
         assert!(!is_main_navigation(&ResourceType::Image, &main, &main));
+    }
+
+    #[test]
+    fn tombstone_cap_evicts_oldest_only() {
+        let now = Instant::now();
+        let mut f = InFlight::new();
+        for i in 0..MAX_TRACKED {
+            f.on_done(&i.to_string(), now);
+        }
+        let len_before = f.len();
+        f.on_done("new", now);
+        let len_after = f.len();
+        assert_eq!(len_before, 0);
+        assert_eq!(len_after, 0);
+        f.on_request("0", false, now);
+        assert_eq!(f.len(), 1, "oldest tombstone evicted, new request accepted");
+        f.on_request("1", false, now);
+        assert_eq!(f.len(), 1, "next oldest still in tombstone, request ignored");
     }
 }
