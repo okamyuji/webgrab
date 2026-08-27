@@ -199,6 +199,7 @@ E2Eハーネスだけが読む環境変数を次に示す（バイナリ本体�
 | E13 | big_gzip（gzip圧縮で約2.1KiB、展開後2MiBの本文を`Content-Encoding: gzip`で返す） | `--render --max-bytes 1048576` | 終了コード4、stderrに`error=http`（展開後バイトで上限が効く。ワイヤ2.1KiBでは超過しない） |
 | E14 | big_gzip | `--auto-render --max-bytes 1048576`（静的経路は`read_capped`で先に超過し終了コード4）| 終了コード4、stderrに`error=http`（静的フェーズのエラーは伝播、§4.3 1） |
 | E15 | dom_bomb | `--render --max-bytes 1048576` | 終了コード4、stderrに`error=http`（`content()`前のDOM長評価が効く） |
+| E16 | static_article | `--render --no-sandbox` | 終了コード0、stderrに`webgrab: warn=no-sandbox`の行がちょうど1本（Chromeを起動する実行でだけ出る、§4.4） |
 
 ## 7. CI設計（`.github/workflows/ci.yml`）
 

@@ -138,17 +138,23 @@ fn unescape_leading_backslash(s: &str) -> String {
 /// タグ境界に空白を挿入して、隣接する要素のテキストが単語として混在しないようにする。
 /// `<`で始まる断片のタグ終端`>`の直後位置を返す。引用符（`"`/`'`）の内側の`>`は
 /// 属性値の一部なのでタグを閉じない。終端が無ければNone。
+/// 引用に入るのは`=`の直後（間の空白は許す）に現れた引用符だけとする。
+/// 非引用の属性値に含まれるアポストロフィ（`data-x=it's`）を開始引用と誤認しないため。
 fn find_tag_end(s: &str) -> Option<usize> {
     let mut quote: Option<char> = None;
+    let mut prev_sig: Option<char> = None;
     for (idx, c) in s.char_indices().skip(1) {
         match quote {
             Some(q) if c == q => quote = None,
             Some(_) => {}
             None => match c {
-                '"' | '\'' => quote = Some(c),
+                '"' | '\'' if prev_sig == Some('=') => quote = Some(c),
                 '>' => return Some(idx + 1),
                 _ => {}
             },
+        }
+        if !c.is_whitespace() {
+            prev_sig = Some(c);
         }
     }
     None
@@ -354,6 +360,11 @@ mod tests {
     fn visible_text_len_tag_scanner_edge_cases() {
         // 引用符内の`>`はタグを閉じない。
         assert_eq!(visible_text_len("<a title=\">\">x</a>"), 1);
+        assert_eq!(visible_text_len("<a title='>'>x</a>"), 1);
+        // 非引用の属性値のアポストロフィは開始引用ではない。
+        assert_eq!(visible_text_len("<div data-x=it's>text</div>"), 4);
+        // `=`と引用符の間の空白は許す。
+        assert_eq!(visible_text_len("<a title= \">\">x</a>"), 1);
         // 終端`>`の無い`<`は本文。以降も落とさない。
         assert_eq!(visible_text_len("a < b"), 5);
         assert_eq!(visible_text_len("<p>x<"), 2);

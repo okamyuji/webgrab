@@ -276,3 +276,28 @@ e2e!(e15_dom_bomb_is_capped_before_content, {
     assert_eq!(code, 4, "{err}");
     assert!(err.contains("error=http"), "{err}");
 });
+
+e2e!(e16_no_sandbox_warns_when_chrome_launches, {
+    // 項目14の肯定側。Chromeを起動する実行では警告を1行出す。
+    // webgrab_rawで環境変数由来の`--no-sandbox`重複を避け、フラグは明示指定だけにする。
+    let s = start(all_routes());
+    let mut args = vec![
+        s.url("/static"),
+        "--render".to_string(),
+        "--no-sandbox".to_string(),
+        "--allow-private".to_string(),
+        "--no-robots".to_string(),
+    ];
+    if let Ok(p) = std::env::var("WEBGRAB_CHROME") {
+        args.push("--chrome-path".to_string());
+        args.push(p);
+    }
+    let argv: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let (code, out, err) = webgrab_raw(&argv);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains(SENTINEL_STATIC), "{out}");
+    assert!(
+        err.lines().any(|l| l == "webgrab: warn=no-sandbox"),
+        "{err}"
+    );
+});

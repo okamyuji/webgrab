@@ -61,7 +61,11 @@ pub fn start(routes: Vec<Route>) -> Server {
             if stop_t.load(Ordering::SeqCst) {
                 break;
             }
-            let Ok(stream) = stream else { continue };
+            let Ok(stream) = stream else {
+                // EMFILE等で連続失敗したときに空転しない。
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            };
             let routes = routes.clone();
             thread::spawn(move || serve_one(stream, &routes));
         }

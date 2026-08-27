@@ -45,13 +45,7 @@ impl InFlight {
         if self.tombstones.contains_key(id) || self.live.contains(id) {
             return;
         }
-        // live_orderは遅延削除。完了済みIDが先頭に溜まるのでここで前詰めする。
-        while let Some(front) = self.live_order.front() {
-            if self.live.contains(front) {
-                break;
-            }
-            self.live_order.pop_front();
-        }
+        self.drain_dead_order();
         if self.live.len() >= MAX_TRACKED {
             while let Some(old) = self.live_order.pop_front() {
                 if self.live.remove(&old) {
@@ -66,6 +60,7 @@ impl InFlight {
     pub fn on_done(&mut self, id: &str, now: Instant) {
         self.expire(now);
         self.live.remove(id);
+        self.drain_dead_order();
         if self.tombstones.contains_key(id) {
             return;
         }
@@ -91,6 +86,23 @@ impl InFlight {
         self.live.is_empty()
     }
 
+    /// live_orderは遅延削除。先頭に溜まった完了済みIDを捨てて長さを有界に保つ。
+    fn drain_dead_order(&mut self) {
+        while let Some(front) = self.live_order.front() {
+            if self.live.contains(front) {
+                break;
+            }
+            self.live_order.pop_front();
+        }
+    }
+
+    #[cfg(test)]
+    fn order_len(&self) -> usize {
+        self.live_order.len()
+    }
+
+    /// 先頭からのpopだけで失効させられるのは、`now`が単調非減少で
+    /// tombstone_orderの挿入順＝時刻順になるため。
     fn expire(&mut self, now: Instant) {
         let ttl = Duration::from_millis(TOMBSTONE_MS);
         while let Some((_, t)) = self.tombstone_order.front() {
@@ -203,6 +215,19 @@ mod tests {
             f.on_request(&i.to_string(), false, now);
         }
         assert_eq!(f.len(), MAX_TRACKED);
+    }
+
+    #[test]
+    fn live_order_stays_bounded_under_fifo_completion() {
+        let now = Instant::now();
+        let mut f = InFlight::new();
+        for i in 0..1000 {
+            let id = i.to_string();
+            f.on_request(&id, false, now);
+            f.on_done(&id, now);
+            assert!(f.order_len() <= 1, "i={i} order_len={}", f.order_len());
+        }
+        assert!(f.is_idle(now));
     }
 
     #[test]

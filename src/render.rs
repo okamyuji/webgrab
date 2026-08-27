@@ -62,6 +62,12 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// poisonを無視してロックする。interceptの子タスクがpanicしても、
+/// finalize側がpoison由来のpanicで巻き添えにならないようにする。
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// drive/監視/interceptが共有する状態。
 struct Shared {
     main_blocked: AtomicBool,
@@ -280,14 +286,12 @@ async fn drive(
         shared_holder.clone(),
     )
     .await;
-    let held = shared_holder.lock().unwrap().clone();
+    let held = lock(&shared_holder).clone();
     let blocked = held
         .as_ref()
         .map(|s| s.blocked_intercept.load(Ordering::SeqCst))
         .unwrap_or(0);
-    let blocked_main = held
-        .as_ref()
-        .and_then(|s| s.blocked_main.lock().unwrap().clone());
+    let blocked_main = held.as_ref().and_then(|s| lock(&s.blocked_main).clone());
     (r, blocked, blocked_main)
 }
 
@@ -328,7 +332,7 @@ async fn drive_inner(
         allow_private: opts.allow_private,
         main_frame: main_frame.clone(),
     });
-    *shared_holder.lock().unwrap() = Some(shared.clone());
+    *lock(&shared_holder) = Some(shared.clone());
     // main_blockedは外側(finalize)が読むArcへ転写するため、Shared側の変化を都度反映する。
     let mirror = main_blocked;
 
@@ -358,10 +362,10 @@ async fn drive_inner(
         loop {
             tokio::select! {
                 Some(ev) = sent.next() => {
-                    sh.inflight.lock().unwrap().on_request(ev.request_id.inner(), ev.redirect_response.is_some(), Instant::now());
+                    lock(&sh.inflight).on_request(ev.request_id.inner(), ev.redirect_response.is_some(), Instant::now());
                 }
-                Some(ev) = fin.next() => { sh.inflight.lock().unwrap().on_done(ev.request_id.inner(), Instant::now()); }
-                Some(ev) = fail.next() => { sh.inflight.lock().unwrap().on_done(ev.request_id.inner(), Instant::now()); }
+                Some(ev) = fin.next() => { lock(&sh.inflight).on_done(ev.request_id.inner(), Instant::now()); }
+                Some(ev) = fail.next() => { lock(&sh.inflight).on_done(ev.request_id.inner(), Instant::now()); }
                 Some(ev) = data.next() => { sh.decoded.on_data(ev.data_length.max(0) as u64); }
                 else => break,
             }
@@ -388,15 +392,12 @@ async fn drive_inner(
                 if let Some((host, res)) = deny {
                     sh.blocked_intercept.fetch_add(1, Ordering::SeqCst);
                     if wait::is_main_navigation(&ev.resource_type, &ev.frame_id, &sh.main_frame) {
-                        *sh.blocked_main.lock().unwrap() = Some((host, res));
+                        *lock(&sh.blocked_main) = Some((host, res));
                         sh.main_blocked.store(true, Ordering::SeqCst);
                         mirror.store(true, Ordering::SeqCst);
                     }
                     if let Some(nid) = &ev.network_id {
-                        sh.inflight
-                            .lock()
-                            .unwrap()
-                            .on_done(nid.inner(), Instant::now());
+                        lock(&sh.inflight).on_done(nid.inner(), Instant::now());
                     }
                     match FailRequestParams::builder()
                         .request_id(ev.request_id.clone())
@@ -474,7 +475,7 @@ async fn drive_inner(
         if shared.decoded.exceeded() {
             return Err(exceed_err(shared.decoded.total(), "network"));
         }
-        let idle = shared.inflight.lock().unwrap().is_idle(Instant::now());
+        let idle = lock(&shared.inflight).is_idle(Instant::now());
         let remaining = deadline.saturating_duration_since(Instant::now());
         match world.measure(remaining).await {
             Some(cur) => {
@@ -759,6 +760,22 @@ mod tests {
             10_000,
         );
         assert_eq!(r.unwrap_err().code, ExitCode::Netguard);
+    }
+
+    #[test]
+    fn lock_tolerates_poisoned_mutex() {
+        let m = Arc::new(Mutex::new(1u32));
+        let m2 = m.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = m2.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(
+            m.lock().is_err(),
+            "mutexがpoisonされていない前提が崩れている"
+        );
+        assert_eq!(*lock(&m), 1);
     }
 
     #[test]
