@@ -45,7 +45,7 @@ pub async fn run(cli: &Cli) -> Result<String> {
         }
         let ropts = RenderOptions {
             timeout,
-            wait_ms: cli.wait_ms,
+            wait_ms: cli.wait_ms.unwrap_or(cli::DEFAULT_WAIT_MS),
             allow_private: cli.allow_private,
             chrome_path: cli.chrome_path.clone(),
             max_bytes: cli.max_bytes,
@@ -136,6 +136,6 @@ pub async fn run(cli: &Cli) -> Result<String> {
         fence: cli.fence,
         ..Default::default()
     };
-    let extra = cli::extra_flags(cli);
+    let extra = cli::extra_flags(cli, output::RenderStatus::Static);
     Ok(output::render(fmt, &meta, &slice, max_chars_zero, &extra))
 }
