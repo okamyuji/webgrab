@@ -67,7 +67,7 @@ pub fn slice(body: &str, start_index: usize, max_chars: usize) -> Slice {
 /// POSIXシェル向けに単一引用符でクォートする。埋め込みの `'` は `'\''` へ。
 /// 継続コマンドはコピペ実行されうるため、URL中の `&`/`?`/空白等による
 /// 誤動作・コマンド注入(A03)を防ぐ。
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 

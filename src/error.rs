@@ -40,27 +40,85 @@ pub struct WebgrabError {
     pub message: String,
     /// 追加の診断行（stderr 2行目以降、空白を含んでよい）。
     pub detail: Option<String>,
+    /// 先頭行に付加する機械可読トークン（例: `hint=--render/--raw`）。
+    pub tokens: Vec<(&'static str, String)>,
+}
+
+const DETAIL_MAX_BYTES: usize = 512;
+
+/// stderrの詳細行を1行に畳む。C0/DEL/C1制御文字は除去し、改行・タブ・行区切りは空白へ。
+/// 512バイトを超えない最大の文字境界で切り詰めて `…` を付す。
+pub fn sanitize_detail(s: &str) -> String {
+    let mut out = String::with_capacity(s.len().min(DETAIL_MAX_BYTES + 4));
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        // Replace ANSI CSI sequences (ESC [ ... letter) with space
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next(); // skip '['
+            while let Some(&ch) = chars.peek() {
+                chars.next();
+                if ch.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            if out.len() + 1 > DETAIL_MAX_BYTES {
+                out.push('…');
+                return out;
+            }
+            out.push(' ');
+            continue;
+        }
+
+        let c = match c {
+            '\t' | '\n' | '\r' | '\u{2028}' | '\u{2029}' => ' ',
+            '\u{0}'..='\u{1F}' | '\u{7F}'..='\u{9F}' => continue,
+            c => c,
+        };
+        if out.len() + c.len_utf8() > DETAIL_MAX_BYTES {
+            out.push('…');
+            return out;
+        }
+        out.push(c);
+    }
+    out
 }
 
 impl WebgrabError {
     pub fn new(code: ExitCode, message: impl Into<String>) -> Self {
-        Self {
-            code,
-            message: message.into(),
-            detail: None,
-        }
+        Self { code, message: message.into(), detail: None, tokens: Vec::new() }
     }
 
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
-        self.detail = Some(detail.into());
+        self.detail = Some(sanitize_detail(&detail.into()));
         self
     }
 
-    /// stderrへ機械可読書式で出力する。先頭行 `webgrab: error=<token> <message>`。
-    pub fn print_stderr(&self) {
-        eprintln!("webgrab: error={} {}", self.code.token(), self.message);
+    pub fn with_token(mut self, key: &'static str, value: impl Into<String>) -> Self {
+        self.tokens.push((key, value.into()));
+        self
+    }
+
+    /// stderrへ出す行の列。トークン付きなら先頭行はトークンのみで、メッセージは2行目。
+    pub fn stderr_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if self.tokens.is_empty() {
+            lines.push(format!("webgrab: error={} {}", self.code.token(), self.message));
+        } else {
+            let toks: Vec<String> = self.tokens.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            lines.push(format!("webgrab: error={} {}", self.code.token(), toks.join(" ")));
+            lines.push(self.message.clone());
+        }
         if let Some(d) = &self.detail {
-            eprintln!("{d}");
+            lines.push(d.clone());
+        }
+        lines
+    }
+
+    /// stderrへ機械可読書式で出力する。
+    pub fn print_stderr(&self) {
+        for l in self.stderr_lines() {
+            eprintln!("{l}");
         }
     }
 }
@@ -107,5 +165,33 @@ mod tests {
         let e = WebgrabError::new(ExitCode::Robots, "blocked").with_detail("rule: /private");
         assert_eq!(e.code, ExitCode::Robots);
         assert_eq!(e.detail.as_deref(), Some("rule: /private"));
+    }
+
+    #[test]
+    fn token_moves_message_to_detail_line() {
+        let e = WebgrabError::new(ExitCode::Empty, "empty body extracted")
+            .with_token("hint", "--render/--raw");
+        let lines = e.stderr_lines();
+        assert_eq!(lines[0], "webgrab: error=empty hint=--render/--raw");
+        assert_eq!(lines[1], "empty body extracted");
+    }
+
+    #[test]
+    fn without_token_first_line_keeps_message() {
+        let e = WebgrabError::new(ExitCode::Http, "HTTP 503 retryable=true");
+        let lines = e.stderr_lines();
+        assert_eq!(lines[0], "webgrab: error=http HTTP 503 retryable=true");
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn detail_is_sanitized_to_one_line_and_capped() {
+        let raw = format!("a\nb\u{1b}[31mc\u{2028}d{}", "é".repeat(600));
+        let d = sanitize_detail(&raw);
+        assert!(!d.contains('\n') && !d.contains('\u{1b}') && !d.contains('\u{2028}'));
+        assert!(d.starts_with("a b c d"));
+        assert!(d.len() <= 512 + '…'.len_utf8(), "len={}", d.len());
+        assert!(d.ends_with('…'));
+        assert!(d.is_char_boundary(d.len() - '…'.len_utf8()));
     }
 }
