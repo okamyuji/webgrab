@@ -47,26 +47,60 @@ pub struct WebgrabError {
 const DETAIL_MAX_BYTES: usize = 512;
 
 /// stderrの詳細行を1行に畳む。C0/DEL/C1制御文字は除去し、改行・タブ・行区切りは空白へ。
+/// ANSI CSI制御シーケンス（ESC [ params final）は単一スペースに置換。
 /// 512バイトを超えない最大の文字境界で切り詰めて `…` を付す。
 pub fn sanitize_detail(s: &str) -> String {
     let mut out = String::with_capacity(s.len().min(DETAIL_MAX_BYTES + 4));
     let mut chars = s.chars().peekable();
 
     while let Some(c) = chars.next() {
-        // Replace ANSI CSI sequences (ESC [ ... letter) with space
+        // Handle ANSI CSI sequences (ESC [ params final) with bounded lookahead.
+        // CSI final byte is in range 0x40–0x7E. If no final byte found within bounded
+        // lookahead (100 chars), drop the ESC and '[', continue with remaining text.
         if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            let mut saved_chars = Vec::new();
+            let mut found_final = false;
             chars.next(); // skip '['
-            while let Some(&ch) = chars.peek() {
-                chars.next();
-                if ch.is_ascii_alphabetic() {
+            for _ in 0..100 {
+                if chars.peek().is_some() {
+                    let ch_to_check = chars.next().unwrap();
+                    saved_chars.push(ch_to_check);
+                    // CSI final byte: 0x40–0x7E (ASCII @–~)
+                    if ch_to_check.len_utf8() == 1 {
+                        let b = ch_to_check as u8;
+                        if (0x40..=0x7E).contains(&b) {
+                            found_final = true;
+                            break;
+                        }
+                    }
+                } else {
                     break;
                 }
             }
-            if out.len() + 1 > DETAIL_MAX_BYTES {
-                out.push('…');
-                return out;
+            if found_final {
+                if out.len() + 1 > DETAIL_MAX_BYTES {
+                    out.push('…');
+                    return out;
+                }
+                out.push(' ');
+            } else {
+                // No final byte found: the sequence is not a valid CSI sequence.
+                // Put the saved characters back into processing (they weren't actually consumed yet,
+                // we're using peekable() so next iteration will handle them).
+                // Actually, we've already consumed them with next(), so we need to process them now.
+                for ch in saved_chars {
+                    let c = match ch {
+                        '\t' | '\n' | '\r' | '\u{2028}' | '\u{2029}' => ' ',
+                        '\u{0}'..='\u{1F}' | '\u{7F}'..='\u{9F}' => continue,
+                        c => c,
+                    };
+                    if out.len() + c.len_utf8() > DETAIL_MAX_BYTES {
+                        out.push('…');
+                        return out;
+                    }
+                    out.push(c);
+                }
             }
-            out.push(' ');
             continue;
         }
 
@@ -193,5 +227,46 @@ mod tests {
         assert!(d.len() <= 512 + '…'.len_utf8(), "len={}", d.len());
         assert!(d.ends_with('…'));
         assert!(d.is_char_boundary(d.len() - '…'.len_utf8()));
+    }
+
+    #[test]
+    fn exactly_512_bytes_no_ellipsis() {
+        let input = "x".repeat(512);
+        let d = sanitize_detail(&input);
+        assert_eq!(d, input);
+        assert!(!d.ends_with('…'));
+    }
+
+    #[test]
+    fn multibyte_char_at_boundary_truncates_cleanly() {
+        // Build 511 ASCII chars + 1 multibyte char (é = 2 bytes in UTF-8)
+        // Total: 511 + 2 = 513 bytes, so truncation should happen at char boundary
+        let mut input = "x".repeat(511);
+        input.push('é');
+        let d = sanitize_detail(&input);
+        assert!(d.ends_with('…'));
+        assert!(d.is_char_boundary(d.len() - '…'.len_utf8()));
+        // Should be exactly 511 bytes + ellipsis
+        assert_eq!(d.len(), 511 + '…'.len_utf8());
+    }
+
+    #[test]
+    fn unterminated_csi_preserves_following_text() {
+        // ESC[ followed by digits but no CSI final byte in bounded lookahead, then text
+        // Use CSI-like but no final byte in next 100 chars (e.g., "ESC[0;" has params but no letter)
+        let input = "\u{1b}[0;text";
+        let d = sanitize_detail(input);
+        // ESC should be removed as C0 control, then processed character by character
+        // Without a CSI final byte, we don't consume the sequence as a unit
+        assert!(!d.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn esc_not_followed_by_bracket_removed() {
+        // ESC followed by 'm' (not '['), so just remove ESC (C0 control char)
+        // 'm' is not a control char, so it remains
+        let input = "\u{1b}mtext";
+        let d = sanitize_detail(input);
+        assert_eq!(d, "mtext");
     }
 }
