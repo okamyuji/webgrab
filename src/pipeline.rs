@@ -49,6 +49,8 @@ pub async fn run(cli: &Cli) -> Result<String> {
             allow_private: cli.allow_private,
             chrome_path: cli.chrome_path.clone(),
             max_bytes: cli.max_bytes,
+            max_bytes_total: cli.max_bytes,
+            no_sandbox: cli.no_sandbox,
         };
         let dom = render::render(&cli.url, &ropts).await?;
         (dom, cli.url.clone(), None)
