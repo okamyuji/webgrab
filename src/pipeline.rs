@@ -134,6 +134,7 @@ pub async fn run(cli: &Cli) -> Result<String> {
         short_content,
         short_content_suggest,
         fence: cli.fence,
+        ..Default::default()
     };
     let extra = cli::extra_flags(cli);
     Ok(output::render(fmt, &meta, &slice, max_chars_zero, &extra))
