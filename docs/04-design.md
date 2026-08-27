@@ -92,7 +92,9 @@ src/
 ├── fetch.rs
 ├── render.rs
 ├── render/
-│   └── wait.rs  # InFlight・should_stop・is_main_navigation等の純関数
+│   ├── wait.rs      # InFlight・should_stop・effective_cap・exceed_msg等の純関数
+│   ├── world.rs     # 分離ワールドでの評価（IsolatedWorld）
+│   └── intercept.rs # Fetch interceptとNetwork監視、共有状態、netguard遮断の集計
 ├── decode.rs
 ├── extract.rs
 ├── convert.rs

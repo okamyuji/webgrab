@@ -9,26 +9,19 @@
 
 pub mod wait;
 
+mod intercept;
+mod world;
+
 use crate::error::{ExitCode, Result, WebgrabError};
-use crate::netguard;
 use crate::renderproxy::{self, HostCache, ProxyState, Resolution};
 use chromiumoxide::browser::{Browser, BrowserConfig};
-use chromiumoxide::cdp::browser_protocol::fetch::{
-    ContinueRequestParams, EnableParams, EventRequestPaused, FailRequestParams,
-};
-use chromiumoxide::cdp::browser_protocol::network::{
-    ErrorReason, EventDataReceived, EventLoadingFailed, EventLoadingFinished,
-    EventRequestWillBeSent,
-};
-use chromiumoxide::cdp::browser_protocol::page::{CreateIsolatedWorldParams, FrameId};
-use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextId};
-use chromiumoxide::page::Page;
 use futures::StreamExt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use intercept::{Shared, install, lock, netguard_detail, netguard_warn_lines, sync_wait};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use url::Url;
-use wait::{DecodedBudget, InFlight};
+use wait::{effective_cap, exceed_msg};
+use world::IsolatedWorld;
 
 pub struct RenderOptions {
     pub timeout: Duration,
@@ -42,10 +35,7 @@ pub struct RenderOptions {
     pub no_sandbox: bool,
 }
 
-const CONTENT_RESERVE: Duration = Duration::from_millis(2000);
 const NAV_WAIT_MAX: Duration = Duration::from_millis(1000);
-const SYNC_WAIT_MAX: Duration = Duration::from_millis(500);
-const INTERCEPT_CONCURRENCY: usize = 16;
 
 /// Dropでabortするタスクガード。早期リターン・--timeoutキャンセルでもタスクを残置しない。
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
@@ -62,27 +52,6 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// poisonを無視してロックする。interceptの子タスクがpanicしても、
-/// finalize側がpoison由来のpanicで巻き添えにならないようにする。
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|p| p.into_inner())
-}
-
-/// drive/監視/interceptが共有する状態。
-struct Shared {
-    main_blocked: AtomicBool,
-    /// 遮断したメインナビゲーションのホストと解決結果（終了コード8の詳細行用）。
-    blocked_main: Mutex<Option<(String, Resolution)>>,
-    inflight: Mutex<InFlight>,
-    decoded: DecodedBudget,
-    blocked_intercept: AtomicU64,
-    received: AtomicU64,
-    processed: AtomicU64,
-    cache: Arc<HostCache>,
-    allow_private: bool,
-    main_frame: FrameId,
-}
-
 /// Chrome起動フラグ（プロキシ強制 + loopbackバイパス無効化）を返す。
 /// chromiumoxideのArgsBuilderが各キーへ先頭`--`を付与するため、ここでは`--`を付けない。
 /// `--`を付けると`----key`となりChromeが無視し、プロキシが不活性化する（回帰防止）。
@@ -91,59 +60,6 @@ fn proxy_args(port: u16) -> [String; 2] {
         format!("proxy-server=127.0.0.1:{port}"),
         "proxy-bypass-list=<-loopback>".to_string(),
     ]
-}
-
-/// `goto`直前に確定する実効待機上限: min(--wait-ms, deadline − now − 予備2000ms)。
-fn effective_cap(wait_ms: u64, deadline: Instant, now: Instant) -> Duration {
-    let remaining = deadline
-        .saturating_duration_since(now)
-        .saturating_sub(CONTENT_RESERVE);
-    Duration::from_millis(wait_ms).min(remaining)
-}
-
-/// `--max-bytes`超過メッセージ。`what`が空なら層の接尾辞を付けない。
-fn exceed_msg(n: u64, max_bytes_total: u64, what: &str) -> String {
-    let base =
-        format!("render download exceeds remaining --max-bytes budget ({n} of {max_bytes_total})");
-    if what.is_empty() {
-        base
-    } else {
-        format!("{base} [{what}]")
-    }
-}
-
-/// 遮断件数の通知行（設計§4.2 手順7）。0件の層は行を出さない。
-fn netguard_warn_lines(intercept: u64, proxy: u64) -> Vec<String> {
-    let mut v = Vec::new();
-    if intercept > 0 {
-        v.push(format!(
-            "webgrab: warn=netguard-blocked layer=intercept count={intercept}"
-        ));
-    }
-    if proxy > 0 {
-        v.push(format!(
-            "webgrab: warn=netguard-blocked layer=proxy count={proxy}"
-        ));
-    }
-    v
-}
-
-/// 終了コード8の詳細行（04-design.md §7: 解決IPと対象レンジを含める）。
-fn netguard_detail(blocked: Option<&(String, Resolution)>, intercept: u64, proxy: u64) -> String {
-    let tail = format!("(intercept={intercept} proxy={proxy}; use --allow-private to override)");
-    match blocked {
-        Some((host, Resolution::Denied { ip, range })) => {
-            format!("layer=intercept host={host} resolved={ip} range={range} {tail}")
-        }
-        Some((host, Resolution::Unresolved)) => {
-            format!("layer=intercept host={host} resolved=unresolved {tail}")
-        }
-        Some((host, Resolution::Timeout)) => {
-            format!("layer=intercept host={host} resolved=timeout {tail}")
-        }
-        // 記録が無い（intercept側の記録より先にdriveが戻った）場合の汎用行。
-        _ => format!("layer=intercept main-navigation blocked {tail}"),
-    }
 }
 
 /// 終了コード8を単一経路で判定する（設計§4.2 手順7）。driveの結果によらず先にmain_blockedを見る。
@@ -320,122 +236,13 @@ async fn drive_inner(
         .map_err(|e| render_err("main frame id unavailable", e.to_string()))?
         .ok_or_else(|| WebgrabError::new(ExitCode::Render, "main frame id unavailable"))?;
 
-    let shared = Arc::new(Shared {
-        main_blocked: AtomicBool::new(false),
-        blocked_main: Mutex::new(None),
-        inflight: Mutex::new(InFlight::new()),
-        decoded: DecodedBudget::new(opts.max_bytes),
-        blocked_intercept: AtomicU64::new(0),
-        received: AtomicU64::new(0),
-        processed: AtomicU64::new(0),
-        cache,
-        allow_private: opts.allow_private,
-        main_frame: main_frame.clone(),
-    });
-    *lock(&shared_holder) = Some(shared.clone());
+    // 手順1: 共有状態・監視タスク・interceptタスクの設置。
     // main_blockedは外側(finalize)が読むArcへ転写するため、Shared側の変化を都度反映する。
-    let mirror = main_blocked;
-
-    page.execute(EnableParams::default())
-        .await
-        .map_err(|e| render_err("fetch enable failed", e.to_string()))?;
-
-    // 手順1: 監視タスク（Network 4イベント）
-    let mut sent = page
-        .event_listener::<EventRequestWillBeSent>()
-        .await
-        .map_err(|e| render_err("listener failed", e.to_string()))?;
-    let mut fin = page
-        .event_listener::<EventLoadingFinished>()
-        .await
-        .map_err(|e| render_err("listener failed", e.to_string()))?;
-    let mut fail = page
-        .event_listener::<EventLoadingFailed>()
-        .await
-        .map_err(|e| render_err("listener failed", e.to_string()))?;
-    let mut data = page
-        .event_listener::<EventDataReceived>()
-        .await
-        .map_err(|e| render_err("listener failed", e.to_string()))?;
-    let sh = shared.clone();
-    let _monitor = AbortOnDrop(tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                Some(ev) = sent.next() => {
-                    lock(&sh.inflight).on_request(ev.request_id.inner(), ev.redirect_response.is_some(), Instant::now());
-                }
-                Some(ev) = fin.next() => { lock(&sh.inflight).on_done(ev.request_id.inner(), Instant::now()); }
-                Some(ev) = fail.next() => { lock(&sh.inflight).on_done(ev.request_id.inner(), Instant::now()); }
-                Some(ev) = data.next() => { sh.decoded.on_data(ev.data_length.max(0) as u64); }
-                else => break,
-            }
-        }
-    }));
-
-    // 手順1: interceptタスク（個別タスク化、同時16、ホスト判定キャッシュ）
-    let mut paused = page
-        .event_listener::<EventRequestPaused>()
-        .await
-        .map_err(|e| render_err("listener failed", e.to_string()))?;
-    let page_i = page.clone();
-    let sh = shared.clone();
-    let mirror_i = mirror.clone();
-    let _intercept = AbortOnDrop(tokio::spawn(async move {
-        let sem = Arc::new(tokio::sync::Semaphore::new(INTERCEPT_CONCURRENCY));
-        while let Some(ev) = paused.next().await {
-            sh.received.fetch_add(1, Ordering::SeqCst);
-            let permit = sem.clone().acquire_owned().await;
-            let (page, sh, mirror) = (page_i.clone(), sh.clone(), mirror_i.clone());
-            tokio::spawn(async move {
-                let _permit = permit;
-                let deny = host_denial(&sh.cache, &ev.request.url, sh.allow_private).await;
-                if let Some((host, res)) = deny {
-                    sh.blocked_intercept.fetch_add(1, Ordering::SeqCst);
-                    if wait::is_main_navigation(&ev.resource_type, &ev.frame_id, &sh.main_frame) {
-                        *lock(&sh.blocked_main) = Some((host, res));
-                        sh.main_blocked.store(true, Ordering::SeqCst);
-                        mirror.store(true, Ordering::SeqCst);
-                    }
-                    if let Some(nid) = &ev.network_id {
-                        lock(&sh.inflight).on_done(nid.inner(), Instant::now());
-                    }
-                    match FailRequestParams::builder()
-                        .request_id(ev.request_id.clone())
-                        .error_reason(ErrorReason::AccessDenied)
-                        .build()
-                    {
-                        Ok(p) => {
-                            let _ = page.execute(p).await;
-                        }
-                        // 遮断パラメータを組めなくても要求を握り潰さない。継続させても
-                        // プロキシ層（第二層）が同じ判定で拒否するため漏洩しない。
-                        Err(_) => {
-                            eprintln!("webgrab: warn=intercept-build-failed");
-                            let _ = page
-                                .execute(ContinueRequestParams::new(ev.request_id.clone()))
-                                .await;
-                        }
-                    }
-                } else {
-                    match ContinueRequestParams::builder()
-                        .request_id(ev.request_id.clone())
-                        .build()
-                    {
-                        Ok(p) => {
-                            let _ = page.execute(p).await;
-                        }
-                        Err(_) => {
-                            eprintln!("webgrab: warn=intercept-build-failed");
-                            let _ = page
-                                .execute(ContinueRequestParams::new(ev.request_id.clone()))
-                                .await;
-                        }
-                    }
-                }
-                sh.processed.fetch_add(1, Ordering::SeqCst);
-            });
-        }
-    }));
+    let (shared, monitor, intercept) =
+        install(&page, opts, cache, main_frame.clone(), main_blocked).await?;
+    *lock(&shared_holder) = Some(shared.clone());
+    let _monitor = AbortOnDrop(monitor);
+    let _intercept = AbortOnDrop(intercept);
 
     let blocked_now = |sh: &Shared| sh.main_blocked.load(Ordering::SeqCst);
     let netguard_err =
@@ -524,145 +331,6 @@ async fn drive_inner(
     Ok(content)
 }
 
-/// interceptが受け取ったイベントの処理完了を最大500ms待つ（設計§4.2 手順6）。
-async fn sync_wait(shared: &Shared) {
-    let start = Instant::now();
-    while start.elapsed() < SYNC_WAIT_MAX {
-        if shared.processed.load(Ordering::SeqCst) >= shared.received.load(Ordering::SeqCst) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-/// 分離ワールドでの数値評価。ページ側のdefineProperty等の上書きが効かない。
-struct IsolatedWorld {
-    page: Page,
-    frame: FrameId,
-    ctx: Option<ExecutionContextId>,
-}
-
-impl IsolatedWorld {
-    async fn ensure_ctx(&mut self) -> Option<ExecutionContextId> {
-        if let Some(c) = self.ctx {
-            return Some(c);
-        }
-        let r = self
-            .page
-            .execute(
-                CreateIsolatedWorldParams::builder()
-                    .frame_id(self.frame.clone())
-                    .world_name("webgrab")
-                    .build()
-                    .ok()?,
-            )
-            .await
-            .ok()?;
-        self.ctx = Some(r.execution_context_id);
-        self.ctx
-    }
-
-    /// 式を評価してu64配列で返す。失敗・タイムアウト・非数値はNone（条件未達扱い）。
-    async fn eval_numbers(&mut self, expr: &str, limit: Duration) -> Option<Vec<u64>> {
-        for attempt in 0..2 {
-            let ctx = self.ensure_ctx().await?;
-            let params = EvaluateParams::builder()
-                .expression(expr)
-                .context_id(ctx)
-                .return_by_value(true)
-                .build()
-                .ok()?;
-            match tokio::time::timeout(limit, self.page.execute(params)).await {
-                Ok(Ok(resp)) => {
-                    let v = resp.result.result.value.clone()?;
-                    let arr = v.as_array()?;
-                    return arr
-                        .iter()
-                        .map(|x| x.as_f64().map(|f| f.max(0.0) as u64))
-                        .collect();
-                }
-                Ok(Err(_)) if attempt == 0 => {
-                    self.ctx = None;
-                    continue;
-                } // 文脈破棄→作り直して1回だけ再試行
-                _ => return None,
-            }
-        }
-        None
-    }
-
-    async fn measure(&mut self, limit: Duration) -> Option<[u64; 2]> {
-        let v = self.eval_numbers(
-            "(function(){var b=document.body;return [document.getElementsByTagName('*').length,(b&&b.innerText||'').trim().length];})()",
-            limit,
-        ).await?;
-        Some([*v.first()?, *v.get(1)?])
-    }
-
-    async fn dom_length(&mut self, limit: Duration) -> Option<u64> {
-        let v = self
-            .eval_numbers(
-                "(function(){var d=document.documentElement;return [d?d.outerHTML.length:0];})()",
-                limit,
-            )
-            .await?;
-        v.first().copied()
-    }
-
-    /// DOM HTML（doctype + outerHTML）を分離ワールドで取得する。失敗・タイムアウトはNone。
-    async fn dom_html(&mut self, limit: Duration) -> Option<String> {
-        const EXPR: &str = "(function(){var s='';if(document.doctype){s=new XMLSerializer().serializeToString(document.doctype);}var d=document.documentElement;if(d){s+=d.outerHTML;}return s;})()";
-        for attempt in 0..2 {
-            let ctx = self.ensure_ctx().await?;
-            let params = EvaluateParams::builder()
-                .expression(EXPR)
-                .context_id(ctx)
-                .return_by_value(true)
-                .build()
-                .ok()?;
-            match tokio::time::timeout(limit, self.page.execute(params)).await {
-                Ok(Ok(resp)) => {
-                    return resp
-                        .result
-                        .result
-                        .value
-                        .as_ref()?
-                        .as_str()
-                        .map(|s| s.to_string());
-                }
-                Ok(Err(_)) if attempt == 0 => {
-                    self.ctx = None;
-                    continue;
-                }
-                _ => return None,
-            }
-        }
-        None
-    }
-}
-
-/// リクエストURLのホストを判定する（第一層）。http(s)以外はChromeに任せる。
-/// 遮断するときだけホスト名と解決結果を返す（終了コード8の詳細行が使う）。
-async fn host_denial(
-    cache: &HostCache,
-    request_url: &str,
-    allow_private: bool,
-) -> Option<(String, Resolution)> {
-    if allow_private {
-        return None;
-    }
-    let u = Url::parse(request_url).ok()?;
-    if !netguard::is_allowed_scheme(u.scheme()) {
-        return None;
-    }
-    let host = u.host_str()?;
-    let port = u.port_or_known_default().unwrap_or(80);
-    match cache.resolve_checked(host, port).await {
-        Resolution::Allowed(_) => None,
-        r => Some((host.to_string(), r)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,21 +346,6 @@ mod tests {
         for a in &args {
             assert!(!a.starts_with('-'), "先頭に`-`があってはならない: {a}");
         }
-    }
-
-    #[test]
-    fn effective_cap_is_clamped_by_deadline() {
-        let now = Instant::now();
-        let deadline = now + Duration::from_millis(3500);
-        assert_eq!(
-            effective_cap(5000, deadline, now),
-            Duration::from_millis(1500)
-        );
-        assert_eq!(
-            effective_cap(1000, deadline, now),
-            Duration::from_millis(1000)
-        );
-        assert_eq!(effective_cap(5000, now, now), Duration::ZERO);
     }
 
     #[test]
@@ -762,91 +415,6 @@ mod tests {
         assert_eq!(r.unwrap_err().code, ExitCode::Netguard);
     }
 
-    #[test]
-    fn lock_tolerates_poisoned_mutex() {
-        let m = Arc::new(Mutex::new(1u32));
-        let m2 = m.clone();
-        let _ = std::thread::spawn(move || {
-            let _g = m2.lock().unwrap();
-            panic!("poison");
-        })
-        .join();
-        assert!(
-            m.lock().is_err(),
-            "mutexがpoisonされていない前提が崩れている"
-        );
-        assert_eq!(*lock(&m), 1);
-    }
-
-    #[test]
-    fn intercept_fallback_continue_params_carry_only_request_id() {
-        // build()失敗時の再試行は request_id だけを載せる（他フィールドを補わない）。
-        let p = ContinueRequestParams::new("req-1".to_string());
-        assert_eq!(p.request_id.inner(), "req-1");
-        assert!(p.url.is_none());
-        assert!(p.method.is_none());
-        assert!(p.post_data.is_none());
-        assert!(p.headers.is_none());
-        assert!(p.intercept_response.is_none());
-    }
-
-    #[test]
-    fn netguard_warn_lines_only_for_nonzero_layers() {
-        assert!(netguard_warn_lines(0, 0).is_empty());
-        assert_eq!(
-            netguard_warn_lines(2, 0),
-            vec!["webgrab: warn=netguard-blocked layer=intercept count=2"]
-        );
-        assert_eq!(
-            netguard_warn_lines(1, 3),
-            vec![
-                "webgrab: warn=netguard-blocked layer=intercept count=1",
-                "webgrab: warn=netguard-blocked layer=proxy count=3",
-            ]
-        );
-    }
-
-    #[test]
-    fn netguard_detail_carries_ip_and_range() {
-        let denied = (
-            "meta.test".to_string(),
-            Resolution::Denied {
-                ip: "169.254.169.254".parse().unwrap(),
-                range: "link-local",
-            },
-        );
-        assert_eq!(
-            netguard_detail(Some(&denied), 2, 1),
-            "layer=intercept host=meta.test resolved=169.254.169.254 range=link-local (intercept=2 proxy=1; use --allow-private to override)"
-        );
-        let unres = ("x.invalid".to_string(), Resolution::Unresolved);
-        assert_eq!(
-            netguard_detail(Some(&unres), 1, 0),
-            "layer=intercept host=x.invalid resolved=unresolved (intercept=1 proxy=0; use --allow-private to override)"
-        );
-        let to = ("slow.test".to_string(), Resolution::Timeout);
-        assert_eq!(
-            netguard_detail(Some(&to), 1, 0),
-            "layer=intercept host=slow.test resolved=timeout (intercept=1 proxy=0; use --allow-private to override)"
-        );
-        assert_eq!(
-            netguard_detail(None, 0, 0),
-            "layer=intercept main-navigation blocked (intercept=0 proxy=0; use --allow-private to override)"
-        );
-    }
-
-    #[test]
-    fn exceed_msg_uses_measured_value() {
-        assert_eq!(
-            exceed_msg(3_000, 1_000, "dom"),
-            "render download exceeds remaining --max-bytes budget (3000 of 1000) [dom]"
-        );
-        assert_eq!(
-            exceed_msg(12, 10, ""),
-            "render download exceeds remaining --max-bytes budget (12 of 10)"
-        );
-    }
-
     #[tokio::test]
     async fn abort_on_drop_join_then_drop_leaves_no_task() {
         let done = Arc::new(AtomicBool::new(false));
@@ -864,54 +432,5 @@ mod tests {
         drop(g2);
         tokio::task::yield_now().await;
         assert!(raw.is_finished());
-    }
-
-    #[tokio::test]
-    async fn allow_private_short_circuits() {
-        // allow_private=true では常に「内部でない」を返す（明示的オプトアウト）。
-        assert!(
-            host_denial(&HostCache::new(true), "http://127.0.0.1/", true)
-                .await
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn unresolvable_host_is_fail_closed() {
-        // .invalid は名前解決できない（RFC 6761）。fail-closedで遮断されること（A10）。
-        assert!(
-            host_denial(&HostCache::new(false), "http://nonexistent.invalid/", false)
-                .await
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn non_http_scheme_is_passed_through() {
-        // data:等はネットワーク解決対象でなくChromeに委ねる（遮断しない）。
-        assert!(
-            host_denial(&HostCache::new(false), "data:text/html,hi", false)
-                .await
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn literal_internal_ip_denied_in_render() {
-        // ホストがIPリテラルで内部レンジなら解決成功→遮断（A10）。
-        assert!(
-            host_denial(
-                &HostCache::new(false),
-                "http://169.254.169.254/latest/meta-data/",
-                false
-            )
-            .await
-            .is_some()
-        );
-        assert!(
-            host_denial(&HostCache::new(false), "http://[::1]/", false)
-                .await
-                .is_some()
-        );
     }
 }

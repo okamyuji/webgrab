@@ -13,6 +13,27 @@ pub const TOMBSTONE_MS: u64 = 2000;
 pub const MAX_TRACKED: usize = 4096;
 /// 早期終了に必要な可視テキスト長。pipelineの短文閾値と同じ値。
 pub const MIN_TEXT_CHARS: usize = 200;
+/// 手順6（同期待ち + DOM長評価 + content取得）のために待機上限から差し引く予備。
+pub const CONTENT_RESERVE: Duration = Duration::from_millis(2000);
+
+/// `goto`直前に確定する実効待機上限: min(--wait-ms, deadline − now − 予備2000ms)。
+pub fn effective_cap(wait_ms: u64, deadline: Instant, now: Instant) -> Duration {
+    let remaining = deadline
+        .saturating_duration_since(now)
+        .saturating_sub(CONTENT_RESERVE);
+    Duration::from_millis(wait_ms).min(remaining)
+}
+
+/// `--max-bytes`超過メッセージ。`what`が空なら層の接尾辞を付けない。
+pub fn exceed_msg(n: u64, max_bytes_total: u64, what: &str) -> String {
+    let base =
+        format!("render download exceeds remaining --max-bytes budget ({n} of {max_bytes_total})");
+    if what.is_empty() {
+        base
+    } else {
+        format!("{base} [{what}]")
+    }
+}
 
 /// 未完了要求の集合。挿入・削除とも冪等。削除済みIDは短命のtombstoneに残し、
 /// 順序が入れ替わって後から届いた挿入を無視する。
@@ -282,6 +303,33 @@ mod tests {
             f.len(),
             1,
             "next oldest still in tombstone, request ignored"
+        );
+    }
+
+    #[test]
+    fn effective_cap_is_clamped_by_deadline() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_millis(3500);
+        assert_eq!(
+            effective_cap(5000, deadline, now),
+            Duration::from_millis(1500)
+        );
+        assert_eq!(
+            effective_cap(1000, deadline, now),
+            Duration::from_millis(1000)
+        );
+        assert_eq!(effective_cap(5000, now, now), Duration::ZERO);
+    }
+
+    #[test]
+    fn exceed_msg_uses_measured_value() {
+        assert_eq!(
+            exceed_msg(3_000, 1_000, "dom"),
+            "render download exceeds remaining --max-bytes budget (3000 of 1000) [dom]"
+        );
+        assert_eq!(
+            exceed_msg(12, 10, ""),
+            "render download exceeds remaining --max-bytes budget (12 of 10)"
         );
     }
 }
