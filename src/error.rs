@@ -84,10 +84,13 @@ pub fn sanitize_detail(s: &str) -> String {
                 }
                 out.push(' ');
             } else {
-                // No final byte found: the sequence is not a valid CSI sequence.
-                // Put the saved characters back into processing (they weren't actually consumed yet,
-                // we're using peekable() so next iteration will handle them).
-                // Actually, we've already consumed them with next(), so we need to process them now.
+                // 終端バイトが無いならCSIではない。ESCだけをC0として落とし、`[`と
+                // 後続テキストは本文として残す（誤って1文字消すと診断が読めなくなる）。
+                if out.len() + 1 > DETAIL_MAX_BYTES {
+                    out.push('…');
+                    return out;
+                }
+                out.push('[');
                 for ch in saved_chars {
                     let c = match ch {
                         '\t' | '\n' | '\r' | '\u{2028}' | '\u{2029}' => ' ',
@@ -269,13 +272,16 @@ mod tests {
 
     #[test]
     fn unterminated_csi_preserves_following_text() {
-        // ESC[ followed by digits but no CSI final byte in bounded lookahead, then text
-        // Use CSI-like but no final byte in next 100 chars (e.g., "ESC[0;" has params but no letter)
-        let input = "\u{1b}[0;text";
-        let d = sanitize_detail(input);
-        // ESC should be removed as C0 control, then processed character by character
-        // Without a CSI final byte, we don't consume the sequence as a unit
-        assert!(!d.contains('\u{1b}'));
+        // 数字のみでCSI終端バイトが現れない。ESCだけ落とし `[` 以降は本文として残す。
+        let d = sanitize_detail("\u{1b}[123456789");
+        assert_eq!(d, "[123456789");
+    }
+
+    #[test]
+    fn terminated_csi_with_final_byte_t_collapses_to_space() {
+        // "\u{1b}[0;t" は終端バイト `t`(0x74) を持つ正当なCSI。単一スペースへ畳む。
+        let d = sanitize_detail("\u{1b}[0;text");
+        assert_eq!(d, " ext");
     }
 
     #[test]

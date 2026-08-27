@@ -11,7 +11,7 @@ pub mod wait;
 
 use crate::error::{ExitCode, Result, WebgrabError};
 use crate::netguard;
-use crate::renderproxy::{self, HostCache, ProxyState};
+use crate::renderproxy::{self, HostCache, ProxyState, Resolution};
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::fetch::{
     ContinueRequestParams, EnableParams, EventRequestPaused, FailRequestParams,
@@ -49,6 +49,13 @@ const INTERCEPT_CONCURRENCY: usize = 16;
 
 /// Dropでabortするタスクガード。早期リターン・--timeoutキャンセルでもタスクを残置しない。
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl AbortOnDrop {
+    /// ガードを保ったままタスクの終了を待つ。待機が早期リターンで中断されても
+    /// Dropがabortするため、タスクは残置されない。
+    async fn join(&mut self) {
+        let _ = (&mut self.0).await;
+    }
+}
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
@@ -58,6 +65,8 @@ impl Drop for AbortOnDrop {
 /// drive/監視/interceptが共有する状態。
 struct Shared {
     main_blocked: AtomicBool,
+    /// 遮断したメインナビゲーションのホストと解決結果（終了コード8の詳細行用）。
+    blocked_main: Mutex<Option<(String, Resolution)>>,
     inflight: Mutex<InFlight>,
     decoded: DecodedBudget,
     blocked_intercept: AtomicU64,
@@ -86,10 +95,56 @@ fn effective_cap(wait_ms: u64, deadline: Instant, now: Instant) -> Duration {
     Duration::from_millis(wait_ms).min(remaining)
 }
 
+/// `--max-bytes`超過メッセージ。`what`が空なら層の接尾辞を付けない。
+fn exceed_msg(n: u64, max_bytes_total: u64, what: &str) -> String {
+    let base =
+        format!("render download exceeds remaining --max-bytes budget ({n} of {max_bytes_total})");
+    if what.is_empty() {
+        base
+    } else {
+        format!("{base} [{what}]")
+    }
+}
+
+/// 遮断件数の通知行（設計§4.2 手順7）。0件の層は行を出さない。
+fn netguard_warn_lines(intercept: u64, proxy: u64) -> Vec<String> {
+    let mut v = Vec::new();
+    if intercept > 0 {
+        v.push(format!(
+            "webgrab: warn=netguard-blocked layer=intercept count={intercept}"
+        ));
+    }
+    if proxy > 0 {
+        v.push(format!(
+            "webgrab: warn=netguard-blocked layer=proxy count={proxy}"
+        ));
+    }
+    v
+}
+
+/// 終了コード8の詳細行（04-design.md §7: 解決IPと対象レンジを含める）。
+fn netguard_detail(blocked: Option<&(String, Resolution)>, intercept: u64, proxy: u64) -> String {
+    let tail = format!("(intercept={intercept} proxy={proxy}; use --allow-private to override)");
+    match blocked {
+        Some((host, Resolution::Denied { ip, range })) => {
+            format!("layer=intercept host={host} resolved={ip} range={range} {tail}")
+        }
+        Some((host, Resolution::Unresolved)) => {
+            format!("layer=intercept host={host} resolved=unresolved {tail}")
+        }
+        Some((host, Resolution::Timeout)) => {
+            format!("layer=intercept host={host} resolved=timeout {tail}")
+        }
+        // 記録が無い（intercept側の記録より先にdriveが戻った）場合の汎用行。
+        _ => format!("layer=intercept main-navigation blocked {tail}"),
+    }
+}
+
 /// 終了コード8を単一経路で判定する（設計§4.2 手順7）。driveの結果によらず先にmain_blockedを見る。
 #[allow(clippy::too_many_arguments)]
 fn finalize(
     main_blocked: &AtomicBool,
+    blocked_main: Option<&(String, Resolution)>,
     result: Result<String>,
     blocked_intercept: u64,
     blocked_proxy: u64,
@@ -97,24 +152,27 @@ fn finalize(
     proxy_bytes: u64,
     max_bytes_total: u64,
 ) -> Result<String> {
+    // 終了コード8の経路でも遮断件数は通知する（SSRF試行を無通知にしない）。
+    for l in netguard_warn_lines(blocked_intercept, blocked_proxy) {
+        eprintln!("{l}");
+    }
     if main_blocked.load(Ordering::SeqCst) {
-        return Err(WebgrabError::new(ExitCode::Netguard, "refused internal address during render")
-            .with_detail(format!("layer=intercept main-navigation blocked (intercept={blocked_intercept} proxy={blocked_proxy})")));
-    }
-    if blocked_intercept > 0 {
-        eprintln!("webgrab: warn=netguard-blocked layer=intercept count={blocked_intercept}");
-    }
-    if blocked_proxy > 0 {
-        eprintln!("webgrab: warn=netguard-blocked layer=proxy count={blocked_proxy}");
+        return Err(WebgrabError::new(
+            ExitCode::Netguard,
+            "refused internal address during render",
+        )
+        .with_detail(netguard_detail(
+            blocked_main,
+            blocked_intercept,
+            blocked_proxy,
+        )));
     }
     // プロキシ層はChromeの全接続（メイン以外を含む）を通すため、Fetch intercept層が見ない
     // 超過（例: 単一の大きなクロスオリジンiframe）もここで終了コード4に写像する。
     if proxy_exceeded {
         return Err(WebgrabError::new(
             ExitCode::Http,
-            format!(
-                "render download exceeds remaining --max-bytes budget ({proxy_bytes} of {max_bytes_total})"
-            ),
+            exceed_msg(proxy_bytes, max_bytes_total, ""),
         ));
     }
     result
@@ -170,10 +228,12 @@ async fn render_inner(url_str: &str, opts: &RenderOptions, deadline: Instant) ->
         )
         .with_detail(e.to_string())
     })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let mut handler_task = AbortOnDrop(tokio::spawn(async move {
+        while handler.next().await.is_some() {}
+    }));
 
     let main_blocked = Arc::new(AtomicBool::new(false));
-    let (result, blocked_intercept) = drive(
+    let (result, blocked_intercept, blocked_main) = drive(
         &mut browser,
         url_str,
         opts,
@@ -185,10 +245,11 @@ async fn render_inner(url_str: &str, opts: &RenderOptions, deadline: Instant) ->
     .await;
 
     let _ = browser.close().await;
-    let _ = handler_task.await;
+    handler_task.join().await;
 
     finalize(
         &main_blocked,
+        blocked_main.as_ref(),
         result,
         blocked_intercept,
         proxy_state.denied(),
@@ -206,7 +267,7 @@ async fn drive(
     cache: Arc<HostCache>,
     proxy_state: &ProxyState,
     main_blocked: Arc<AtomicBool>,
-) -> (Result<String>, u64) {
+) -> (Result<String>, u64, Option<(String, Resolution)>) {
     let shared_holder: Arc<Mutex<Option<Arc<Shared>>>> = Arc::new(Mutex::new(None));
     let r = drive_inner(
         browser,
@@ -219,13 +280,15 @@ async fn drive(
         shared_holder.clone(),
     )
     .await;
-    let blocked = shared_holder
-        .lock()
-        .unwrap()
+    let held = shared_holder.lock().unwrap().clone();
+    let blocked = held
         .as_ref()
         .map(|s| s.blocked_intercept.load(Ordering::SeqCst))
         .unwrap_or(0);
-    (r, blocked)
+    let blocked_main = held
+        .as_ref()
+        .and_then(|s| s.blocked_main.lock().unwrap().clone());
+    (r, blocked, blocked_main)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -255,6 +318,7 @@ async fn drive_inner(
 
     let shared = Arc::new(Shared {
         main_blocked: AtomicBool::new(false),
+        blocked_main: Mutex::new(None),
         inflight: Mutex::new(InFlight::new()),
         decoded: DecodedBudget::new(opts.max_bytes),
         blocked_intercept: AtomicU64::new(0),
@@ -320,10 +384,11 @@ async fn drive_inner(
             let (page, sh, mirror) = (page_i.clone(), sh.clone(), mirror_i.clone());
             tokio::spawn(async move {
                 let _permit = permit;
-                let deny = host_is_internal(&sh.cache, &ev.request.url, sh.allow_private).await;
-                if deny {
+                let deny = host_denial(&sh.cache, &ev.request.url, sh.allow_private).await;
+                if let Some((host, res)) = deny {
                     sh.blocked_intercept.fetch_add(1, Ordering::SeqCst);
                     if wait::is_main_navigation(&ev.resource_type, &ev.frame_id, &sh.main_frame) {
+                        *sh.blocked_main.lock().unwrap() = Some((host, res));
                         sh.main_blocked.store(true, Ordering::SeqCst);
                         mirror.store(true, Ordering::SeqCst);
                     }
@@ -333,18 +398,38 @@ async fn drive_inner(
                             .unwrap()
                             .on_done(nid.inner(), Instant::now());
                     }
-                    if let Ok(p) = FailRequestParams::builder()
+                    match FailRequestParams::builder()
                         .request_id(ev.request_id.clone())
                         .error_reason(ErrorReason::AccessDenied)
                         .build()
                     {
-                        let _ = page.execute(p).await;
+                        Ok(p) => {
+                            let _ = page.execute(p).await;
+                        }
+                        // 遮断パラメータを組めなくても要求を握り潰さない。継続させても
+                        // プロキシ層（第二層）が同じ判定で拒否するため漏洩しない。
+                        Err(_) => {
+                            eprintln!("webgrab: warn=intercept-build-failed");
+                            let _ = page
+                                .execute(ContinueRequestParams::new(ev.request_id.clone()))
+                                .await;
+                        }
                     }
-                } else if let Ok(p) = ContinueRequestParams::builder()
-                    .request_id(ev.request_id.clone())
-                    .build()
-                {
-                    let _ = page.execute(p).await;
+                } else {
+                    match ContinueRequestParams::builder()
+                        .request_id(ev.request_id.clone())
+                        .build()
+                    {
+                        Ok(p) => {
+                            let _ = page.execute(p).await;
+                        }
+                        Err(_) => {
+                            eprintln!("webgrab: warn=intercept-build-failed");
+                            let _ = page
+                                .execute(ContinueRequestParams::new(ev.request_id.clone()))
+                                .await;
+                        }
+                    }
                 }
                 sh.processed.fetch_add(1, Ordering::SeqCst);
             });
@@ -354,15 +439,9 @@ async fn drive_inner(
     let blocked_now = |sh: &Shared| sh.main_blocked.load(Ordering::SeqCst);
     let netguard_err =
         || WebgrabError::new(ExitCode::Netguard, "refused internal address during render");
-    let exceed_err = |sh: &Shared, what: &str| {
-        WebgrabError::new(
-            ExitCode::Http,
-            format!(
-                "render download exceeds remaining --max-bytes budget ({} of {}) [{what}]",
-                sh.decoded.total().max(opts.max_bytes),
-                opts.max_bytes_total
-            ),
-        )
+    // Nは実測値そのもの（network=受信済み展開後バイト、dom=DOM長）。
+    let exceed_err = |n: u64, what: &str| {
+        WebgrabError::new(ExitCode::Http, exceed_msg(n, opts.max_bytes_total, what))
     };
 
     // 手順2: goto（失敗時も同期待ち+再確認してから8/7を決める）
@@ -393,7 +472,7 @@ async fn drive_inner(
             return Err(netguard_err());
         }
         if shared.decoded.exceeded() {
-            return Err(exceed_err(&shared, "network"));
+            return Err(exceed_err(shared.decoded.total(), "network"));
         }
         let idle = shared.inflight.lock().unwrap().is_idle(Instant::now());
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -422,13 +501,13 @@ async fn drive_inner(
         return Err(netguard_err());
     }
     if shared.decoded.exceeded() {
-        return Err(exceed_err(&shared, "network"));
+        return Err(exceed_err(shared.decoded.total(), "network"));
     }
     let remaining = deadline.saturating_duration_since(Instant::now());
     if let Some(dom_len) = world.dom_length(remaining).await {
         let budget_left = opts.max_bytes.saturating_sub(shared.decoded.total());
         if dom_len > budget_left {
-            return Err(exceed_err(&shared, "dom"));
+            return Err(exceed_err(dom_len, "dom"));
         }
     }
     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -562,21 +641,25 @@ impl IsolatedWorld {
 }
 
 /// リクエストURLのホストを判定する（第一層）。http(s)以外はChromeに任せる。
-async fn host_is_internal(cache: &HostCache, request_url: &str, allow_private: bool) -> bool {
+/// 遮断するときだけホスト名と解決結果を返す（終了コード8の詳細行が使う）。
+async fn host_denial(
+    cache: &HostCache,
+    request_url: &str,
+    allow_private: bool,
+) -> Option<(String, Resolution)> {
     if allow_private {
-        return false;
+        return None;
     }
-    let Ok(u) = Url::parse(request_url) else {
-        return false;
-    };
+    let u = Url::parse(request_url).ok()?;
     if !netguard::is_allowed_scheme(u.scheme()) {
-        return false;
+        return None;
     }
-    let Some(host) = u.host_str() else {
-        return false;
-    };
+    let host = u.host_str()?;
     let port = u.port_or_known_default().unwrap_or(80);
-    cache.resolve(host, port).await.is_none()
+    match cache.resolve_checked(host, port).await {
+        Resolution::Allowed(_) => None,
+        r => Some((host.to_string(), r)),
+    }
 }
 
 #[cfg(test)]
@@ -616,6 +699,7 @@ mod tests {
         let blocked = Arc::new(AtomicBool::new(true));
         let r = finalize(
             &blocked,
+            None,
             Err(WebgrabError::new(ExitCode::Http, "x")),
             0,
             0,
@@ -624,10 +708,19 @@ mod tests {
             0,
         );
         assert_eq!(r.unwrap_err().code, ExitCode::Netguard);
-        let r2 = finalize(&blocked, Ok("<html></html>".into()), 0, 0, false, 0, 0);
+        let r2 = finalize(
+            &blocked,
+            None,
+            Ok("<html></html>".into()),
+            0,
+            0,
+            false,
+            0,
+            0,
+        );
         assert_eq!(r2.unwrap_err().code, ExitCode::Netguard);
         let clear = Arc::new(AtomicBool::new(false));
-        assert!(finalize(&clear, Ok("<html></html>".into()), 0, 0, false, 0, 0).is_ok());
+        assert!(finalize(&clear, None, Ok("<html></html>".into()), 0, 0, false, 0, 0).is_ok());
     }
 
     #[test]
@@ -635,6 +728,7 @@ mod tests {
         let clear = Arc::new(AtomicBool::new(false));
         let r = finalize(
             &clear,
+            None,
             Ok("<html></html>".into()),
             0,
             0,
@@ -656,6 +750,7 @@ mod tests {
         let blocked = Arc::new(AtomicBool::new(true));
         let r = finalize(
             &blocked,
+            None,
             Ok("<html></html>".into()),
             0,
             0,
@@ -666,37 +761,140 @@ mod tests {
         assert_eq!(r.unwrap_err().code, ExitCode::Netguard);
     }
 
+    #[test]
+    fn intercept_fallback_continue_params_carry_only_request_id() {
+        // build()失敗時の再試行は request_id だけを載せる（他フィールドを補わない）。
+        let p = ContinueRequestParams::new("req-1".to_string());
+        assert_eq!(p.request_id.inner(), "req-1");
+        assert!(p.url.is_none());
+        assert!(p.method.is_none());
+        assert!(p.post_data.is_none());
+        assert!(p.headers.is_none());
+        assert!(p.intercept_response.is_none());
+    }
+
+    #[test]
+    fn netguard_warn_lines_only_for_nonzero_layers() {
+        assert!(netguard_warn_lines(0, 0).is_empty());
+        assert_eq!(
+            netguard_warn_lines(2, 0),
+            vec!["webgrab: warn=netguard-blocked layer=intercept count=2"]
+        );
+        assert_eq!(
+            netguard_warn_lines(1, 3),
+            vec![
+                "webgrab: warn=netguard-blocked layer=intercept count=1",
+                "webgrab: warn=netguard-blocked layer=proxy count=3",
+            ]
+        );
+    }
+
+    #[test]
+    fn netguard_detail_carries_ip_and_range() {
+        let denied = (
+            "meta.test".to_string(),
+            Resolution::Denied {
+                ip: "169.254.169.254".parse().unwrap(),
+                range: "link-local",
+            },
+        );
+        assert_eq!(
+            netguard_detail(Some(&denied), 2, 1),
+            "layer=intercept host=meta.test resolved=169.254.169.254 range=link-local (intercept=2 proxy=1; use --allow-private to override)"
+        );
+        let unres = ("x.invalid".to_string(), Resolution::Unresolved);
+        assert_eq!(
+            netguard_detail(Some(&unres), 1, 0),
+            "layer=intercept host=x.invalid resolved=unresolved (intercept=1 proxy=0; use --allow-private to override)"
+        );
+        let to = ("slow.test".to_string(), Resolution::Timeout);
+        assert_eq!(
+            netguard_detail(Some(&to), 1, 0),
+            "layer=intercept host=slow.test resolved=timeout (intercept=1 proxy=0; use --allow-private to override)"
+        );
+        assert_eq!(
+            netguard_detail(None, 0, 0),
+            "layer=intercept main-navigation blocked (intercept=0 proxy=0; use --allow-private to override)"
+        );
+    }
+
+    #[test]
+    fn exceed_msg_uses_measured_value() {
+        assert_eq!(
+            exceed_msg(3_000, 1_000, "dom"),
+            "render download exceeds remaining --max-bytes budget (3000 of 1000) [dom]"
+        );
+        assert_eq!(
+            exceed_msg(12, 10, ""),
+            "render download exceeds remaining --max-bytes budget (12 of 10)"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_on_drop_join_then_drop_leaves_no_task() {
+        let done = Arc::new(AtomicBool::new(false));
+        let d = done.clone();
+        let mut g = AbortOnDrop(tokio::spawn(async move {
+            d.store(true, Ordering::SeqCst);
+        }));
+        g.join().await;
+        assert!(done.load(Ordering::SeqCst));
+        assert!(g.0.is_finished());
+
+        // 未完了タスクはdropでabortされる。
+        let g2 = AbortOnDrop(tokio::spawn(std::future::pending::<()>()));
+        let raw = g2.0.abort_handle();
+        drop(g2);
+        tokio::task::yield_now().await;
+        assert!(raw.is_finished());
+    }
+
     #[tokio::test]
     async fn allow_private_short_circuits() {
         // allow_private=true では常に「内部でない」を返す（明示的オプトアウト）。
-        assert!(!host_is_internal(&HostCache::new(true), "http://127.0.0.1/", true).await);
+        assert!(
+            host_denial(&HostCache::new(true), "http://127.0.0.1/", true)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn unresolvable_host_is_fail_closed() {
         // .invalid は名前解決できない（RFC 6761）。fail-closedで遮断されること（A10）。
         assert!(
-            host_is_internal(&HostCache::new(false), "http://nonexistent.invalid/", false).await
+            host_denial(&HostCache::new(false), "http://nonexistent.invalid/", false)
+                .await
+                .is_some()
         );
     }
 
     #[tokio::test]
     async fn non_http_scheme_is_passed_through() {
         // data:等はネットワーク解決対象でなくChromeに委ねる（遮断しない）。
-        assert!(!host_is_internal(&HostCache::new(false), "data:text/html,hi", false).await);
+        assert!(
+            host_denial(&HostCache::new(false), "data:text/html,hi", false)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn literal_internal_ip_denied_in_render() {
         // ホストがIPリテラルで内部レンジなら解決成功→遮断（A10）。
         assert!(
-            host_is_internal(
+            host_denial(
                 &HostCache::new(false),
                 "http://169.254.169.254/latest/meta-data/",
                 false
             )
             .await
+            .is_some()
         );
-        assert!(host_is_internal(&HostCache::new(false), "http://[::1]/", false).await);
+        assert!(
+            host_denial(&HostCache::new(false), "http://[::1]/", false)
+                .await
+                .is_some()
+        );
     }
 }

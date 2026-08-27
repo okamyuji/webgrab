@@ -709,4 +709,17 @@ mod tests {
             "{txt}"
         );
     }
+
+    #[test]
+    fn html_meta_only_has_no_standalone_comment_guard() {
+        // meta-onlyは本文を出さないので閉じ忘れ`<!--`が有り得ない。単独の`-->`行を出さない。
+        let mut m = meta();
+        m.render_status = RenderStatus::Failed("render");
+        let out = render(Format::Html, &m, &slc("", false, false, 42), true, &[]);
+        assert_eq!(
+            out,
+            "<!-- [webgrab:meta-only total 42 chars] -->\n<!-- [webgrab:render-status failed reason=render] -->"
+        );
+        assert!(!out.contains("\n-->"), "{out}");
+    }
 }

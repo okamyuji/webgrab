@@ -65,35 +65,63 @@ fn embedded_v4(v6: Ipv6Addr) -> Vec<Ipv4Addr> {
     out
 }
 
-fn is_denied_v4(a: Ipv4Addr) -> bool {
+fn deny_range_v4(a: Ipv4Addr) -> Option<&'static str> {
     let o = a.octets();
-    a.is_loopback()                        // 127.0.0.0/8
-        || a.is_link_local()               // 169.254.0.0/16（メタデータ含む）
-        || a.is_private()                  // 10/8, 172.16/12, 192.168/16
-        || a.is_broadcast()
-        || a.is_unspecified()              // 0.0.0.0
-        || a.is_multicast()                // 224.0.0.0/4
-        || o[0] == 0                       // 0.0.0.0/8
-        || o[0] >= 240                     // 240.0.0.0/4 予約
-        || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 CGN
+    // 255.255.255.255（ブロードキャスト）は240.0.0.0/4に含まれるため`reserved`で拾う。
+    if a.is_loopback() {
+        Some("loopback") // 127.0.0.0/8
+    } else if a.is_link_local() {
+        Some("link-local") // 169.254.0.0/16（メタデータ含む）
+    } else if a.is_private() {
+        Some("private") // 10/8, 172.16/12, 192.168/16
+    } else if a.is_unspecified() {
+        Some("unspecified") // 0.0.0.0
+    } else if a.is_multicast() {
+        Some("multicast") // 224.0.0.0/4
+    } else if o[0] == 0 {
+        Some("this-network") // 0.0.0.0/8
+    } else if o[0] >= 240 {
+        Some("reserved") // 240.0.0.0/4
+    } else if o[0] == 100 && (o[1] & 0xc0) == 64 {
+        Some("cgn") // 100.64.0.0/10
+    } else {
+        None
+    }
 }
 
-fn is_denied_v6(a: Ipv6Addr) -> bool {
-    a.is_loopback()                        // ::1
-        || a.is_unspecified()              // ::
-        || a.is_multicast()                // ff00::/8
-        || (a.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
-        || (a.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
-        || embedded_v4(a).into_iter().any(is_denied_v4) // 遷移アドレス埋め込みv4
+fn deny_range_v6(a: Ipv6Addr) -> Option<&'static str> {
+    if a.is_loopback() {
+        Some("loopback") // ::1
+    } else if a.is_unspecified() {
+        Some("unspecified") // ::
+    } else if a.is_multicast() {
+        Some("multicast") // ff00::/8
+    } else if (a.segments()[0] & 0xffc0) == 0xfe80 {
+        Some("link-local") // fe80::/10
+    } else if (a.segments()[0] & 0xfe00) == 0xfc00 {
+        Some("ula") // fc00::/7
+    } else if embedded_v4(a)
+        .into_iter()
+        .any(|v| deny_range_v4(v).is_some())
+    {
+        Some("embedded-v4") // 6to4 / NAT64 / Teredo に埋め込まれた内部v4
+    } else {
+        None
+    }
+}
+
+/// 最初に一致した拒否レンジのラベルを返す。許可なら`None`。
+/// stderrの`range=`トークンに使う。IPv4-mapped等は先に正規化する。
+pub fn deny_range(ip: IpAddr) -> Option<&'static str> {
+    match normalize(ip) {
+        IpAddr::V4(a) => deny_range_v4(a),
+        IpAddr::V6(a) => deny_range_v6(a),
+    }
 }
 
 /// 与えられたIPが内部アドレス（取得を拒否すべき）か判定する。
-/// IPv4-mapped等は先に正規化してから判定する。
 pub fn is_internal(ip: IpAddr) -> bool {
-    match normalize(ip) {
-        IpAddr::V4(a) => is_denied_v4(a),
-        IpAddr::V6(a) => is_denied_v6(a),
-    }
+    deny_range(ip).is_some()
 }
 
 /// URLのスキームがhttp/httpsか検証する。
@@ -198,6 +226,28 @@ mod tests {
     #[test]
     fn multicast_v6_denied() {
         assert!(is_internal(ip("ff02::1"))); // リンクローカル全ノードマルチキャスト
+    }
+
+    #[test]
+    fn deny_range_labels_first_match() {
+        assert_eq!(deny_range(ip("127.0.0.1")), Some("loopback"));
+        assert_eq!(deny_range(ip("169.254.1.1")), Some("link-local"));
+        assert_eq!(deny_range(ip("10.0.0.1")), Some("private"));
+        assert_eq!(deny_range(ip("::1")), Some("loopback"));
+        assert_eq!(deny_range(ip("fe80::1")), Some("link-local"));
+        assert_eq!(deny_range(ip("fc00::1")), Some("ula"));
+        assert_eq!(deny_range(ip("8.8.8.8")), None);
+        assert_eq!(deny_range(ip("0.0.0.0")), Some("unspecified"));
+        assert_eq!(deny_range(ip("224.0.0.1")), Some("multicast"));
+        assert_eq!(deny_range(ip("0.1.2.3")), Some("this-network"));
+        assert_eq!(deny_range(ip("240.0.0.1")), Some("reserved"));
+        assert_eq!(deny_range(ip("255.255.255.255")), Some("reserved"));
+        assert_eq!(deny_range(ip("100.64.0.1")), Some("cgn"));
+        assert_eq!(deny_range(ip("::")), Some("unspecified"));
+        assert_eq!(deny_range(ip("ff02::1")), Some("multicast"));
+        assert_eq!(deny_range(ip("2002:7f00:0001::")), Some("embedded-v4"));
+        // 正規化を経る経路: ::ffff:10.0.0.1 は v4 の private として拾う。
+        assert_eq!(deny_range(ip("::ffff:10.0.0.1")), Some("private"));
     }
 
     #[test]

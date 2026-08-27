@@ -2103,7 +2103,7 @@ pub fn csr_fast() -> Route; csr_slow(); csr_xhr() -> Vec<Route>; static_article(
 ```bash
 mkdir -p tests/fixtures
 python3 -c "import sys;sys.stdout.write('<html><head><title>gz</title></head><body><article><p>'+'x'*2097152+' SENTINEL_GZIP_9f3c</p></article></body></html>')" | gzip -9 > tests/fixtures/big_gzip.html.gz
-ls -l tests/fixtures/big_gzip.html.gz   # 約4KiB
+ls -l tests/fixtures/big_gzip.html.gz   # 約2.1KiB
 ```
 
 `tests/fixtures/README.md`:
@@ -2111,7 +2111,7 @@ ls -l tests/fixtures/big_gzip.html.gz   # 約4KiB
 ```markdown
 # テスト fixture
 
-- `big_gzip.html.gz`: 展開後約2MiB（`x`の繰り返し + 番兵 `SENTINEL_GZIP_9f3c`）を `gzip -9` した約4KiBのバイナリ。E13/E14 で `Content-Encoding: gzip` として配信し、`--max-bytes` が展開後バイトで効くことを検証する。再生成コマンドは次のとおり。
+- `big_gzip.html.gz`: 展開後約2MiB（`x`の繰り返し + 番兵 `SENTINEL_GZIP_9f3c`）を `gzip -9` した約2.1KiBのバイナリ。E13/E14 で `Content-Encoding: gzip` として配信し、`--max-bytes` が展開後バイトで効くことを検証する。再生成コマンドは次のとおり。
 
 ```sh
 python3 -c "import sys;sys.stdout.write('<html><head><title>gz</title></head><body><article><p>'+'x'*2097152+' SENTINEL_GZIP_9f3c</p></article></body></html>')" | gzip -9 > tests/fixtures/big_gzip.html.gz

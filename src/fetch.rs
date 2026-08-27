@@ -75,11 +75,11 @@ async fn resolve_checked(
     }
     if !allow_private {
         for a in &addrs {
-            if netguard::is_internal(a.ip()) {
+            if let Some(range) = netguard::deny_range(a.ip()) {
                 return Err(
                     WebgrabError::new(ExitCode::Netguard, "refused internal address").with_detail(
                         format!(
-                            "host={host} resolved={} (use --allow-private to override)",
+                            "host={host} resolved={} range={range} (use --allow-private to override)",
                             a.ip()
                         ),
                     ),
@@ -316,6 +316,10 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(e.code, ExitCode::Netguard);
+        let d = e.detail.unwrap_or_default();
+        assert!(d.contains("host=localhost"), "{d}");
+        assert!(d.contains("resolved="), "{d}");
+        assert!(d.contains("range=loopback"), "{d}");
     }
 
     #[test]

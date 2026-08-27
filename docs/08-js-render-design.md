@@ -76,7 +76,7 @@ Round 3所見の検証として2回目のprobeで次を実測した。(7) メイ
 4. 各ポーリングの前後と手順3の終了後に`main_blocked`を再確認し、立っていれば終了コード8で中断する。`main_blocked`は`resource_type == Document`かつ`frame_id`がメインフレームIDに一致する要求（＝メインナビゲーション）が内部アドレス宛だったときに限って立てる。サブフレーム（iframe）やサブリソースの内部アドレス要求は`Fetch.failRequest`で遮断するだけで`main_blocked`を立てない（1個のiframeで終了コード8を強制されないため）。判定は純関数`is_main_navigation(resource_type, frame_id, main_frame_id)`とし単体テストする。
 5. 経過時間が実効上限に達したら、条件未達でも終了する。実効上限は`goto`直前に`min(--wait-ms, deadline − now − 2000ms)`（`saturating_sub`、負なら0）として確定し、待機上限到達は正常終了として外側のタイムアウト（終了コード7）に先んじる。2000msは手順6（同期待ち500ms + DOM長評価 + `content()`）の予備。
 6. interceptが受け取った`requestPaused`の個別タスクがすべて完了するのを最大500ms待ってから（受信+1 / 完了+1のカウンタ一致。処理中のイベントの完了だけを保証し、未受信のイベントは対象外）、手順4の再確認を再度行う。次に分離ワールドで`document.documentElement.outerHTML.length`を1回評価し（この1回だけO(DOMサイズ)）、`RenderOptions.max_bytes − decoded_total`を超えていれば終了コード4（`--auto-render`時は`reason=max-bytes`）で中断する（JSでネットワークを経ずに膨らませたDOMを`content()`前に塞ぐ。文字数はUTF-8バイト数の下界なので安全側）。最後にDOM HTML（doctype + `document.documentElement.outerHTML`）を同じ分離ワールドの評価で残り時間を上限に取得して返す（超過は終了コード7）。chromiumoxideの`page.content()`はメインワールドで評価するためページ側のgetter上書きで偽装でき（§1 probe(14)）、使わない。
-7. 終了コード8の判定は単一の経路で行う。`render_inner`は`drive`の戻り値（`Ok`/どの`Err`か）によらず、`drive`完了後にまず`main_blocked`を読み、立っていれば終了コード8を返す（`goto`失敗、evaluate/`content()`タイムアウト、展開後超過、DOM長超過、プロキシ`exceeded()`のいずれで戻った場合も同じ）。プロキシ側で遮断した要求はカウントし、1件以上あればstderrに`webgrab: warn=netguard-blocked layer=proxy count=N`を1行出す（interceptで遮断したサブリソースも`layer=intercept`で同様）。これにより、メインナビゲーション以外のSSRF試行も無通知にはならない。
+7. 終了コード8の判定は単一の経路で行う。`render_inner`は`drive`の戻り値（`Ok`/どの`Err`か）によらず、`drive`完了後にまず`main_blocked`を読み、立っていれば終了コード8を返す（`goto`失敗、evaluate/`content()`タイムアウト、展開後超過、DOM長超過、プロキシ`exceeded()`のいずれで戻った場合も同じ）。プロキシ側で遮断した要求はカウントし、1件以上あればstderrに`webgrab: warn=netguard-blocked layer=proxy count=N`を1行出す（interceptで遮断したサブリソースも`layer=intercept`で同様）。この2行は終了コード8で終わる実行でも`error=`ブロックの前に出す。これにより、メインナビゲーション以外のSSRF試行も無通知にはならない。終了コード8の詳細行は`layer=intercept host=<host> resolved=<ip> range=<range> (intercept=N proxy=M; use --allow-private to override)`とし、解決IPと拒否レンジを含める（04-design.md §7）。名前解決に失敗した場合は`resolved=unresolved`、2秒の解決上限を超えた場合は`resolved=timeout`とし、いずれも`range=`を省く。静的経路（fetch.rs）の終了コード8詳細行も`host=... resolved=... range=...`で同じ書式にそろえる。
 
 判定と計数は`src/render/wait.rs`に純関数として切り出し、Chromeなしで単体テストする。`InFlight::on_request(id, is_redirect)` / `on_done(id)` / `is_idle()`、および`should_stop(idle, stable_polls, text_len, elapsed, cap) -> bool`。
 
@@ -101,10 +101,10 @@ interceptハンドラとrenderproxyのホスト名解決には、それぞれ上
 |---|---|---|---|
 | --auto-render | フラグ | off | 静的取得の可視テキスト（スライス前）が空または200文字未満のとき、同一プロセス内でJSレンダリングに切り替える。`--raw`でも同じ基準で切り替える（`--raw`の終了コード6 / short-content免除は維持）。切替・失敗・skipはstderrの`info=` / `warn=`行、`render_status`、markdown/text/htmlの`[webgrab:render-status ...]`行で通知する。`--render`と同時指定時は`--render`が優先。注意: 外部ページは本文を短くするだけでChrome起動を誘発でき、エスカレーション時は対象オリジンへ描画1ページ分（サブリソース含む）の要求が追加で発生する。自側のコストは残余`--timeout`と残余`--max-bytes`（両経路とも展開後バイト）で上限づける |
 | --wait-ms | Option<u64>（未指定=5000。変更前2000） | 5000 | `--render` / `--auto-render`のrender時、`goto`開始からDOM取得までの上限ミリ秒（ナビゲーション時間を含む。変更前は「load後の追加待機」だった）。`--auto-render`時は残余`--timeout`に丸める。ネットワーク静止・DOM安定・可視テキスト200文字以上を満たせば上限前に終了する。`--render`と`--auto-render`のどちらも指定されていない場合は無視しstderrに`warn=flag-ignored flag=--wait-ms`を出す（現状この注記は未実装のため本改訂で実装する。明示指定の判定は`Option`の`Some`で行い、`ArgMatches`は不要） |
-| --no-sandbox | フラグ | off | Chromeのsandboxを無効化する。有効時はstderrに`warn=no-sandbox`を1行出し、継続コマンドに再現する（stdout側の継続コマンドにこのフラグが載る点はSKILLで注意喚起）。用途はsandboxが起動しないCI環境に限り、通常利用では指定しない（README「セキュリティと信頼モデル」に記載） |
+| --no-sandbox | フラグ | off | Chromeのsandboxを無効化する。Chromeを実際に起動する直前にstderrへ`warn=no-sandbox`を1行出す（エスカレーションしない実行やskipされた実行では出さない）。あわせて継続コマンドに再現する（stdout側の継続コマンドにこのフラグが載る点はSKILLで注意喚起）。用途はsandboxが起動しないCI環境に限り、通常利用では指定しない（README「セキュリティと信頼モデル」に記載） |
 | --chrome-path | パス | なし | 変更なし（継続コマンドには既に再現されている） |
 
-終了コード表は変更しない。stderrの機械可読行の種別に`info=`を加える（`error=` / `warn=` / `info=`。`info=`は失敗を意味せず、失敗する実行では`error=`ブロックが必ず後続する）。追加する行は`info=auto-render`、`warn=auto-render-failed`、`warn=auto-render-no-gain`、`warn=auto-render-skipped`、`warn=extract-grab-failed`、`warn=flag-ignored`、`warn=no-sandbox`。いずれもブロック先頭行は空白を含まないトークンだけで構成し、詳細は2行目以降に出す。詳細行のサニタイズは本文と同じ`strip_terminal_controls`（C0・DEL・C1を除去）を共有し、`\t` `\n` `\r` U+2028 U+2029は空白へ畳み、512バイトを超えない最大の文字境界で切り詰めて`…`を付す（バイト境界での切断はUTF-8の途中でpanicするため禁止）。
+終了コード表は変更しない。stderrの機械可読行の種別に`info=`を加える（`error=` / `warn=` / `info=`。`info=`は失敗を意味せず、失敗する実行では`error=`ブロックが必ず後続する）。追加する行は`info=auto-render`、`warn=auto-render-failed`、`warn=auto-render-no-gain`、`warn=auto-render-skipped`、`warn=extract-grab-failed`、`warn=flag-ignored`、`warn=no-sandbox`、`warn=intercept-build-failed`（Fetch interceptのパラメータ組み立てに失敗し、`request_id`のみで`Fetch.continueRequest`を再試行したとき）。いずれもブロック先頭行は空白を含まないトークンだけで構成し、詳細は2行目以降に出す。詳細行のサニタイズは本文と同じ`strip_terminal_controls`（C0・DEL・C1を除去）を共有し、`\t` `\n` `\r` U+2028 U+2029は空白へ畳み、512バイトを超えない最大の文字境界で切り詰めて`…`を付す（バイト境界での切断はUTF-8の途中でpanicするため禁止）。
 
 JSONエンベロープとfrontmatterに`render_status`（`static` / `rendered` / `failed` / `no-gain` / `skipped`）を追加し、JSONには`static_chars`と`rendered_chars`（可視テキスト長。renderしていなければnull）も加える。`--render`明示時は`rendered`、既定の静的経路は`static`。`--max-chars 0`と終端（`ended`）でも同じ規則で出す。markdown / text / htmlでは`render_status`が`failed` / `no-gain` / `skipped`のときだけ、既存マーカーと同じ書式の`[webgrab:render-status <status> reason=<token>]`（`reason`は`failed`が`render|max-bytes|extract`、`skipped`が`timeout|max-bytes`、`no-gain`が`shorter`）を1行付ける（htmlはコメント。htmlでは本文側の閉じ忘れ`<!--`にマーカーが飲み込まれないよう、マーカー群の直前に`-->`を1つ出す）。位置は`--fence`の閉じ行の外側で、出力順は「本文（フェンス内）→ フェンス閉じ → `[webgrab:truncated ...]`または`[webgrab:end ...]` → `[webgrab:short-content ...]` → `[webgrab:render-status ...]`」に固定する。webgrab自身が生成する行なので偽造無害化の対象外（本文側の同名文字列は従来どおり`[quoted-webgrab:`になる）。`--max-chars 0`でもこの行は出す（自己参照を含まないため既存の抑止対象外。text/htmlでは`[webgrab:meta-only ...]`の直後）。`static` / `rendered`では行を増やさない。`-o`でファイル出力した場合はstdoutが空になるため、この行は出力ファイル側に入り、経路の判別はstderrか出力ファイルで行う。
 
@@ -143,7 +143,7 @@ E2Eハーネスだけが読む環境変数を次に示す（バイナリ本体�
 | `src/convert.rs` | `visible_text_len(html) -> usize`（タグ・script・style・noscript除去、空白畳み込み、失敗しない）を追加 |
 | `src/budget.rs` | 変更なし（継続コマンドは`extra_flags`の結果を使う） |
 | `tests/common/mod.rs`（新設、`#![allow(dead_code)]`） | 任意回数のリクエストに応答し、パスごとに本文（`Vec<u8>`）・Content-Type・任意の追加ヘッダ（`Content-Encoding`等）・遅延を設定できる最小HTTPサーバ（Chromeはfavicon等も要求するため、回数固定の既存サーバでは足りない。`Content-Length`は送信バイト長）。E2Eを直列化する`Mutex` |
-| `tests/fixtures/big_gzip.html.gz`（新設） | 展開後2MiB（`x`の繰り返し + `SENTINEL_GZIP`）を`gzip -9`した約4KiBのバイナリ。生成コマンドを`tests/fixtures/README.md`に記す |
+| `tests/fixtures/big_gzip.html.gz`（新設） | 展開後2MiB（`x`の繰り返し + `SENTINEL_GZIP`）を`gzip -9`した約2.1KiBのバイナリ。生成コマンドを`tests/fixtures/README.md`に記す |
 | `tests/integration.rs` | F1の回帰テスト、`hint=`トークンの検証、skip契約の検証（短文150文字の静的fixtureに`--auto-render --timeout 3`を与え、残余が閾値未満で必ずskipすることを使って、stderrの`warn=auto-render-skipped reason=timeout`とstdoutの`[webgrab:short-content` → `[webgrab:render-status skipped reason=timeout]`の順序を検証。空本文でのskipは終了コード6と`hint=--render/--raw`として別ケース）を追加（Chrome不要） |
 | `tests/render_e2e.rs`（新設） | §6のE2E |
 | `.github/workflows/ci.yml`（新設） | §7 |
@@ -178,7 +178,7 @@ E2Eハーネスだけが読む環境変数を次に示す（バイナリ本体�
 | csr_xhr | `fetch('/api/data')`の応答（サーバ側1000ms遅延）で記事（400文字超）を描画 | `SENTINEL_XHR` |
 | static_article | 静的な記事（400文字超） | `SENTINEL_STATIC` |
 | short_static | 静的150文字の本文、JSは20文字のシェルに置換する（JSチャレンジ模擬） | `SENTINEL_SHORT` |
-| big_gzip | `tests/fixtures/big_gzip.html.gz`（展開後2MiB、約4KiB）を`Content-Encoding: gzip`、`Content-Length`=圧縮後長で返す | `SENTINEL_GZIP` |
+| big_gzip | `tests/fixtures/big_gzip.html.gz`（展開後2MiB、約2.1KiB）を`Content-Encoding: gzip`、`Content-Length`=圧縮後長で返す | `SENTINEL_GZIP` |
 | dom_bomb | 1KiBの文書で、JSが`document.body.innerHTML`に3MiB分のテキストを生成する（ネットワークを経ないDOM膨張） | `SENTINEL_DOM` |
 
 | ケース | fixture | コマンド | 期待 |
@@ -196,7 +196,7 @@ E2Eハーネスだけが読む環境変数を次に示す（バイナリ本体�
 | E10b | short_static | `--auto-render --format json` | `render_status`が`no-gain`、`rendered_chars` < `static_chars` |
 | E11 | csr_fast | `--auto-render --format json --max-chars 0` | 終了コード0、`render_status`が`rendered`、`markdown`が空文字列（判定がスライス前全文で行われる） |
 | E12 | csr_fast | `--auto-render --raw --format json` | `render_status`が`rendered`、`markdown`に`SENTINEL_FAST`（`--raw`でも可視テキスト基準で発火する） |
-| E13 | big_gzip（gzip圧縮で約4KiB、展開後2MiBの本文を`Content-Encoding: gzip`で返す） | `--render --max-bytes 1048576` | 終了コード4、stderrに`error=http`（展開後バイトで上限が効く。ワイヤ4KiBでは超過しない） |
+| E13 | big_gzip（gzip圧縮で約2.1KiB、展開後2MiBの本文を`Content-Encoding: gzip`で返す） | `--render --max-bytes 1048576` | 終了コード4、stderrに`error=http`（展開後バイトで上限が効く。ワイヤ2.1KiBでは超過しない） |
 | E14 | big_gzip | `--auto-render --max-bytes 1048576`（静的経路は`read_capped`で先に超過し終了コード4）| 終了コード4、stderrに`error=http`（静的フェーズのエラーは伝播、§4.3 1） |
 | E15 | dom_bomb | `--render --max-bytes 1048576` | 終了コード4、stderrに`error=http`（`content()`前のDOM長評価が効く） |
 

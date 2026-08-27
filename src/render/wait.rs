@@ -20,7 +20,8 @@ pub struct InFlight {
     live: HashSet<String>,
     live_order: VecDeque<String>,
     tombstones: HashMap<String, Instant>,
-    tombstone_order: VecDeque<String>,
+    /// 挿入順（=時刻順）。失効は先頭からのpopだけで済ませ、毎回の全走査を避ける。
+    tombstone_order: VecDeque<(String, Instant)>,
 }
 
 impl Default for InFlight {
@@ -44,10 +45,19 @@ impl InFlight {
         if self.tombstones.contains_key(id) || self.live.contains(id) {
             return;
         }
+        // live_orderは遅延削除。完了済みIDが先頭に溜まるのでここで前詰めする。
+        while let Some(front) = self.live_order.front() {
+            if self.live.contains(front) {
+                break;
+            }
+            self.live_order.pop_front();
+        }
         if self.live.len() >= MAX_TRACKED {
-            self.live_order
-                .pop_front()
-                .map(|old| self.live.remove(&old));
+            while let Some(old) = self.live_order.pop_front() {
+                if self.live.remove(&old) {
+                    break;
+                }
+            }
         }
         self.live.insert(id.to_string());
         self.live_order.push_back(id.to_string());
@@ -59,13 +69,13 @@ impl InFlight {
         if self.tombstones.contains_key(id) {
             return;
         }
-        if self.tombstones.len() >= MAX_TRACKED {
-            self.tombstone_order
-                .pop_front()
-                .map(|oldest| self.tombstones.remove(&oldest));
+        if self.tombstones.len() >= MAX_TRACKED
+            && let Some((oldest, _)) = self.tombstone_order.pop_front()
+        {
+            self.tombstones.remove(&oldest);
         }
         self.tombstones.insert(id.to_string(), now);
-        self.tombstone_order.push_back(id.to_string());
+        self.tombstone_order.push_back((id.to_string(), now));
     }
 
     pub fn is_idle(&mut self, now: Instant) -> bool {
@@ -83,10 +93,14 @@ impl InFlight {
 
     fn expire(&mut self, now: Instant) {
         let ttl = Duration::from_millis(TOMBSTONE_MS);
-        self.tombstones.retain(|_, t| now.duration_since(*t) < ttl);
-        self.tombstone_order
-            .retain(|id| self.tombstones.contains_key(id));
-        self.live_order.retain(|id| self.live.contains(id));
+        while let Some((_, t)) = self.tombstone_order.front() {
+            if now.duration_since(*t) < ttl {
+                break;
+            }
+            if let Some((id, _)) = self.tombstone_order.pop_front() {
+                self.tombstones.remove(&id);
+            }
+        }
     }
 }
 

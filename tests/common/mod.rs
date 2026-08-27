@@ -4,7 +4,8 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -30,6 +31,7 @@ impl Route {
 
 pub struct Server {
     pub port: u16,
+    stop: Arc<AtomicBool>,
 }
 
 impl Server {
@@ -38,39 +40,36 @@ impl Server {
     }
 }
 
-/// 任意回数の要求に応答する常駐サーバ。スレッドはプロセス終了まで生きる。
-type RouteTuple = (
-    String,
-    Vec<u8>,
-    &'static str,
-    Vec<(&'static str, String)>,
-    u64,
-);
+/// テストごとにaccept loopを畳む。listenerスレッドをプロセス終了まで残さない。
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        // accept待ちをほどくために自分へ1本つなぐ。
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+    }
+}
 
+/// 任意回数の要求に応答するサーバ。ルートはArcで共有し、接続ごとの複製をしない。
 pub fn start(routes: Vec<Route>) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let stop = Arc::new(AtomicBool::new(false));
+    let routes = Arc::new(routes);
+    let stop_t = stop.clone();
     thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let routes: Vec<RouteTuple> = routes
-                .iter()
-                .map(|r| {
-                    (
-                        r.path.to_string(),
-                        r.body.clone(),
-                        r.content_type,
-                        r.headers.clone(),
-                        r.delay_ms,
-                    )
-                })
-                .collect();
+        for stream in listener.incoming() {
+            if stop_t.load(Ordering::SeqCst) {
+                break;
+            }
+            let Ok(stream) = stream else { continue };
+            let routes = routes.clone();
             thread::spawn(move || serve_one(stream, &routes));
         }
     });
-    Server { port }
+    Server { port, stop }
 }
 
-fn serve_one(mut stream: TcpStream, routes: &[RouteTuple]) {
+fn serve_one(mut stream: TcpStream, routes: &[Route]) {
     let mut buf = [0u8; 8192];
     let n = stream.read(&mut buf).unwrap_or(0);
     let req = String::from_utf8_lossy(&buf[..n]);
@@ -81,10 +80,11 @@ fn serve_one(mut stream: TcpStream, routes: &[RouteTuple]) {
         .unwrap_or("/")
         .to_string();
     let path_only = path.split('?').next().unwrap_or("/");
-    match routes.iter().find(|r| r.0 == path_only) {
-        Some((_, body, ct, headers, delay)) => {
-            if *delay > 0 {
-                thread::sleep(Duration::from_millis(*delay));
+    match routes.iter().find(|r| r.path == path_only) {
+        Some(r) => {
+            let (body, ct, headers, delay) = (&r.body, r.content_type, &r.headers, r.delay_ms);
+            if delay > 0 {
+                thread::sleep(Duration::from_millis(delay));
             }
             let mut head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n",
@@ -249,4 +249,49 @@ pub fn dom_bomb() -> Route {
          <script>var s='<p>'+'y'.repeat(1048576)+'</p>';document.getElementById('app').innerHTML=s+s+s;</script></body></html>"
         ),
     )
+}
+
+#[cfg(test)]
+mod server_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn get(port: u16, path: &str) -> String {
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        c.read_to_end(&mut buf).unwrap();
+        String::from_utf8_lossy(&buf).to_string()
+    }
+
+    #[test]
+    fn shared_routes_serve_repeated_requests() {
+        let s = start(vec![
+            Route::html("/a", "<p>alpha</p>"),
+            Route::html("/b", "<p>beta</p>"),
+        ]);
+        assert!(get(s.port, "/a").contains("alpha"));
+        assert!(get(s.port, "/b").contains("beta"));
+        assert!(get(s.port, "/a?q=1").contains("alpha"));
+        assert!(get(s.port, "/missing").contains("404"));
+    }
+
+    #[test]
+    fn dropping_server_stops_accept_loop() {
+        let s = start(vec![Route::html("/a", "<p>alpha</p>")]);
+        let port = s.port;
+        assert!(get(port, "/a").contains("alpha"));
+        drop(s);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if TcpStream::connect(("127.0.0.1", port)).is_err() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "accept loopが止まっていない");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
 }

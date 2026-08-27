@@ -266,3 +266,30 @@ fn auto_render_skips_when_budget_is_short() {
     assert!(i_short < i_rs, "{stdout}");
     assert!(stdout.contains("retry with --render or --raw]"), "{stdout}");
 }
+
+#[test]
+fn no_sandbox_warning_only_when_chrome_launches() {
+    // Chromeを起動しない実行（エスカレーションしない静的ページ）では警告を出さない。
+    let para = "これは十分に長い本文です。抽出アルゴリズムが本文と認識できるだけの日本語文章を用意し、可視テキストが二百文字を確実に超えるようにしています。";
+    let body = format!(
+        "<html><head><title>長い記事</title></head><body><article><h1>長い記事</h1><p>{para}</p><p>{para}</p><p>{para}</p></article></body></html>"
+    );
+    let page = body.clone();
+    let port = spawn_server(4, move |path| {
+        if path == "/robots.txt" {
+            return http_response("User-agent: *\nAllow: /\n", "text/plain");
+        }
+        http_response(&page, "text/html; charset=utf-8")
+    });
+    let url = format!("http://127.0.0.1:{port}/long");
+    let (code, _stdout, stderr) = run_webgrab(&[
+        &url,
+        "--allow-private",
+        "--auto-render",
+        "--no-sandbox",
+        "--no-tokens",
+    ]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(!stderr.contains("warn=no-sandbox"), "{stderr}");
+    assert!(!stderr.contains("info=auto-render"), "{stderr}");
+}

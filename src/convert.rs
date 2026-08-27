@@ -136,20 +136,55 @@ fn unescape_leading_backslash(s: &str) -> String {
 /// script/style/noscriptを要素ごと除去し、タグを落とし、代表的な実体参照を1文字に戻し、
 /// 空白を畳んでtrimする。リンク先や画像URLは含まない。失敗しない。
 /// タグ境界に空白を挿入して、隣接する要素のテキストが単語として混在しないようにする。
+/// `<`で始まる断片のタグ終端`>`の直後位置を返す。引用符（`"`/`'`）の内側の`>`は
+/// 属性値の一部なのでタグを閉じない。終端が無ければNone。
+fn find_tag_end(s: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    for (idx, c) in s.char_indices().skip(1) {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None => match c {
+                '"' | '\'' => quote = Some(c),
+                '>' => return Some(idx + 1),
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
 pub fn visible_text_len(html: &str) -> usize {
     let stripped = strip_non_content(html);
     let mut text = String::with_capacity(stripped.len());
-    let mut in_tag = false;
-    for c in stripped.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' if in_tag => {
-                in_tag = false;
-                text.push(' ');
-            }
-            _ if in_tag => {}
-            c => text.push(c),
+    let mut i = 0usize;
+    while i < stripped.len() {
+        let rest = &stripped[i..];
+        if let Some(inner) = rest.strip_prefix("<!--") {
+            // コメントは中身ごと落とす。終端が無ければ以降すべてコメント扱い。
+            i += match inner.find("-->") {
+                Some(p) => 4 + p + 3,
+                None => rest.len(),
+            };
+            continue;
         }
+        if rest.starts_with('<') {
+            match find_tag_end(rest) {
+                Some(end) => {
+                    text.push(' ');
+                    i += end;
+                    continue;
+                }
+                // 終端`>`が無い`<`はタグではなく本文。以降を切り捨てない。
+                None => {
+                    text.push_str(rest);
+                    break;
+                }
+            }
+        }
+        let ch = rest.chars().next().unwrap();
+        text.push(ch);
+        i += ch.len_utf8();
     }
     let text = text
         .replace("&nbsp;", " ")
@@ -313,5 +348,18 @@ mod tests {
         assert_eq!(visible_text_len("<div id=\"app\"></div>"), 0);
         // 二重エスケープ: &amp;lt; は &lt; であって < ではない（4文字）。
         assert_eq!(visible_text_len("<p>&amp;lt;</p>"), 4);
+    }
+
+    #[test]
+    fn visible_text_len_tag_scanner_edge_cases() {
+        // 引用符内の`>`はタグを閉じない。
+        assert_eq!(visible_text_len("<a title=\">\">x</a>"), 1);
+        // 終端`>`の無い`<`は本文。以降も落とさない。
+        assert_eq!(visible_text_len("a < b"), 5);
+        assert_eq!(visible_text_len("<p>x<"), 2);
+        // コメントは中身ごと除去する。
+        assert_eq!(visible_text_len("<p>x</p><!-- <b>y</b> -->"), 1);
+        // 終端の無いコメントは以降すべて除去。
+        assert_eq!(visible_text_len("<p>x</p><!-- y"), 1);
     }
 }

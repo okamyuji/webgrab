@@ -128,6 +128,20 @@ fn build_stage(cli: &Cli, html: &str, final_url: &str) -> Result<Stage> {
     })
 }
 
+/// Chromeを実際に起動する直前にだけ出す。エスカレーションしない実行では出さない。
+fn warn_no_sandbox(cli: &Cli) {
+    if cli.no_sandbox {
+        eprintln!("webgrab: warn=no-sandbox");
+    }
+}
+
+/// `warn=auto-render-failed`の2行目。detailが無いときに末尾の空白を残さない。
+fn failure_detail(e: &WebgrabError) -> String {
+    crate::error::sanitize_detail(
+        format!("{} {}", e.message, e.detail.as_deref().unwrap_or("")).trim_end(),
+    )
+}
+
 fn render_options(cli: &Cli, timeout: Duration, max_bytes: u64) -> RenderOptions {
     RenderOptions {
         timeout,
@@ -151,9 +165,6 @@ pub async fn run(cli: &Cli) -> Result<String> {
     if cli.wait_ms.is_some() && !cli.render && !cli.auto_render {
         eprintln!("webgrab: warn=flag-ignored flag=--wait-ms");
     }
-    if cli.no_sandbox && (cli.render || cli.auto_render) {
-        eprintln!("webgrab: warn=no-sandbox");
-    }
 
     // 1. 静的フェーズ（または --render 明示）
     let mut status = RenderStatus::Static;
@@ -173,6 +184,7 @@ pub async fn run(cli: &Cli) -> Result<String> {
                     .with_detail(format!("url={}", cli.url)));
             }
         }
+        warn_no_sandbox(cli);
         let dom = render::render(&cli.url, &render_options(cli, timeout, cli.max_bytes)).await?;
         status = RenderStatus::Rendered;
         (dom, cli.url.clone(), 0u64)
@@ -215,6 +227,7 @@ pub async fn run(cli: &Cli) -> Result<String> {
                     "webgrab: info=auto-render reason={reason} chars={}",
                     stage.visible
                 );
+                warn_no_sandbox(cli);
                 match render::render(&final_url, &render_options(cli, rt, rb)).await {
                     Ok(dom) => match build_stage(cli, &dom, &final_url) {
                         Ok(rs) => {
@@ -229,7 +242,7 @@ pub async fn run(cli: &Cli) -> Result<String> {
                         Err(e) => match fallback_reason(Phase::Extract, &e) {
                             Some(r) => {
                                 eprintln!("webgrab: warn=auto-render-failed reason={r}");
-                                eprintln!("{}", crate::error::sanitize_detail(&e.message));
+                                eprintln!("{}", failure_detail(&e));
                                 status = RenderStatus::Failed(r);
                             }
                             None => return Err(e),
@@ -238,14 +251,7 @@ pub async fn run(cli: &Cli) -> Result<String> {
                     Err(e) => match fallback_reason(Phase::Render, &e) {
                         Some(r) => {
                             eprintln!("webgrab: warn=auto-render-failed reason={r}");
-                            eprintln!(
-                                "{}",
-                                crate::error::sanitize_detail(&format!(
-                                    "{} {}",
-                                    e.message,
-                                    e.detail.as_deref().unwrap_or("")
-                                ))
-                            );
+                            eprintln!("{}", failure_detail(&e));
                             status = RenderStatus::Failed(r);
                         }
                         None => return Err(e),
@@ -363,6 +369,18 @@ mod tests {
         assert_eq!(fallback_reason(Phase::Render, &e1), None);
         assert_eq!(fallback_reason(Phase::Extract, &e4), Some("extract"));
         assert_eq!(fallback_reason(Phase::Extract, &e1), Some("extract"));
+    }
+
+    #[test]
+    fn failure_detail_trims_trailing_space_when_no_detail() {
+        let e = WebgrabError::new(ExitCode::Render, "chrome launch failed");
+        assert_eq!(failure_detail(&e), "chrome launch failed");
+        let e2 = WebgrabError::new(ExitCode::Render, "chrome launch failed")
+            .with_detail("No such file or directory");
+        assert_eq!(
+            failure_detail(&e2),
+            "chrome launch failed No such file or directory"
+        );
     }
 
     #[test]
