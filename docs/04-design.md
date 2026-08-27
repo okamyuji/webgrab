@@ -95,6 +95,9 @@ src/
 │   ├── wait.rs      # InFlight・should_stop・effective_cap・exceed_msg等の純関数
 │   ├── world.rs     # 分離ワールドでの評価（IsolatedWorld）
 │   └── intercept.rs # Fetch interceptとNetwork監視、共有状態、netguard遮断の集計
+├── renderproxy.rs
+├── renderproxy/
+│   └── hostcache.rs # HostCache（ホスト解決2秒上限、netguard判定、実行単位キャッシュ）
 ├── decode.rs
 ├── extract.rs
 ├── convert.rs
