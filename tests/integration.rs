@@ -195,3 +195,55 @@ fn stdout_stderr_separation_on_success() {
     assert!(stdout.contains("統合テスト"));
     assert!(!stderr.contains("Markdown Content:"));
 }
+
+const EMPTY_SHELL: &str = "<html><head><title>CSR</title></head><body><div id=\"app\"></div><script>setTimeout(function(){document.getElementById('app').innerHTML='<p>late</p>'},500)</script></body></html>";
+
+#[test]
+fn empty_shell_exits_6_with_hint_token() {
+    let port = spawn_server(3, |path| {
+        if path == "/robots.txt" {
+            return "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into();
+        }
+        http_response(EMPTY_SHELL, "text/html; charset=utf-8")
+    });
+    let url = format!("http://127.0.0.1:{port}/shell");
+    let (code, _stdout, stderr) = run_webgrab(&[&url, "--allow-private"]);
+    assert_eq!(code, 6, "stderr={stderr}");
+    assert!(stderr.lines().any(|l| l.starts_with("webgrab: error=empty hint=--render/--raw")), "{stderr}");
+    assert!(stderr.contains("warn=extract-grab-failed"));
+}
+
+#[test]
+fn wait_ms_without_render_is_ignored_with_warning() {
+    let port = spawn_server(3, |path| {
+        if path == "/robots.txt" {
+            return "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into();
+        }
+        http_response(ARTICLE, "text/html; charset=utf-8")
+    });
+    let url = format!("http://127.0.0.1:{port}/a");
+    let (code, _stdout, stderr) = run_webgrab(&[&url, "--allow-private", "--wait-ms", "100"]);
+    assert_eq!(code, 0);
+    assert!(stderr.contains("warn=flag-ignored flag=--wait-ms"), "{stderr}");
+}
+
+const SHORT_ARTICLE: &str = "<html><head><title>短い</title></head><body><article><p>これは百五十文字程度の短い本文です。抽出器が本文として認識できる長さはありますが、二百文字には届きません。エスカレーション判定の境界を確認するための固定文です。末尾。</p></article></body></html>";
+
+#[test]
+fn auto_render_skips_when_budget_is_short() {
+    // --timeout 3 なら残余は常に5秒未満 → skip。Chrome不要。
+    let port = spawn_server(3, |path| {
+        if path == "/robots.txt" {
+            return "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into();
+        }
+        http_response(SHORT_ARTICLE, "text/html; charset=utf-8")
+    });
+    let url = format!("http://127.0.0.1:{port}/short");
+    let (code, stdout, stderr) = run_webgrab(&[&url, "--allow-private", "--auto-render", "--timeout", "3"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(stderr.contains("warn=auto-render-skipped reason=timeout"), "{stderr}");
+    let i_short = stdout.find("[webgrab:short-content").expect("short-content");
+    let i_rs = stdout.find("[webgrab:render-status skipped reason=timeout]").expect("render-status");
+    assert!(i_short < i_rs, "{stdout}");
+    assert!(stdout.contains("retry with --render or --raw]"), "{stdout}");
+}
