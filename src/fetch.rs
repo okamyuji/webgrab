@@ -21,6 +21,8 @@ pub struct Fetched {
     pub final_url: String,
     pub content_type: Option<String>,
     pub body: Vec<u8>,
+    /// 最終応答の展開後バイト数（残余--max-bytesの計算に使う）。
+    pub consumed_bytes: u64,
 }
 
 /// オプション（fetch層が必要とする分だけ）。
@@ -267,6 +269,7 @@ pub async fn fetch(url_str: &str, opts: &FetchOptions) -> Result<Fetched> {
         return Ok(Fetched {
             final_url: current.to_string(),
             content_type,
+            consumed_bytes: body.len() as u64,
             body,
         });
     }
