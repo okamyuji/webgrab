@@ -296,8 +296,11 @@ e2e!(e16_no_sandbox_warns_when_chrome_launches, {
     let (code, out, err) = webgrab_raw(&argv);
     assert_eq!(code, 0, "{err}");
     assert!(out.contains(SENTINEL_STATIC), "{out}");
-    assert!(
-        err.lines().any(|l| l == "webgrab: warn=no-sandbox"),
+    assert_eq!(
+        err.lines()
+            .filter(|l| *l == "webgrab: warn=no-sandbox")
+            .count(),
+        1,
         "{err}"
     );
 });

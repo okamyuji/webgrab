@@ -40,8 +40,8 @@ Round 2レビューで、当初の「名前解決後IPを判定」だけではDN
 
 判定前にアドレスを正規化する。IPv4-mapped IPv6（`::ffff:0:0/96`）とIPv4-compatible IPv6は対応するIPv4へ変換してから両体系のレンジ照合を行う。以下を拒否する。
 
-- IPv4: ループバック 127.0.0.0/8、リンクローカル 169.254.0.0/16（AWS/GCPメタデータ 169.254.169.254含む）、RFC1918（10/8・172.16/12・192.168/16）、CGN 100.64.0.0/10、`0.0.0.0/8`
-- IPv6: ループバック `::1`、未指定 `::`、リンクローカル fe80::/10、ULA fc00::/7
+- IPv4: ループバック`127.0.0.0/8`、リンクローカル`169.254.0.0/16`（AWS/GCPメタデータの`169.254.169.254`を含む）、RFC1918（`10/8`・`172.16/12`・`192.168/16`）、CGN`100.64.0.0/10`、`0.0.0.0/8`
+- IPv6: ループバック`::1`、未指定`::`、リンクローカル`fe80::/10`、ULA`fc00::/7`
 
 ### 判定と接続の一致（DNSリバインディング対策）
 
@@ -74,7 +74,7 @@ URL → [netguard] → [robots] → [fetch | render] → 生バイト+ヘッダ 
 - robots（src/robots.rs）はfetch前に対象ホストのrobots.txtを確認する（--no-robotsでスキップ）。--render経路でも同様にトップURLのrobots.txtを確認してから起動する（--no-robotsでスキップ）。ただしrender経路では、Chromeが辿るリダイレクトやクライアント側遷移（`meta refresh`、`location.href`）の着地ホストは確認されない（静的経路の全リダイレクトホップ確認とは範囲が異なる。--auto-renderのエスカレーション時は静的経路の`final_url`とその各リダイレクトホップで確認済みのため再確認しない）。robots.txt取得は--user-agentと同じUA・5秒タイムアウト・512KiBサイズ上限で行い、取得先もnetguardを通す。robots.txt応答のリダイレクト追従は最大1回かつ追従先をnetguardで再検証する。512KiB超過や取得失敗は「許可」とみなしstderrに注記して継続する。クロスホストリダイレクトが発生した場合は最終ホストのrobots.txtも確認する。robots.txt内の`User-agent:`行との照合は製品トークン`webgrab`（大文字小文字無視）で行い、--user-agent上書き時も変わらない。一致グループがなければ`*`グループを適用する。ワイルドカード`*`と行末`$`をサポートし、解釈できないパターンに一致候補がある場合は安全側（disallow扱い+stderr注記）に倒す
 - fetch（src/fetch.rs）は静的取得（reqwest）。--render指定時はrender（src/render.rs、chromiumoxide）がDOM安定後のHTMLを返す。Chrome未検出・起動失敗時は終了コード7で失敗し、stderrに静的取得への切替コマンドを提示する（暗黙フォールバックはしない）。`--auto-render`（既定off）は静的取得の可視テキストが空または200文字未満のとき同一プロセス内でrenderへ自動エスカレーションする。pipeline（src/pipeline.rs）は「静的フェーズ → エスカレーション判定 → renderフェーズ → 出力」の順で構成し、エスカレーション時の失敗のうち終了コード7・`--max-bytes`超過・render後の抽出失敗は静的結果へ復帰し（`render_status=failed`）、終了コード8（内部アドレス到達）だけは既存契約どおり出力なしで伝播する（詳細は08-js-render-design.md §4.3）
 - render.rsは一時user-data-dirを生成し、正常・異常終了ともDropガードでChromeプロセスをkillして一時ディレクトリを削除する。`goto`以降の待機は「ネットワーク静止（`RequestId`集合が空）かつDOM安定（要素数と`innerText`長が直前と2回連続一致）かつ可視テキスト200文字以上」を250msごとに判定し、満たせば早期終了、満たさなければ`--wait-ms`（既定5000ms、上限）まで待つ。判定と計数はsrc/render/wait.rsの純関数（`InFlight`、`should_stop`、`is_main_navigation`等）に切り出しChromeなしで単体テストする
-- decode（src/decode.rs）は charset判定を「HTTPヘッダ → HTML先頭1024バイトのmeta → chardetng推定」の順で行う。--render経路はCDPが常にUTF-8のDOM文字列を返すためdecodeをスキップする
+- decode（src/decode.rs）はcharset判定を「HTTPヘッダ → HTML先頭1024バイトのmeta → chardetng推定」の順で行う。--render経路はCDPが常にUTF-8のDOM文字列を返すためdecodeをスキップする
 - extract（src/extract.rs）はdom_smoothieで本文・title・公開日時を抽出。--raw指定時はスキップし、代わりにconvertの`strip_non_content`で`<script>`/`<style>`/`<noscript>`だけを除去する（JSコード・CSSの本文混入を防ぐ）。一覧/インデックスページなど本文抽出が向かないページは--raw（JS描画なら--render併用）を使う
 - convert（src/convert.rs）はhtmdでMarkdown化。クリックでスクリプトが走りうる実行系スキーム（javascript:・vbscript:・data:text/html・data:image/svg+xml）のリンク先は`unsafe-`接頭辞で無害化する。通常URLや非実行データURL（data:image/png等）はそのまま残す
 - budget（src/budget.rs）は--start-index/--max-charsで文字スライスし、tiktoken-rsで出力スライスの概算トークン数を計測（--no-tokens時は省略）。切り詰め発生時は自己記述フッタを付与
