@@ -132,6 +132,47 @@ fn unescape_leading_backslash(s: &str) -> String {
     s.to_string()
 }
 
+/// 可視テキストの文字数（Unicodeスカラー値）。エスカレーション判定と`static_chars`/`rendered_chars`に使う。
+/// script/style/noscriptを要素ごと除去し、タグを落とし、代表的な実体参照を1文字に戻し、
+/// 空白を畳んでtrimする。リンク先や画像URLは含まない。失敗しない。
+pub fn visible_text_len(html: &str) -> usize {
+    let stripped = strip_non_content(html);
+    let mut text = String::with_capacity(stripped.len());
+    let mut in_tag = false;
+    for c in stripped.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' if in_tag => {
+                in_tag = false;
+            }
+            _ if in_tag => {}
+            c => text.push(c),
+        }
+    }
+    let text = text
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'");
+    let trimmed = text.trim();
+    let mut count = 0usize;
+    let mut last_was_space = true;
+    for c in trimmed.chars() {
+        if c.is_whitespace() {
+            if !last_was_space {
+                count += 1;
+                last_was_space = true;
+            }
+        } else {
+            count += 1;
+            last_was_space = false;
+        }
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,5 +288,25 @@ mod tests {
         let t = to_text(html).unwrap();
         assert!(t.contains("item one"));
         assert!(!t.trim_start().starts_with('*'));
+    }
+
+    #[test]
+    fn visible_text_len_ignores_urls_and_scripts() {
+        // 30文字超のhrefを持つリンク10個。アンカーテキスト3文字×10=30だけが数えられる。
+        // (ホーム = ホ + ー + ム = 3 characters)
+        let nav: String = (0..10)
+            .map(|i| format!("<a href=\"https://example.com/very/long/path/segment/{i:04}/page.html\">ホーム</a>"))
+            .collect();
+        let html = format!("<html><head><style>p{{}}</style><script>var x='xxxxxxxxxx';</script></head><body><nav>{nav}</nav><div id=\"app\"></div></body></html>");
+        assert_eq!(visible_text_len(&html), 30);
+    }
+
+    #[test]
+    fn visible_text_len_counts_article_text_and_entities() {
+        let html = "<article><h1>見出し</h1><p>本文&amp;続き&nbsp;末尾</p></article>";
+        // 見出し(3) + 本文&続き 末尾(7) = 10。タグ境界は空白1つに畳まれ、trimされる。
+        assert_eq!(visible_text_len(html), 3 + 1 + 7);
+        assert_eq!(visible_text_len(""), 0);
+        assert_eq!(visible_text_len("<div id=\"app\"></div>"), 0);
     }
 }
