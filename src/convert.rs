@@ -132,10 +132,6 @@ fn unescape_leading_backslash(s: &str) -> String {
     s.to_string()
 }
 
-/// 可視テキストの文字数（Unicodeスカラー値）。エスカレーション判定と`static_chars`/`rendered_chars`に使う。
-/// script/style/noscriptを要素ごと除去し、タグを落とし、代表的な実体参照を1文字に戻し、
-/// 空白を畳んでtrimする。リンク先や画像URLは含まない。失敗しない。
-/// タグ境界に空白を挿入して、隣接する要素のテキストが単語として混在しないようにする。
 /// `<`で始まる断片のタグ終端`>`の直後位置を返す。引用符（`"`/`'`）の内側の`>`は
 /// 属性値の一部なのでタグを閉じない。終端が無ければNone。
 /// 引用に入るのは`=`の直後（間の空白は許す）に現れた引用符だけとする。
@@ -160,6 +156,10 @@ fn find_tag_end(s: &str) -> Option<usize> {
     None
 }
 
+/// 可視テキストの文字数（Unicodeスカラー値）。エスカレーション判定と`static_chars`/`rendered_chars`に使う。
+/// script/style/noscriptを要素ごと除去し、タグを落とし、代表的な実体参照を1文字に戻し、
+/// 空白を畳んでtrimする。リンク先や画像URLは含まない。失敗しない。
+/// タグ境界に空白を挿入して、隣接する要素のテキストが単語として混在しないようにする。
 pub fn visible_text_len(html: &str) -> usize {
     let stripped = strip_non_content(html);
     let mut text = String::with_capacity(stripped.len());

@@ -9,7 +9,7 @@
 //! （render経路のDoS対策、設計§3.1の総ダウンロード量上限）。
 
 use crate::netguard;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -42,17 +42,43 @@ enum Entry {
     Pending(tokio::sync::watch::Receiver<Option<Resolution>>),
 }
 
+/// キャッシュ上限。悪意あるページが無数のサブドメインを要求してもメモリを有界に保つ。
+const MAX_CACHED_HOSTS: usize = 4096;
+
+/// キャッシュ本体。挿入順を`order`に持ち、上限超過で最古のキーから捨てる。
+#[derive(Default)]
+struct Cache {
+    map: HashMap<(String, u16), Entry>,
+    order: VecDeque<(String, u16)>,
+}
+
+impl Cache {
+    /// 上限を保ったまま挿入する。新規キーのときだけ挿入順に積む
+    /// （Pending→Readyの差し替えで同じキーを二重に積まない）。
+    fn insert_bounded(&mut self, key: (String, u16), entry: Entry) {
+        if self.map.insert(key.clone(), entry).is_none() {
+            self.order.push_back(key);
+        }
+        while self.map.len() > MAX_CACHED_HOSTS {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.map.remove(&oldest);
+        }
+    }
+}
+
 /// ホスト解決の実行単位キャッシュ。intercept層とプロキシ層で共有する（設計§4.2）。
 pub struct HostCache {
     allow_private: bool,
-    map: tokio::sync::Mutex<HashMap<(String, u16), Entry>>,
+    map: tokio::sync::Mutex<Cache>,
 }
 
 impl HostCache {
     pub fn new(allow_private: bool) -> Self {
         Self {
             allow_private,
-            map: tokio::sync::Mutex::new(HashMap::new()),
+            map: tokio::sync::Mutex::new(Cache::default()),
         }
     }
 
@@ -69,12 +95,12 @@ impl HostCache {
         let key = (host.to_ascii_lowercase(), port);
         // 解決はロックの外で行う。ロックを跨いで持つと同時ミスが直列化する。
         let tx = {
-            let mut map = self.map.lock().await;
-            match map.get(&key) {
+            let mut c = self.map.lock().await;
+            match c.map.get(&key) {
                 Some(Entry::Ready(r)) => return *r,
                 Some(Entry::Pending(rx)) => {
                     let mut rx = rx.clone();
-                    drop(map);
+                    drop(c);
                     // 先着の2秒上限に相乗りする。送信側が消えた場合もfail-closed。
                     return match tokio::time::timeout(RESOLVE_TIMEOUT, rx.changed()).await {
                         Ok(Ok(())) => (*rx.borrow()).unwrap_or(Resolution::Timeout),
@@ -83,7 +109,7 @@ impl HostCache {
                 }
                 None => {
                     let (tx, rx) = tokio::sync::watch::channel(None);
-                    map.insert(key.clone(), Entry::Pending(rx));
+                    c.insert_bounded(key.clone(), Entry::Pending(rx));
                     tx
                 }
             }
@@ -115,14 +141,14 @@ impl HostCache {
             Ok(Err(_)) => Resolution::Unresolved,
             Err(_) => Resolution::Timeout,
         };
-        self.map.lock().await.insert(key, Entry::Ready(v));
+        self.map.lock().await.insert_bounded(key, Entry::Ready(v));
         let _ = tx.send(Some(v));
         v
     }
 
     #[cfg(test)]
     pub async fn cached_len(&self) -> usize {
-        self.map.lock().await.len()
+        self.map.lock().await.map.len()
     }
 }
 
@@ -168,11 +194,22 @@ pub async fn spawn(
     });
     let st = state.clone();
     let handle = tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            let st = st.clone();
-            tokio::spawn(async move {
-                let _ = handle_conn(stream, st).await;
-            });
+        loop {
+            // accept()の一時エラー（ECONNABORTED、EMFILE等）でループを抜けてはならない。
+            // 抜けるとChromeの以後の接続がすべて拒否され、サブリソースを欠いたDOMを
+            // 終了コード0で返してしまう。少し待って受付を続ける（busy loopも避ける）。
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let st = st.clone();
+                    tokio::spawn(async move {
+                        let _ = handle_conn(stream, st).await;
+                    });
+                }
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
+            }
         }
     });
     Ok((addr, state, handle))
@@ -572,6 +609,43 @@ mod tests {
         let mut sink = Vec::new();
         let _ = c.read_to_end(&mut sink).await;
         assert!(st.exceeded(), "max_bytes超過が検出されていない");
+    }
+
+    #[tokio::test]
+    async fn accept_loop_survives_an_aborted_client_handshake() {
+        // ヘッダ未完了で切断するクライアントの後も受付が続くこと（I1の回帰）。
+        let (addr, st, _h) = spawn(Arc::new(HostCache::new(false)), NO_CAP)
+            .await
+            .unwrap();
+        let aborted = TcpStream::connect(addr).await.unwrap();
+        drop(aborted);
+        for _ in 0..2 {
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            c.write_all(b"CONNECT 127.0.0.1:9 HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n")
+                .await
+                .unwrap();
+            let mut sink = Vec::new();
+            let _ = c.read_to_end(&mut sink).await;
+            assert!(
+                String::from_utf8_lossy(&sink).starts_with("HTTP/1.1 403"),
+                "中断後の接続が処理されていない"
+            );
+        }
+        assert_eq!(st.denied(), 2);
+    }
+
+    #[tokio::test]
+    async fn host_cache_is_bounded() {
+        // 上限を1件超える異なるキーを入れても、最古から捨てられて上限内に収まる。
+        let c = HostCache::new(true);
+        for port in 1..=(MAX_CACHED_HOSTS as u16 + 1) {
+            let _ = c.resolve("127.0.0.1", port).await;
+        }
+        assert!(
+            c.cached_len().await <= MAX_CACHED_HOSTS,
+            "上限を超えた: {}",
+            c.cached_len().await
+        );
     }
 
     #[tokio::test]

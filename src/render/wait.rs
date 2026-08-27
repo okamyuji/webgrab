@@ -61,6 +61,9 @@ impl InFlight {
         }
     }
 
+    /// `is_redirect`は受け取るだけで使わない。集合のsemanticsが冪等なので、
+    /// リダイレクト再送（同一`RequestId`の再通知）はそのまま無視され、区別する必要がない。
+    /// 引数を残すのは、呼び出し側でどのイベントを渡しているかが読み取れるようにするため。
     pub fn on_request(&mut self, id: &str, _is_redirect: bool, now: Instant) {
         self.expire(now);
         if self.tombstones.contains_key(id) || self.live.contains(id) {

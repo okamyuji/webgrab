@@ -70,7 +70,7 @@ Round 3所見の検証として2回目のprobeで次を実測した。(7) メイ
 2. `goto`の後、`wait_for_navigation`（load完了）を`min(1000ms, 残り時間)`を上限に`tokio::time::timeout`で待つ。既にloaded扱いなら即時に返り、上限に達したらそのまま次へ進む（load未発火のページで待機予算を使い切らないため）。この手順は最善努力であり、正しさは手順3の条件だけに依存する。`goto`自体が`Err`を返した場合は、手順6と同じintercept同期待ち（最大500ms）と`main_blocked`再確認を行ってから終了コードを決める（立っていれば8、立っていなければ7）。
 3. 250msごとに次を評価する。
    - `in_flight`が空
-   - ページ内で計算した`[要素数, innerText長]`の2数値が直前の観測と等しい（直前との一致が2回連続なら「安定」。観測3回が必要なので最短750ms）
+   - ページ内で計算した`[要素数, innerText長]`の2数値が直前の観測と等しい（直前との一致が2回連続なら「安定」。観測3回が必要なので最短500ms。初回の観測はナビゲーション待ちの直後に行い、ポーリング間隔を挟まない）
    - `innerText`のtrim後の文字数が200以上（短文閾値と同じ定数を共有する）
    すべて満たしたら終了する。評価式は`(function(){var b=document.body;return [document.getElementsByTagName('*').length,(b&&b.innerText||'').trim().length];})()`のように、常に数値配列を返し、`body`が無い文書でも例外を投げない形にし、分離ワールドの`context_id`を付けた`Page::evaluate_expression`（`EvaluateParams`）で送る。evaluateの失敗・タイムアウト・数値以外の戻り値は「条件未達」として扱い、終了コード7にはしない。各evaluateは残り時間を上限にタイムアウトさせる。
 4. 各ポーリングの前後と手順3の終了後に`main_blocked`を再確認し、立っていれば終了コード8で中断する。`main_blocked`は`resource_type == Document`かつ`frame_id`がメインフレームIDに一致する要求（＝メインナビゲーション）が内部アドレス宛だったときに限って立てる。サブフレーム（iframe）やサブリソースの内部アドレス要求は`Fetch.failRequest`で遮断するだけで`main_blocked`を立てない（1個のiframeで終了コード8を強制されないため）。判定は純関数`is_main_navigation(resource_type, frame_id, main_frame_id)`とし単体テストする。
@@ -156,7 +156,7 @@ E2Eハーネスだけが読む環境変数を次に示す（バイナリ本体�
 
 - `extract`: 空シェルHTML（`<div id="app"></div>`のみ）で`Ok`かつ本文空。記事HTMLで従来どおり本文あり
 - `wait`: `InFlight`はリダイレクト再送（同一ID、`is_redirect=true`）で件数が増えない、未知IDの`on_done`で負にならない、挿入→削除で空になる、`on_done`→`on_request`の順でも空のまま（tombstone）。`should_stop`は (idle, stable=2, text=200, elapsed<cap)→true、idle=false→false、stable=1→false、text=199→false、elapsed>=capなら他条件によらずtrue
-- `cli`: `--auto-render`と`--no-sandbox`の解析。`extra_flags`は`render_status=rendered`で`--auto-render`が`--render`に置換され、`static`/`failed`/`no-gain`/`skipped`では`--auto-render`が出ず、`--render --auto-render`では`--render`が1回だけ出る。`--wait-ms 2000`は再現され`--wait-ms 5000`（既定）は出ない。`--chrome-path`と`--no-sandbox`が再現される
+- `cli`: `--auto-render`と`--no-sandbox`の解析。`extra_flags`は`render_status=rendered`で`--auto-render`が`--render`に置換され、`static`/`failed`/`no-gain`/`skipped`では`--auto-render`が出ず、`--render --auto-render`では`--render`が1回だけ出る。`--wait-ms 2000`は再現され、既定値と同じ`--wait-ms 5000`も明示指定なら再現される（未指定のときだけ出ない）。`--chrome-path`と`--no-sandbox`が再現される
 - `pipeline`: `escalation_reason`（0→`empty`、199→`short`、200→None）。`remaining_budget`（経過が`--timeout`−5秒以上なら`Err(Timeout)`、残余バイトが256KiB未満なら`Err(MaxBytes)`、それ以外は`Ok(残余)`）。`choose_result`（rendered>static→`rendered`、それ以外→`no-gain`）。`fallback_reason`（`Render`フェーズ: 終了コード8→None、7→`render`、4→`max-bytes`。`Extract`フェーズ: 終了コード4→`extract`、1→`extract`）。`hint_for`（`static`/`skipped`→(`--render/--raw`, `--render or --raw`)、他→(`--raw`, `--raw`)）
 - `convert`: `visible_text_len`（`href`が30文字超のリンク10個からなるナビ付き空シェルでアンカーテキスト分（各2文字×10=20）だけが数えられURLは含まれない、記事→本文文字数、script/style内は数えない）
 - `wait`（追加）: `is_main_navigation`（Document + メインフレームID→true、Document + 別フレームID→false、Image→false）。`DecodedBudget::on_data(len) -> bool`（累積が上限を超えた最初の呼び出しでtrue、以後もtrue）。`host_cache`（同一`host:port`の2回目は解決を呼ばない）
@@ -231,7 +231,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@<40桁SHA> # v2
       - run: '! grep -nE "uses: .*@(v[0-9]|stable|cargo-llvm-cov)" .github/workflows/ci.yml | grep -v reusable-workflows'
-      - run: grep -q "persist-credentials: false" .github/workflows/ci.yml
+      - run: test "$(grep -c 'persist-credentials: false' .github/workflows/ci.yml)" -eq "$(grep -c 'uses: actions/checkout@' .github/workflows/ci.yml)"
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: python3 tools/doclint.py docs/

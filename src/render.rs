@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wait::{effective_cap, exceed_msg};
-use world::IsolatedWorld;
+use world::{IsolatedWorld, eval_limit};
 
 pub struct RenderOptions {
     pub timeout: Duration,
@@ -283,8 +283,11 @@ async fn drive_inner(
             return Err(exceed_err(shared.decoded.total(), "network"));
         }
         let idle = lock(&shared.inflight).is_idle(Instant::now());
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match world.measure(remaining).await {
+        let limit = eval_limit(
+            deadline.saturating_duration_since(Instant::now()),
+            cap.saturating_sub(t_goto.elapsed()),
+        );
+        match world.measure(limit).await {
             Some(cur) => {
                 if prev == Some(cur) {
                     stable += 1
@@ -311,17 +314,23 @@ async fn drive_inner(
     if shared.decoded.exceeded() {
         return Err(exceed_err(shared.decoded.total(), "network"));
     }
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if let Some(dom_len) = world.dom_length(remaining).await {
+    let limit = eval_limit(
+        deadline.saturating_duration_since(Instant::now()),
+        cap.saturating_sub(t_goto.elapsed()),
+    );
+    if let Some(dom_len) = world.dom_length(limit).await {
         let budget_left = opts.max_bytes.saturating_sub(shared.decoded.total());
         if dom_len > budget_left {
             return Err(exceed_err(dom_len, "dom"));
         }
     }
-    let remaining = deadline.saturating_duration_since(Instant::now());
+    let limit = eval_limit(
+        deadline.saturating_duration_since(Instant::now()),
+        cap.saturating_sub(t_goto.elapsed()),
+    );
     // page.content()はメインワールド評価でgetter上書きに弱いため、分離ワールドで取得する。
     let content = world
-        .dom_html(remaining)
+        .dom_html(limit)
         .await
         .ok_or_else(|| WebgrabError::new(ExitCode::Render, "content read failed or timed out"))?;
     if blocked_now(&shared) {

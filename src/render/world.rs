@@ -2,10 +2,18 @@
 //!
 //! ページ側の`defineProperty`等による上書きが効かない文脈で数値・DOM HTMLを取得する。
 
+use super::wait::CONTENT_RESERVE;
 use chromiumoxide::cdp::browser_protocol::page::{CreateIsolatedWorldParams, FrameId};
 use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextId};
 use chromiumoxide::page::Page;
 use std::time::Duration;
+
+/// 1回のevaluateに与える上限。deadline残余だけで丸めると、ハングした1回のevaluateが
+/// 手順6の予備（CONTENT_RESERVE）まで食い潰し、DOM長評価とcontent取得の時間が残らない。
+/// 待機上限（cap）の残余に予備を足した値でも丸め、どの1回も予備を越えて延びないようにする。
+pub(super) fn eval_limit(deadline_remaining: Duration, cap_remaining: Duration) -> Duration {
+    deadline_remaining.min(cap_remaining.saturating_add(CONTENT_RESERVE))
+}
 
 /// 分離ワールドでの評価。ページ側のdefineProperty等の上書きが効かない。
 pub(super) struct IsolatedWorld {
@@ -110,5 +118,23 @@ impl IsolatedWorld {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eval_limit_is_clamped_by_both_deadline_and_reserve() {
+        let ms = Duration::from_millis;
+        // cap残余3000 + 予備2000 = 5000 > deadline残余4000 なのでdeadlineが効く
+        assert_eq!(eval_limit(ms(4000), ms(3000)), ms(4000));
+        // deadline残余10000 > cap残余1000 + 予備2000 なので予備側が効く
+        assert_eq!(eval_limit(ms(10000), ms(1000)), ms(3000));
+        // 手順6（cap到達後）は予備の2000msが上限になる
+        assert_eq!(eval_limit(ms(10000), Duration::ZERO), ms(2000));
+        // deadlineが尽きていれば0（負にはならない）
+        assert_eq!(eval_limit(Duration::ZERO, ms(5000)), Duration::ZERO);
     }
 }

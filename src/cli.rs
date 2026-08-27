@@ -37,7 +37,7 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub render: bool,
 
-    /// 自動レンダリング（static取得失敗時のみChrome使用）
+    /// 自動レンダリング（静的取得の本文が空または200文字未満のときだけChrome使用）
     #[arg(long, default_value_t = false)]
     pub auto_render: bool,
 
@@ -85,7 +85,7 @@ pub struct Cli {
     #[arg(short, long)]
     pub output: Option<String>,
 
-    /// Chrome実行ファイルのパス（--render時、自動検出に失敗する場合）
+    /// Chrome実行ファイルのパス（--render / --auto-render時、自動検出に失敗する場合）
     #[arg(long)]
     pub chrome_path: Option<String>,
 }

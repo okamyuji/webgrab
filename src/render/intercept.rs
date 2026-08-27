@@ -104,10 +104,18 @@ pub(super) async fn host_denial(
     request_url: &str,
     allow_private: bool,
 ) -> Option<(String, Resolution)> {
+    let u = Url::parse(request_url).ok()?;
+    // file:はローカルファイルの読み出しに使えるため、http(s)以外で唯一fail-closedで遮断する。
+    // --allow-privateは内部「アドレス」の許可であり、ローカルファイルの持ち出しは含まない。
+    if u.scheme() == "file" {
+        return Some((
+            u.host_str().unwrap_or("file").to_string(),
+            Resolution::Unresolved,
+        ));
+    }
     if allow_private {
         return None;
     }
-    let u = Url::parse(request_url).ok()?;
     if !netguard::is_allowed_scheme(u.scheme()) {
         return None;
     }
@@ -214,14 +222,20 @@ where
 {
     tokio::spawn(async move {
         let sem = Arc::new(tokio::sync::Semaphore::new(INTERCEPT_CONCURRENCY));
+        // 子タスクはJoinSetが所有する。tokio::spawnで切り離すと、親（このタスク）が
+        // abort-on-dropガードで落ちても子は生き残り、Chrome終了後のCDP発行が残る。
+        // JoinSetはdropで全メンバをabortするため、親のabortが子まで届く。
+        let mut set = tokio::task::JoinSet::new();
         while let Some(ev) = paused.next().await {
             sh.received.fetch_add(1, Ordering::SeqCst);
             let permit = sem.clone().acquire_owned().await;
             let (page, sh, mirror) = (page.clone(), sh.clone(), mirror.clone());
-            tokio::spawn(async move {
+            set.spawn(async move {
                 let _permit = permit;
                 handle_paused(page, ev, sh, mirror).await;
             });
+            // 完了済みを回収してJoinSetの要素数を有界に保つ。
+            while set.try_join_next().is_some() {}
         }
     })
 }
@@ -384,6 +398,30 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn file_scheme_is_denied_fail_closed() {
+        // file:はローカルファイル読み出しに使えるため遮断する。--allow-privateでも解除しない。
+        assert!(
+            host_denial(&HostCache::new(false), "file:///etc/passwd", false)
+                .await
+                .is_some()
+        );
+        assert!(
+            host_denial(&HostCache::new(true), "file:///etc/passwd", true)
+                .await
+                .is_some()
+        );
+        // ネットワークを経ないスキームはChromeに委ねる（遮断しない）。
+        for u in ["blob:https://a.test/1234", "about:blank"] {
+            assert!(
+                host_denial(&HostCache::new(false), u, false)
+                    .await
+                    .is_none(),
+                "{u}"
+            );
+        }
     }
 
     #[tokio::test]
