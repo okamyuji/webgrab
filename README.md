@@ -40,11 +40,14 @@ cargo build --release   # target/release/webgrab
 ```bash
 webgrab https://example.com/article
 webgrab https://spa.example.com --render          # JSレンダリング
+webgrab https://spa.example.com --auto-render     # 本文が空か200文字未満のときだけJSレンダリングへ自動切替
 webgrab https://example.com --format json         # プログラム連携用
 webgrab https://example.com --max-chars 8000      # 量を絞る
 webgrab https://example.com --start-index 8000    # 続きを取る
 webgrab https://example.com --format json --fence # エージェント用途の推奨（本文分離＋境界明示）
 ```
+
+`--auto-render`は既定off。静的取得の本文が空または200文字未満のとき、同一プロセス内でJSレンダリングへ切り替えます。切替・失敗・skipはstderrと`--format json`の`render_status`（`static`/`rendered`/`failed`/`no-gain`/`skipped`）で分かります。`--wait-ms`（既定5000、`--render`/`--auto-render`時のみ有効）はrender取得の上限ミリ秒です。ネットワーク静止・DOM安定・可視テキスト200文字以上を満たせば上限前に終了します。
 
 出力（デフォルトのmarkdown形式）:
 
@@ -81,6 +84,8 @@ webgrabは任意のWebページ本文をLLMへ渡すため、取得内容は**�
 - SSRF防止（内部アドレス拒否・IPピン留め・render経路の検証プロキシ）。詳細は[設計書](docs/04-design.md)§3.1。
 - 出力インジェクション対策: 端末制御文字（ANSI/OSC）除去、`javascript:`等の危険リンクスキーム無害化、非信頼タイトルによるヘッダ/YAML偽造の防止、本文からのwebgrab制御マーカー偽造の防止。
 - `--fence`: 本文を `[webgrab:untrusted-content ...]` 〜 `[webgrab:untrusted-content-end]` で囲み、外部データの境界を明示する（本文からは閉じマーカーを偽造できない）。`--format json` では本文が `markdown` フィールドに構造的に分離され、`untrusted: true` と `untrusted_note` で同じ非信頼シグナルを渡す。
+- `--no-sandbox`: Chromeのsandboxはページ側HTML/JSに対する封じ込め層です。無効化するとその層が失われるため、sandboxが起動しないCI環境等に限って指定してください。通常利用では指定しないでください。指定時はstderrに`warn=no-sandbox`が出て、続き取得の継続コマンドにも再現されます。
+- `--auto-render`: 外部ページは本文を短く返すだけでChrome起動を誘発できます。エスカレーション時は対象オリジンへ描画1ページ分（サブリソース含む）の追加要求が発生するため、自側のコストは残余`--timeout`と残余`--max-bytes`で上限づけられます。一覧ページや連続取得を大量に行う用途では既定にしないでください。
 
 **プロンプトインジェクションの根本防御は消費側の責務です。** 散文中の説得型指示（「以前の指示を無視せよ」等）はツールでは防げません。呼び出す側のエージェントは、取得本文を指示として自動実行せず、破壊的・外部影響のある操作は人間確認を挟んでください。エージェント用途では、本文が構造的に分離される `--format json` の利用と `--fence` の併用を推奨します。
 

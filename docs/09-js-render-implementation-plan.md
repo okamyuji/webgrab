@@ -244,19 +244,19 @@ Interfaces:
 ```rust
     #[test]
     fn visible_text_len_ignores_urls_and_scripts() {
-        // 30文字超のhrefを持つリンク10個。アンカーテキスト2文字×10=20だけが数えられる。
+        // 30文字超のhrefを持つリンク10個。アンカーテキスト3文字×10と、リンク間の境界空白9つ = 39。hrefは数えない。
         let nav: String = (0..10)
             .map(|i| format!("<a href=\"https://example.com/very/long/path/segment/{i:04}/page.html\">ホーム</a>"))
             .collect();
         let html = format!("<html><head><style>p{{}}</style><script>var x='xxxxxxxxxx';</script></head><body><nav>{nav}</nav><div id=\"app\"></div></body></html>");
-        assert_eq!(visible_text_len(&html), 20);
+        assert_eq!(visible_text_len(&html), 39);
     }
 
     #[test]
     fn visible_text_len_counts_article_text_and_entities() {
         let html = "<article><h1>見出し</h1><p>本文&amp;続き&nbsp;末尾</p></article>";
-        // 見出し(3) + 本文&続き 末尾(7) = 10。タグ境界は空白1つに畳まれ、trimされる。
-        assert_eq!(visible_text_len(html), 3 + 1 + 7);
+        // 見出し(3) + タグ境界(1) + 本文&続き 末尾(8) = 12。タグ境界は空白1つに畳まれ、trimされる。
+        assert_eq!(visible_text_len(html), 12);
         assert_eq!(visible_text_len(""), 0);
         assert_eq!(visible_text_len("<div id=\"app\"></div>"), 0);
     }
@@ -290,11 +290,11 @@ pub fn visible_text_len(html: &str) -> usize {
     }
     let text = text
         .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
-        .replace("&#39;", "'");
+        .replace("&#39;", "'")
+        .replace("&amp;", "&"); // &amp;は最後にデコードする（先にデコードすると二重デコードで文字化けするため）
     let mut count = 0usize;
     let mut prev_space = true;
     let mut pending_space = false;
@@ -917,6 +917,8 @@ pub struct InFlight {
     live: HashSet<String>,
     live_order: VecDeque<String>,
     tombstones: HashMap<String, Instant>,
+    /// 挿入順（=時刻順）。失効は先頭からのpopだけで済ませ、毎回の全走査を避ける。
+    tombstone_order: VecDeque<(String, Instant)>,
 }
 
 impl Default for InFlight {
@@ -927,7 +929,12 @@ impl Default for InFlight {
 
 impl InFlight {
     pub fn new() -> Self {
-        Self { live: HashSet::new(), live_order: VecDeque::new(), tombstones: HashMap::new() }
+        Self {
+            live: HashSet::new(),
+            live_order: VecDeque::new(),
+            tombstones: HashMap::new(),
+            tombstone_order: VecDeque::new(),
+        }
     }
 
     pub fn on_request(&mut self, id: &str, _is_redirect: bool, now: Instant) {
@@ -935,9 +942,12 @@ impl InFlight {
         if self.tombstones.contains_key(id) || self.live.contains(id) {
             return;
         }
+        self.drain_dead_order();
         if self.live.len() >= MAX_TRACKED {
-            if let Some(old) = self.live_order.pop_front() {
-                self.live.remove(&old);
+            while let Some(old) = self.live_order.pop_front() {
+                if self.live.remove(&old) {
+                    break;
+                }
             }
         }
         self.live.insert(id.to_string());
@@ -947,10 +957,19 @@ impl InFlight {
     pub fn on_done(&mut self, id: &str, now: Instant) {
         self.expire(now);
         self.live.remove(id);
-        if self.tombstones.len() >= MAX_TRACKED {
-            self.tombstones.clear();
+        self.drain_dead_order();
+        if self.tombstones.contains_key(id) {
+            return;
+        }
+        // 上限到達時は最古のtombstoneを1件だけ捨てる（clear()による全消去はしない。
+        // 設計08 §4.2 (g)）。
+        if self.tombstones.len() >= MAX_TRACKED
+            && let Some((oldest, _)) = self.tombstone_order.pop_front()
+        {
+            self.tombstones.remove(&oldest);
         }
         self.tombstones.insert(id.to_string(), now);
+        self.tombstone_order.push_back((id.to_string(), now));
     }
 
     pub fn is_idle(&mut self, now: Instant) -> bool {
@@ -966,10 +985,28 @@ impl InFlight {
         self.live.is_empty()
     }
 
+    /// live_orderは遅延削除。先頭に溜まった完了済みIDを捨てて長さを有界に保つ。
+    fn drain_dead_order(&mut self) {
+        while let Some(front) = self.live_order.front() {
+            if self.live.contains(front) {
+                break;
+            }
+            self.live_order.pop_front();
+        }
+    }
+
+    /// 先頭からのpopだけで失効させられるのは、`now`が単調非減少で
+    /// tombstone_orderの挿入順＝時刻順になるため。
     fn expire(&mut self, now: Instant) {
         let ttl = Duration::from_millis(TOMBSTONE_MS);
-        self.tombstones.retain(|_, t| now.duration_since(*t) < ttl);
-        self.live_order.retain(|id| self.live.contains(id));
+        while let Some((_, t)) = self.tombstone_order.front() {
+            if now.duration_since(*t) < ttl {
+                break;
+            }
+            if let Some((id, _)) = self.tombstone_order.pop_front() {
+                self.tombstones.remove(&id);
+            }
+        }
     }
 }
 
