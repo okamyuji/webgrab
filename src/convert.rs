@@ -15,10 +15,29 @@ pub fn strip_non_content(html: &str) -> String {
 
 /// `<tag ...>...</tag>` を要素ごと除去する（大小無視、複数対応）。
 /// 開始タグ名の直後が区切り（空白/`>`/`/`）であることを確認し、`<scripts>`等の別タグは残す。
+/// `</tag` の直後に空白（HTMLとして正当）を挟んで `>` が来る閉じタグを探す。
+/// 見つかった場合、`haystack` 先頭からの終端直後のバイトオフセットを返す。
+fn find_close_tag_end(haystack: &str, close_prefix: &str) -> Option<usize> {
+    let bytes = haystack.as_bytes();
+    let mut search_start = 0;
+    while let Some(rel) = haystack[search_start..].find(close_prefix) {
+        let match_start = search_start + rel;
+        let mut j = match_start + close_prefix.len();
+        while j < bytes.len() && matches!(bytes[j], b' ' | b'\t' | b'\n' | b'\r') {
+            j += 1;
+        }
+        if j < bytes.len() && bytes[j] == b'>' {
+            return Some(j + 1);
+        }
+        search_start = match_start + 1;
+    }
+    None
+}
+
 fn remove_element(html: &str, tag: &str) -> String {
     let lower = html.to_ascii_lowercase();
     let open = format!("<{tag}");
-    let close = format!("</{tag}>");
+    let close_prefix = format!("</{tag}");
     let mut out = String::with_capacity(html.len());
     let mut i = 0;
     while i < html.len() {
@@ -26,9 +45,9 @@ fn remove_element(html: &str, tag: &str) -> String {
             let boundary = lower[i + open.len()..].chars().next();
             let is_tag = matches!(boundary, Some(' ' | '\t' | '\n' | '\r' | '>' | '/') | None);
             if is_tag {
-                match lower[i..].find(&close) {
+                match find_close_tag_end(&lower[i..], &close_prefix) {
                     Some(rel) => {
-                        i += rel + close.len();
+                        i += rel;
                         continue;
                     }
                     // 閉じタグが無い場合は以降をすべて捨てる（壊れたHTMLの防御）
@@ -132,6 +151,90 @@ fn unescape_leading_backslash(s: &str) -> String {
     s.to_string()
 }
 
+/// `<`で始まる断片のタグ終端`>`の直後位置を返す。引用符（`"`/`'`）の内側の`>`は
+/// 属性値の一部なのでタグを閉じない。終端が無ければNone。
+/// 引用に入るのは`=`の直後（間の空白は許す）に現れた引用符だけとする。
+/// 非引用の属性値に含まれるアポストロフィ（`data-x=it's`）を開始引用と誤認しないため。
+fn find_tag_end(s: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    let mut prev_sig: Option<char> = None;
+    for (idx, c) in s.char_indices().skip(1) {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None => match c {
+                '"' | '\'' if prev_sig == Some('=') => quote = Some(c),
+                '>' => return Some(idx + 1),
+                _ => {}
+            },
+        }
+        if !c.is_whitespace() {
+            prev_sig = Some(c);
+        }
+    }
+    None
+}
+
+/// 可視テキストの文字数（Unicodeスカラー値）。エスカレーション判定と`static_chars`/`rendered_chars`に使う。
+/// script/style/noscriptを要素ごと除去し、タグを落とし、代表的な実体参照を1文字に戻し、
+/// 空白を畳んでtrimする。リンク先や画像URLは含まない。失敗しない。
+/// タグ境界に空白を挿入して、隣接する要素のテキストが単語として混在しないようにする。
+pub fn visible_text_len(html: &str) -> usize {
+    let stripped = strip_non_content(html);
+    let mut text = String::with_capacity(stripped.len());
+    let mut i = 0usize;
+    while i < stripped.len() {
+        let rest = &stripped[i..];
+        if let Some(inner) = rest.strip_prefix("<!--") {
+            // コメントは中身ごと落とす。終端が無ければ以降すべてコメント扱い。
+            i += match inner.find("-->") {
+                Some(p) => 4 + p + 3,
+                None => rest.len(),
+            };
+            continue;
+        }
+        if rest.starts_with('<') {
+            match find_tag_end(rest) {
+                Some(end) => {
+                    text.push(' ');
+                    i += end;
+                    continue;
+                }
+                // 終端`>`が無い`<`はタグではなく本文。以降を切り捨てない。
+                None => {
+                    text.push_str(rest);
+                    break;
+                }
+            }
+        }
+        let ch = rest.chars().next().unwrap();
+        text.push(ch);
+        i += ch.len_utf8();
+    }
+    let text = text
+        .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&");
+    let trimmed = text.trim();
+    let mut count = 0usize;
+    let mut last_was_space = true;
+    for c in trimmed.chars() {
+        if c.is_whitespace() {
+            if !last_was_space {
+                count += 1;
+                last_was_space = true;
+            }
+        } else {
+            count += 1;
+            last_was_space = false;
+        }
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +295,20 @@ mod tests {
     }
 
     #[test]
+    fn visible_text_len_handles_closing_tag_with_space_before_gt() {
+        // `</script >` のように閉じタグの `>` 前に空白があっても正当なHTML。
+        // 誤って未終端扱いすると以降の本文が丸ごと落ちる回帰ガード。
+        let html = "<script>x</script ><article><p>body</p></article>";
+        assert_eq!(visible_text_len(html), 4);
+    }
+
+    #[test]
+    fn visible_text_len_handles_closing_tag_with_newline_before_gt() {
+        let html = "<script>x</SCRIPT\n><article><p>body</p></article>";
+        assert_eq!(visible_text_len(html), 4);
+    }
+
+    #[test]
     fn strip_non_content_keeps_similar_tags() {
         // <scripts> や <article> のような別タグは削らない。
         let html = "<article>本文</article>";
@@ -247,5 +364,46 @@ mod tests {
         let t = to_text(html).unwrap();
         assert!(t.contains("item one"));
         assert!(!t.trim_start().starts_with('*'));
+    }
+
+    #[test]
+    fn visible_text_len_ignores_urls_and_scripts() {
+        // 30文字超のhrefを持つリンク10個。アンカーテキスト3文字×10と、リンク間の境界空白9つ = 39。hrefは数えない。
+        let nav: String = (0..10)
+            .map(|i| format!("<a href=\"https://example.com/very/long/path/segment/{i:04}/page.html\">ホーム</a>"))
+            .collect();
+        let html = format!(
+            "<html><head><style>p{{}}</style><script>var x='xxxxxxxxxx';</script></head><body><nav>{nav}</nav><div id=\"app\"></div></body></html>"
+        );
+        assert_eq!(visible_text_len(&html), 39);
+    }
+
+    #[test]
+    fn visible_text_len_counts_article_text_and_entities() {
+        let html = "<article><h1>見出し</h1><p>本文&amp;続き&nbsp;末尾</p></article>";
+        // 見出し(3) + タグ境界(1) + 本文&続き 末尾(8) = 12。
+        assert_eq!(visible_text_len(html), 12);
+        assert_eq!(visible_text_len(""), 0);
+        assert_eq!(visible_text_len("<div id=\"app\"></div>"), 0);
+        // 二重エスケープ: &amp;lt; は &lt; であって < ではない（4文字）。
+        assert_eq!(visible_text_len("<p>&amp;lt;</p>"), 4);
+    }
+
+    #[test]
+    fn visible_text_len_tag_scanner_edge_cases() {
+        // 引用符内の`>`はタグを閉じない。
+        assert_eq!(visible_text_len("<a title=\">\">x</a>"), 1);
+        assert_eq!(visible_text_len("<a title='>'>x</a>"), 1);
+        // 非引用の属性値のアポストロフィは開始引用ではない。
+        assert_eq!(visible_text_len("<div data-x=it's>text</div>"), 4);
+        // `=`と引用符の間の空白は許す。
+        assert_eq!(visible_text_len("<a title= \">\">x</a>"), 1);
+        // 終端`>`の無い`<`は本文。以降も落とさない。
+        assert_eq!(visible_text_len("a < b"), 5);
+        assert_eq!(visible_text_len("<p>x<"), 2);
+        // コメントは中身ごと除去する。
+        assert_eq!(visible_text_len("<p>x</p><!-- <b>y</b> -->"), 1);
+        // 終端の無いコメントは以降すべて除去。
+        assert_eq!(visible_text_len("<p>x</p><!-- y"), 1);
     }
 }

@@ -8,22 +8,27 @@
 //! あわせて全接続の集約点でダウンロード総量を計上し、`--max-bytes`超過を検出する
 //! （render経路のDoS対策、設計§3.1の総ダウンロード量上限）。
 
-use crate::netguard;
+mod hostcache;
+
+pub use hostcache::{HostCache, Resolution};
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 const MAX_HEAD_BYTES: usize = 64 * 1024;
 const RELAY_BUF: usize = 16 * 1024;
 
-/// プロキシの共有状態。ダウンロード総量と上限超過フラグを全接続で共有する。
+/// プロキシの共有状態。ダウンロード総量と上限超過フラグ、遮断件数を全接続で共有する。
 pub struct ProxyState {
-    allow_private: bool,
+    cache: Arc<HostCache>,
     max_bytes: u64,
     downloaded: AtomicU64,
     exceeded: AtomicBool,
+    denied: AtomicU64,
 }
 
 impl ProxyState {
@@ -31,28 +36,50 @@ impl ProxyState {
     pub fn exceeded(&self) -> bool {
         self.exceeded.load(Ordering::SeqCst)
     }
+
+    /// netguard判定で遮断した接続数。
+    pub fn denied(&self) -> u64 {
+        self.denied.load(Ordering::SeqCst)
+    }
+
+    /// これまでにプロキシ経由で転送した総バイト数（超過メッセージの表示用）。
+    pub fn downloaded(&self) -> u64 {
+        self.downloaded.load(Ordering::SeqCst)
+    }
 }
 
 /// プロキシを127.0.0.1の空きポートで起動し、待受アドレス・共有状態・タスクハンドルを返す。
 pub async fn spawn(
-    allow_private: bool,
+    cache: Arc<HostCache>,
     max_bytes: u64,
 ) -> std::io::Result<(SocketAddr, Arc<ProxyState>, tokio::task::JoinHandle<()>)> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let addr = listener.local_addr()?;
     let state = Arc::new(ProxyState {
-        allow_private,
+        cache,
         max_bytes,
         downloaded: AtomicU64::new(0),
         exceeded: AtomicBool::new(false),
+        denied: AtomicU64::new(0),
     });
     let st = state.clone();
     let handle = tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            let st = st.clone();
-            tokio::spawn(async move {
-                let _ = handle_conn(stream, st).await;
-            });
+        loop {
+            // accept()の一時エラー（ECONNABORTED、EMFILE等）でループを抜けてはならない。
+            // 抜けるとChromeの以後の接続がすべて拒否され、サブリソースを欠いたDOMを
+            // 終了コード0で返してしまう。少し待って受付を続ける（busy loopも避ける）。
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let st = st.clone();
+                    tokio::spawn(async move {
+                        let _ = handle_conn(stream, st).await;
+                    });
+                }
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
+            }
         }
     });
     Ok((addr, state, handle))
@@ -117,25 +144,6 @@ fn parse_absolute_request(line: &str) -> Option<(String, u16, String)> {
     Some((host, port, origin_line))
 }
 
-/// ホストを解決し、内部アドレスでなければ接続先の検証済みIPを返す（fail-closed）。
-async fn validate_and_pin(host: &str, port: u16, allow_private: bool) -> Option<SocketAddr> {
-    let host = host.to_string();
-    tokio::task::spawn_blocking(move || {
-        use std::net::ToSocketAddrs;
-        let addrs: Vec<SocketAddr> = (host.as_str(), port).to_socket_addrs().ok()?.collect();
-        if addrs.is_empty() {
-            return None;
-        }
-        if !allow_private && addrs.iter().any(|a| netguard::is_internal(a.ip())) {
-            return None; // 内部アドレスを含む → 遮断
-        }
-        Some(addrs[0]) // 検証済みIPへピン留め
-    })
-    .await
-    .ok()
-    .flatten()
-}
-
 async fn handle_conn(mut client: TcpStream, st: Arc<ProxyState>) -> std::io::Result<()> {
     // リクエストヘッダ末尾（\r\n\r\n）まで読む。
     let mut head: Vec<u8> = Vec::new();
@@ -181,7 +189,8 @@ async fn handle_connect(
         let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
         return Ok(());
     };
-    let Some(addr) = validate_and_pin(&host, port, st.allow_private).await else {
+    let Some(addr) = st.cache.resolve(&host, port).await else {
+        st.denied.fetch_add(1, Ordering::SeqCst);
         let _ = client
             .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
             .await;
@@ -213,7 +222,8 @@ async fn handle_http(
         let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
         return Ok(());
     };
-    let Some(addr) = validate_and_pin(&host, port, st.allow_private).await else {
+    let Some(addr) = st.cache.resolve(&host, port).await else {
+        st.denied.fetch_add(1, Ordering::SeqCst);
         let _ = client
             .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
             .await;
@@ -366,33 +376,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_and_pin_denies_internal_literal() {
-        assert!(
-            validate_and_pin("169.254.169.254", 80, false)
-                .await
-                .is_none()
-        );
-        assert!(validate_and_pin("127.0.0.1", 80, false).await.is_none());
-        assert!(validate_and_pin("::1", 80, false).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn validate_and_pin_fail_closed_on_unresolvable() {
-        assert!(
-            validate_and_pin("nonexistent.invalid", 80, false)
-                .await
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn validate_and_pin_allows_internal_with_flag() {
-        assert!(validate_and_pin("127.0.0.1", 80, true).await.is_some());
+    async fn proxy_counts_denials() {
+        let (addr, st, _h) = spawn(Arc::new(HostCache::new(false)), 1_000_000)
+            .await
+            .unwrap();
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(b"CONNECT 127.0.0.1:9 HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n")
+            .await
+            .unwrap();
+        let mut sink = Vec::new();
+        let _ = c.read_to_end(&mut sink).await;
+        assert!(String::from_utf8_lossy(&sink).starts_with("HTTP/1.1 403"));
+        assert_eq!(st.denied(), 1);
     }
 
     #[tokio::test]
     async fn proxy_denies_connect_to_metadata_endpoint() {
-        let (addr, _st, _h) = spawn(false, NO_CAP).await.unwrap();
+        let (addr, _st, _h) = spawn(Arc::new(HostCache::new(false)), NO_CAP)
+            .await
+            .unwrap();
         let mut c = TcpStream::connect(addr).await.unwrap();
         c.write_all(b"CONNECT 169.254.169.254:443 HTTP/1.1\r\nHost: 169.254.169.254:443\r\n\r\n")
             .await
@@ -418,7 +420,7 @@ mod tests {
             }
         });
 
-        let (addr, st, _h) = spawn(true, 1024).await.unwrap();
+        let (addr, st, _h) = spawn(Arc::new(HostCache::new(true)), 1024).await.unwrap();
         let mut c = TcpStream::connect(addr).await.unwrap();
         c.write_all(format!("CONNECT {up_addr} HTTP/1.1\r\nHost: {up_addr}\r\n\r\n").as_bytes())
             .await
@@ -427,6 +429,29 @@ mod tests {
         let mut sink = Vec::new();
         let _ = c.read_to_end(&mut sink).await;
         assert!(st.exceeded(), "max_bytes超過が検出されていない");
+    }
+
+    #[tokio::test]
+    async fn accept_loop_survives_an_aborted_client_handshake() {
+        // ヘッダ未完了で切断するクライアントの後も受付が続くこと（I1の回帰）。
+        let (addr, st, _h) = spawn(Arc::new(HostCache::new(false)), NO_CAP)
+            .await
+            .unwrap();
+        let aborted = TcpStream::connect(addr).await.unwrap();
+        drop(aborted);
+        for _ in 0..2 {
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            c.write_all(b"CONNECT 127.0.0.1:9 HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n")
+                .await
+                .unwrap();
+            let mut sink = Vec::new();
+            let _ = c.read_to_end(&mut sink).await;
+            assert!(
+                String::from_utf8_lossy(&sink).starts_with("HTTP/1.1 403"),
+                "中断後の接続が処理されていない"
+            );
+        }
+        assert_eq!(st.denied(), 2);
     }
 
     #[tokio::test]
@@ -439,7 +464,9 @@ mod tests {
                 let _ = s.shutdown().await;
             }
         });
-        let (addr, st, _h) = spawn(true, 1_000_000).await.unwrap();
+        let (addr, st, _h) = spawn(Arc::new(HostCache::new(true)), 1_000_000)
+            .await
+            .unwrap();
         let mut c = TcpStream::connect(addr).await.unwrap();
         c.write_all(format!("CONNECT {up_addr} HTTP/1.1\r\nHost: {up_addr}\r\n\r\n").as_bytes())
             .await

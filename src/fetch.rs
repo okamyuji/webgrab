@@ -21,6 +21,8 @@ pub struct Fetched {
     pub final_url: String,
     pub content_type: Option<String>,
     pub body: Vec<u8>,
+    /// 最終応答の展開後バイト数（残余--max-bytesの計算に使う）。
+    pub consumed_bytes: u64,
 }
 
 /// オプション（fetch層が必要とする分だけ）。
@@ -73,11 +75,11 @@ async fn resolve_checked(
     }
     if !allow_private {
         for a in &addrs {
-            if netguard::is_internal(a.ip()) {
+            if let Some(range) = netguard::deny_range(a.ip()) {
                 return Err(
                     WebgrabError::new(ExitCode::Netguard, "refused internal address").with_detail(
                         format!(
-                            "host={host} resolved={} (use --allow-private to override)",
+                            "host={host} resolved={} range={range} (use --allow-private to override)",
                             a.ip()
                         ),
                     ),
@@ -267,6 +269,7 @@ pub async fn fetch(url_str: &str, opts: &FetchOptions) -> Result<Fetched> {
         return Ok(Fetched {
             final_url: current.to_string(),
             content_type,
+            consumed_bytes: body.len() as u64,
             body,
         });
     }
@@ -313,6 +316,10 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(e.code, ExitCode::Netguard);
+        let d = e.detail.unwrap_or_default();
+        assert!(d.contains("host=localhost"), "{d}");
+        assert!(d.contains("resolved="), "{d}");
+        assert!(d.contains("range=loopback"), "{d}");
     }
 
     #[test]
