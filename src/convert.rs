@@ -298,7 +298,9 @@ mod tests {
         let nav: String = (0..10)
             .map(|i| format!("<a href=\"https://example.com/very/long/path/segment/{i:04}/page.html\">ホーム</a>"))
             .collect();
-        let html = format!("<html><head><style>p{{}}</style><script>var x='xxxxxxxxxx';</script></head><body><nav>{nav}</nav><div id=\"app\"></div></body></html>");
+        let html = format!(
+            "<html><head><style>p{{}}</style><script>var x='xxxxxxxxxx';</script></head><body><nav>{nav}</nav><div id=\"app\"></div></body></html>"
+        );
         assert_eq!(visible_text_len(&html), 39);
     }
 

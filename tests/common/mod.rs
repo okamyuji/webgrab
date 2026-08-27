@@ -18,7 +18,13 @@ pub struct Route {
 
 impl Route {
     pub fn html(path: &'static str, body: impl Into<String>) -> Self {
-        Route { path, body: body.into().into_bytes(), content_type: "text/html; charset=utf-8", headers: vec![], delay_ms: 0 }
+        Route {
+            path,
+            body: body.into().into_bytes(),
+            content_type: "text/html; charset=utf-8",
+            headers: vec![],
+            delay_ms: 0,
+        }
     }
 }
 
@@ -33,7 +39,13 @@ impl Server {
 }
 
 /// 任意回数の要求に応答する常駐サーバ。スレッドはプロセス終了まで生きる。
-type RouteTuple = (String, Vec<u8>, &'static str, Vec<(&'static str, String)>, u64);
+type RouteTuple = (
+    String,
+    Vec<u8>,
+    &'static str,
+    Vec<(&'static str, String)>,
+    u64,
+);
 
 pub fn start(routes: Vec<Route>) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -42,7 +54,15 @@ pub fn start(routes: Vec<Route>) -> Server {
         for stream in listener.incoming().flatten() {
             let routes: Vec<RouteTuple> = routes
                 .iter()
-                .map(|r| (r.path.to_string(), r.body.clone(), r.content_type, r.headers.clone(), r.delay_ms))
+                .map(|r| {
+                    (
+                        r.path.to_string(),
+                        r.body.clone(),
+                        r.content_type,
+                        r.headers.clone(),
+                        r.delay_ms,
+                    )
+                })
                 .collect();
             thread::spawn(move || serve_one(stream, &routes));
         }
@@ -54,14 +74,22 @@ fn serve_one(mut stream: TcpStream, routes: &[RouteTuple]) {
     let mut buf = [0u8; 8192];
     let n = stream.read(&mut buf).unwrap_or(0);
     let req = String::from_utf8_lossy(&buf[..n]);
-    let path = req.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("/").to_string();
+    let path = req
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .unwrap_or("/")
+        .to_string();
     let path_only = path.split('?').next().unwrap_or("/");
     match routes.iter().find(|r| r.0 == path_only) {
         Some((_, body, ct, headers, delay)) => {
             if *delay > 0 {
                 thread::sleep(Duration::from_millis(*delay));
             }
-            let mut head = format!("HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n", body.len());
+            let mut head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                body.len()
+            );
             for (k, v) in headers {
                 head.push_str(&format!("{k}: {v}\r\n"));
             }
@@ -70,7 +98,9 @@ fn serve_one(mut stream: TcpStream, routes: &[RouteTuple]) {
             let _ = stream.write_all(body);
         }
         None => {
-            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
         }
     }
     let _ = stream.flush();
@@ -103,7 +133,10 @@ fn env_args() -> Vec<String> {
 }
 
 fn run(args: Vec<String>) -> (i32, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_webgrab")).args(&args).output().expect("binary runs");
+    let out = Command::new(env!("CARGO_BIN_EXE_webgrab"))
+        .args(&args)
+        .output()
+        .expect("binary runs");
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -137,37 +170,64 @@ pub const SENTINEL_DOM: &str = "SENTINEL_DOM_2e4f";
 
 fn article(sentinel: &str) -> String {
     let para = "これはJavaScriptで後から挿入された本文です。抽出アルゴリズムが本文と認識できる十分な長さの日本語文章を用意しています。さらに文章を続けて厚みを持たせます。";
-    format!("<article><h1>記事 {sentinel}</h1><p>{para}</p><p>{para}</p><p>{para}</p><p>{para}</p></article>")
+    format!(
+        "<article><h1>記事 {sentinel}</h1><p>{para}</p><p>{para}</p><p>{para}</p><p>{para}</p></article>"
+    )
 }
 
 fn csr(path: &'static str, delay_ms: u64, placeholder: &str, sentinel: &str) -> Route {
     let art = article(sentinel).replace('\'', "\\'");
-    Route::html(path, format!(
-        "<html><head><meta charset=\"utf-8\"><title>CSR</title></head><body><div id=\"app\">{placeholder}</div>\
+    Route::html(
+        path,
+        format!(
+            "<html><head><meta charset=\"utf-8\"><title>CSR</title></head><body><div id=\"app\">{placeholder}</div>\
          <script>setTimeout(function(){{document.getElementById('app').innerHTML='{art}';}},{delay_ms});</script></body></html>"
-    ))
+        ),
+    )
 }
 
-pub fn csr_fast() -> Route { csr("/csr_fast", 500, "", SENTINEL_FAST) }
-pub fn csr_slow() -> Route { csr("/csr_slow", 2500, "読み込み中...", SENTINEL_SLOW) }
+pub fn csr_fast() -> Route {
+    csr("/csr_fast", 500, "", SENTINEL_FAST)
+}
+pub fn csr_slow() -> Route {
+    csr("/csr_slow", 2500, "読み込み中...", SENTINEL_SLOW)
+}
 
 pub fn csr_xhr() -> Vec<Route> {
-    let page = Route::html("/csr_xhr", "<html><head><meta charset=\"utf-8\"><title>XHR</title></head><body><div id=\"app\"></div>\
-        <script>fetch('/api/data').then(function(r){return r.text()}).then(function(t){document.getElementById('app').innerHTML=t;});</script></body></html>");
-    let api = Route { path: "/api/data", body: article(SENTINEL_XHR).into_bytes(), content_type: "text/html; charset=utf-8", headers: vec![], delay_ms: 1000 };
+    let page = Route::html(
+        "/csr_xhr",
+        "<html><head><meta charset=\"utf-8\"><title>XHR</title></head><body><div id=\"app\"></div>\
+        <script>fetch('/api/data').then(function(r){return r.text()}).then(function(t){document.getElementById('app').innerHTML=t;});</script></body></html>",
+    );
+    let api = Route {
+        path: "/api/data",
+        body: article(SENTINEL_XHR).into_bytes(),
+        content_type: "text/html; charset=utf-8",
+        headers: vec![],
+        delay_ms: 1000,
+    };
     vec![page, api]
 }
 
 pub fn static_article() -> Route {
-    Route::html("/static", format!("<html><head><meta charset=\"utf-8\"><title>static</title></head><body>{}</body></html>", article(SENTINEL_STATIC)))
+    Route::html(
+        "/static",
+        format!(
+            "<html><head><meta charset=\"utf-8\"><title>static</title></head><body>{}</body></html>",
+            article(SENTINEL_STATIC)
+        ),
+    )
 }
 
 /// 静的150文字前後の本文。JSは20文字のシェルに置換する（JSチャレンジ模擬）。
 pub fn short_static() -> Route {
-    Route::html("/short", format!(
-        "<html><head><meta charset=\"utf-8\"><title>short</title></head><body><article id=\"a\"><p>これは百五十文字程度の短い本文です {SENTINEL_SHORT}。抽出器が本文として認識できる長さはありますが二百文字には届きません。エスカレーション判定の境界を確認するための固定文です。末尾。</p></article>\
+    Route::html(
+        "/short",
+        format!(
+            "<html><head><meta charset=\"utf-8\"><title>short</title></head><body><article id=\"a\"><p>これは百五十文字程度の短い本文です {SENTINEL_SHORT}。抽出器が本文として認識できる長さはありますが二百文字には届きません。エスカレーション判定の境界を確認するための固定文です。末尾。</p></article>\
          <script>document.getElementById('a').innerHTML='<p>Please enable JS.</p>';</script></body></html>"
-    ))
+        ),
+    )
 }
 
 pub fn big_gzip() -> Route {
@@ -182,8 +242,11 @@ pub fn big_gzip() -> Route {
 
 /// 1KiBの文書で、JSがネットワークを経ずに3MiBのDOMを作る。
 pub fn dom_bomb() -> Route {
-    Route::html("/dom_bomb", format!(
-        "<html><head><meta charset=\"utf-8\"><title>dom</title></head><body><div id=\"app\">{SENTINEL_DOM}</div>\
+    Route::html(
+        "/dom_bomb",
+        format!(
+            "<html><head><meta charset=\"utf-8\"><title>dom</title></head><body><div id=\"app\">{SENTINEL_DOM}</div>\
          <script>var s='<p>'+'y'.repeat(1048576)+'</p>';document.getElementById('app').innerHTML=s+s+s;</script></body></html>"
-    ))
+        ),
+    )
 }

@@ -13,31 +13,59 @@ const SKIP_TIMEOUT_MIN: Duration = Duration::from_secs(5);
 const SKIP_BYTES_MIN: u64 = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Phase { Render, Extract }
+pub enum Phase {
+    Render,
+    Extract,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SkipReason { Timeout, MaxBytes }
+pub enum SkipReason {
+    Timeout,
+    MaxBytes,
+}
 
 impl SkipReason {
     pub fn token(self) -> &'static str {
-        match self { SkipReason::Timeout => "timeout", SkipReason::MaxBytes => "max-bytes" }
+        match self {
+            SkipReason::Timeout => "timeout",
+            SkipReason::MaxBytes => "max-bytes",
+        }
     }
 }
 
 pub fn escalation_reason(visible_chars: usize) -> Option<&'static str> {
-    if visible_chars == 0 { Some("empty") } else if visible_chars < SHORT_CONTENT_CHARS { Some("short") } else { None }
+    if visible_chars == 0 {
+        Some("empty")
+    } else if visible_chars < SHORT_CONTENT_CHARS {
+        Some("short")
+    } else {
+        None
+    }
 }
 
-pub fn remaining_budget(timeout: Duration, elapsed: Duration, max_bytes: u64, consumed: u64) -> std::result::Result<(Duration, u64), SkipReason> {
+pub fn remaining_budget(
+    timeout: Duration,
+    elapsed: Duration,
+    max_bytes: u64,
+    consumed: u64,
+) -> std::result::Result<(Duration, u64), SkipReason> {
     let rt = timeout.saturating_sub(elapsed);
-    if rt < SKIP_TIMEOUT_MIN { return Err(SkipReason::Timeout); }
+    if rt < SKIP_TIMEOUT_MIN {
+        return Err(SkipReason::Timeout);
+    }
     let rb = max_bytes.saturating_sub(consumed);
-    if rb < SKIP_BYTES_MIN { return Err(SkipReason::MaxBytes); }
+    if rb < SKIP_BYTES_MIN {
+        return Err(SkipReason::MaxBytes);
+    }
     Ok((rt, rb))
 }
 
 pub fn choose_result(static_chars: usize, rendered_chars: usize) -> RenderStatus {
-    if rendered_chars > static_chars { RenderStatus::Rendered } else { RenderStatus::NoGain }
+    if rendered_chars > static_chars {
+        RenderStatus::Rendered
+    } else {
+        RenderStatus::NoGain
+    }
 }
 
 pub fn fallback_reason(phase: Phase, err: &WebgrabError) -> Option<&'static str> {
@@ -55,7 +83,9 @@ pub fn fallback_reason(phase: Phase, err: &WebgrabError) -> Option<&'static str>
 pub fn hint_for(status: RenderStatus) -> (&'static str, &'static str) {
     match status {
         RenderStatus::Static | RenderStatus::Skipped(_) => ("--render/--raw", "--render or --raw"),
-        RenderStatus::Rendered | RenderStatus::Failed(_) | RenderStatus::NoGain => ("--raw", "--raw"),
+        RenderStatus::Rendered | RenderStatus::Failed(_) | RenderStatus::NoGain => {
+            ("--raw", "--raw")
+        }
     }
 }
 
@@ -90,7 +120,12 @@ fn build_stage(cli: &Cli, html: &str, final_url: &str) -> Result<Stage> {
         _ => convert::to_markdown(&body_html)?,
     };
     let visible = convert::visible_text_len(&body_html);
-    Ok(Stage { title, published, body, visible })
+    Ok(Stage {
+        title,
+        published,
+        body,
+        visible,
+    })
 }
 
 fn render_options(cli: &Cli, timeout: Duration, max_bytes: u64) -> RenderOptions {
@@ -108,7 +143,10 @@ fn render_options(cli: &Cli, timeout: Duration, max_bytes: u64) -> RenderOptions
 /// CLIを実行し、最終出力文字列を返す。
 pub async fn run(cli: &Cli) -> Result<String> {
     let start = Instant::now();
-    let ua = cli.user_agent.clone().unwrap_or_else(cli::default_user_agent);
+    let ua = cli
+        .user_agent
+        .clone()
+        .unwrap_or_else(cli::default_user_agent);
     let timeout = Duration::from_secs(cli.timeout);
     if cli.wait_ms.is_some() && !cli.render && !cli.auto_render {
         eprintln!("webgrab: warn=flag-ignored flag=--wait-ms");
@@ -123,18 +161,32 @@ pub async fn run(cli: &Cli) -> Result<String> {
     let mut rendered_chars: Option<usize> = None;
     let (html, final_url, consumed) = if cli.render {
         if !cli.no_robots {
-            let fopts = FetchOptions { user_agent: ua, timeout, max_bytes: cli.max_bytes, allow_private: cli.allow_private, check_robots: true };
+            let fopts = FetchOptions {
+                user_agent: ua,
+                timeout,
+                max_bytes: cli.max_bytes,
+                allow_private: cli.allow_private,
+                check_robots: true,
+            };
             if !fetch::robots_precheck(&cli.url, &fopts).await? {
-                return Err(WebgrabError::new(ExitCode::Robots, "blocked by robots.txt").with_detail(format!("url={}", cli.url)));
+                return Err(WebgrabError::new(ExitCode::Robots, "blocked by robots.txt")
+                    .with_detail(format!("url={}", cli.url)));
             }
         }
         let dom = render::render(&cli.url, &render_options(cli, timeout, cli.max_bytes)).await?;
         status = RenderStatus::Rendered;
         (dom, cli.url.clone(), 0u64)
     } else {
-        let fopts = FetchOptions { user_agent: ua, timeout, max_bytes: cli.max_bytes, allow_private: cli.allow_private, check_robots: !cli.no_robots };
+        let fopts = FetchOptions {
+            user_agent: ua,
+            timeout,
+            max_bytes: cli.max_bytes,
+            allow_private: cli.allow_private,
+            check_robots: !cli.no_robots,
+        };
         let fetched = fetch::fetch(&cli.url, &fopts).await?;
-        let (text, enc, had_errors) = decode::decode(&fetched.body, fetched.content_type.as_deref());
+        let (text, enc, had_errors) =
+            decode::decode(&fetched.body, fetched.content_type.as_deref());
         if had_errors {
             eprintln!("webgrab: warn=decode-replacement enc={enc}");
         }
@@ -149,7 +201,8 @@ pub async fn run(cli: &Cli) -> Result<String> {
     }
 
     // 2〜5. エスカレーション（--auto-render、--render明示時は無効）
-    if cli.auto_render && !cli.render
+    if cli.auto_render
+        && !cli.render
         && let Some(reason) = escalation_reason(stage.visible)
     {
         match remaining_budget(timeout, start.elapsed(), cli.max_bytes, consumed) {
@@ -158,7 +211,10 @@ pub async fn run(cli: &Cli) -> Result<String> {
                 status = RenderStatus::Skipped(skip.token());
             }
             Ok((rt, rb)) => {
-                eprintln!("webgrab: info=auto-render reason={reason} chars={}", stage.visible);
+                eprintln!(
+                    "webgrab: info=auto-render reason={reason} chars={}",
+                    stage.visible
+                );
                 match render::render(&final_url, &render_options(cli, rt, rb)).await {
                     Ok(dom) => match build_stage(cli, &dom, &final_url) {
                         Ok(rs) => {
@@ -182,7 +238,14 @@ pub async fn run(cli: &Cli) -> Result<String> {
                     Err(e) => match fallback_reason(Phase::Render, &e) {
                         Some(r) => {
                             eprintln!("webgrab: warn=auto-render-failed reason={r}");
-                            eprintln!("{}", crate::error::sanitize_detail(&format!("{} {}", e.message, e.detail.as_deref().unwrap_or(""))));
+                            eprintln!(
+                                "{}",
+                                crate::error::sanitize_detail(&format!(
+                                    "{} {}",
+                                    e.message,
+                                    e.detail.as_deref().unwrap_or("")
+                                ))
+                            );
                             status = RenderStatus::Failed(r);
                         }
                         None => return Err(e),
@@ -195,23 +258,35 @@ pub async fn run(cli: &Cli) -> Result<String> {
     // 6. 空本文チェック（--rawは免除、設計§4.3 4）
     if !cli.raw && stage.body.trim().is_empty() {
         let (tok, prose) = hint_for(status);
-        return Err(WebgrabError::new(ExitCode::Empty, format!("empty body extracted; retry with {prose}")).with_token("hint", tok));
+        return Err(WebgrabError::new(
+            ExitCode::Empty,
+            format!("empty body extracted; retry with {prose}"),
+        )
+        .with_token("hint", tok));
     }
 
     // 7. 文字量制御・トークン
     let slice = budget::slice(&stage.body, cli.start_index, cli.max_chars);
     let max_chars_zero = cli.max_chars == 0;
-    let tok = if cli.no_tokens { None } else { Some(tokens::count(&slice.content)) };
+    let tok = if cli.no_tokens {
+        None
+    } else {
+        Some(tokens::count(&slice.content))
+    };
 
     // 8. 短い本文の通知（提案はrender_status基準）
     let content_len = slice.content.chars().count();
-    let (short_content, short_content_suggest) = if !cli.raw && content_len > 0 && slice.total < SHORT_CONTENT_CHARS {
-        let (hint, suggest) = hint_for(status);
-        eprintln!("webgrab: warn=short-content chars={} hint={hint}", slice.total);
-        (Some(slice.total), suggest)
-    } else {
-        (None, "")
-    };
+    let (short_content, short_content_suggest) =
+        if !cli.raw && content_len > 0 && slice.total < SHORT_CONTENT_CHARS {
+            let (hint, suggest) = hint_for(status);
+            eprintln!(
+                "webgrab: warn=short-content chars={} hint={hint}",
+                slice.total
+            );
+            (Some(slice.total), suggest)
+        } else {
+            (None, "")
+        };
 
     let meta = Meta {
         title: stage.title,
@@ -226,7 +301,13 @@ pub async fn run(cli: &Cli) -> Result<String> {
         rendered_chars,
     };
     let extra = cli::extra_flags(cli, status);
-    Ok(output::render(to_format(cli.format), &meta, &slice, max_chars_zero, &extra))
+    Ok(output::render(
+        to_format(cli.format),
+        &meta,
+        &slice,
+        max_chars_zero,
+        &extra,
+    ))
 }
 
 #[cfg(test)]
@@ -243,12 +324,24 @@ mod tests {
     #[test]
     fn remaining_budget_skips_below_thresholds() {
         let t = Duration::from_secs(30);
-        assert!(matches!(remaining_budget(t, Duration::from_secs(26), 20 << 20, 0), Err(SkipReason::Timeout)));
-        assert!(matches!(remaining_budget(t, Duration::from_secs(1), 300 * 1024, 100 * 1024), Err(SkipReason::MaxBytes)));
+        assert!(matches!(
+            remaining_budget(t, Duration::from_secs(26), 20 << 20, 0),
+            Err(SkipReason::Timeout)
+        ));
+        assert!(matches!(
+            remaining_budget(t, Duration::from_secs(1), 300 * 1024, 100 * 1024),
+            Err(SkipReason::MaxBytes)
+        ));
         let (rt, rb) = remaining_budget(t, Duration::from_secs(10), 20 << 20, 1 << 20).unwrap();
         assert_eq!(rt, Duration::from_secs(20));
         assert_eq!(rb, (20 << 20) - (1 << 20));
-        assert!(matches!(remaining_budget(t, Duration::from_secs(40), 20 << 20, 0), Err(SkipReason::Timeout)), "経過が予算超過なら0扱い");
+        assert!(
+            matches!(
+                remaining_budget(t, Duration::from_secs(40), 20 << 20, 0),
+                Err(SkipReason::Timeout)
+            ),
+            "経過が予算超過なら0扱い"
+        );
     }
 
     #[test]
@@ -274,8 +367,14 @@ mod tests {
 
     #[test]
     fn hint_follows_render_status() {
-        assert_eq!(hint_for(RenderStatus::Static), ("--render/--raw", "--render or --raw"));
-        assert_eq!(hint_for(RenderStatus::Skipped("timeout")), ("--render/--raw", "--render or --raw"));
+        assert_eq!(
+            hint_for(RenderStatus::Static),
+            ("--render/--raw", "--render or --raw")
+        );
+        assert_eq!(
+            hint_for(RenderStatus::Skipped("timeout")),
+            ("--render/--raw", "--render or --raw")
+        );
         assert_eq!(hint_for(RenderStatus::Rendered), ("--raw", "--raw"));
         assert_eq!(hint_for(RenderStatus::Failed("render")), ("--raw", "--raw"));
         assert_eq!(hint_for(RenderStatus::NoGain), ("--raw", "--raw"));

@@ -472,9 +472,7 @@ mod tests {
             }
         });
 
-        let (addr, st, _h) = spawn(Arc::new(HostCache::new(true)), 1024)
-            .await
-            .unwrap();
+        let (addr, st, _h) = spawn(Arc::new(HostCache::new(true)), 1024).await.unwrap();
         let mut c = TcpStream::connect(addr).await.unwrap();
         c.write_all(format!("CONNECT {up_addr} HTTP/1.1\r\nHost: {up_addr}\r\n\r\n").as_bytes())
             .await

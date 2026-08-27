@@ -31,7 +31,12 @@ impl Default for InFlight {
 
 impl InFlight {
     pub fn new() -> Self {
-        Self { live: HashSet::new(), live_order: VecDeque::new(), tombstones: HashMap::new(), tombstone_order: VecDeque::new() }
+        Self {
+            live: HashSet::new(),
+            live_order: VecDeque::new(),
+            tombstones: HashMap::new(),
+            tombstone_order: VecDeque::new(),
+        }
     }
 
     pub fn on_request(&mut self, id: &str, _is_redirect: bool, now: Instant) {
@@ -40,7 +45,9 @@ impl InFlight {
             return;
         }
         if self.live.len() >= MAX_TRACKED {
-            self.live_order.pop_front().map(|old| self.live.remove(&old));
+            self.live_order
+                .pop_front()
+                .map(|old| self.live.remove(&old));
         }
         self.live.insert(id.to_string());
         self.live_order.push_back(id.to_string());
@@ -53,7 +60,9 @@ impl InFlight {
             return;
         }
         if self.tombstones.len() >= MAX_TRACKED {
-            self.tombstone_order.pop_front().map(|oldest| self.tombstones.remove(&oldest));
+            self.tombstone_order
+                .pop_front()
+                .map(|oldest| self.tombstones.remove(&oldest));
         }
         self.tombstones.insert(id.to_string(), now);
         self.tombstone_order.push_back(id.to_string());
@@ -75,7 +84,8 @@ impl InFlight {
     fn expire(&mut self, now: Instant) {
         let ttl = Duration::from_millis(TOMBSTONE_MS);
         self.tombstones.retain(|_, t| now.duration_since(*t) < ttl);
-        self.tombstone_order.retain(|id| self.tombstones.contains_key(id));
+        self.tombstone_order
+            .retain(|id| self.tombstones.contains_key(id));
         self.live_order.retain(|id| self.live.contains(id));
     }
 }
@@ -89,7 +99,11 @@ pub struct DecodedBudget {
 
 impl DecodedBudget {
     pub fn new(max: u64) -> Self {
-        Self { max, total: AtomicU64::new(0), exceeded: AtomicBool::new(false) }
+        Self {
+            max,
+            total: AtomicU64::new(0),
+            exceeded: AtomicBool::new(false),
+        }
     }
     /// 加算し、上限超過ならtrue（以後もtrue）。
     pub fn on_data(&self, len: u64) -> bool {
@@ -108,7 +122,13 @@ impl DecodedBudget {
 }
 
 /// 待機終了判定（設計§4.2 手順3・5）。
-pub fn should_stop(idle: bool, stable_polls: u32, text_len: usize, elapsed: Duration, cap: Duration) -> bool {
+pub fn should_stop(
+    idle: bool,
+    stable_polls: u32,
+    text_len: usize,
+    elapsed: Duration,
+    cap: Duration,
+) -> bool {
     if elapsed >= cap {
         return true;
     }
@@ -116,7 +136,11 @@ pub fn should_stop(idle: bool, stable_polls: u32, text_len: usize, elapsed: Dura
 }
 
 /// メインナビゲーション（メインフレームのDocument要求）か（設計§4.2 手順4）。
-pub fn is_main_navigation(resource_type: &ResourceType, frame_id: &FrameId, main_frame_id: &FrameId) -> bool {
+pub fn is_main_navigation(
+    resource_type: &ResourceType,
+    frame_id: &FrameId,
+    main_frame_id: &FrameId,
+) -> bool {
     *resource_type == ResourceType::Document && frame_id == main_frame_id
 }
 
@@ -146,9 +170,15 @@ mod tests {
         let mut f = InFlight::new();
         f.on_done("x", now);
         f.on_request("x", false, now + Duration::from_millis(10));
-        assert!(f.is_idle(now + Duration::from_millis(10)), "tombstone中の遅延挿入は無視される");
+        assert!(
+            f.is_idle(now + Duration::from_millis(10)),
+            "tombstone中の遅延挿入は無視される"
+        );
         f.on_request("x", false, now + Duration::from_millis(TOMBSTONE_MS + 1));
-        assert!(!f.is_idle(now + Duration::from_millis(TOMBSTONE_MS + 1)), "失効後は通常どおり挿入される");
+        assert!(
+            !f.is_idle(now + Duration::from_millis(TOMBSTONE_MS + 1)),
+            "失効後は通常どおり挿入される"
+        );
     }
 
     #[test]
@@ -179,7 +209,10 @@ mod tests {
         assert!(!should_stop(false, 2, 200, t, cap));
         assert!(!should_stop(true, 1, 200, t, cap));
         assert!(!should_stop(true, 2, 199, t, cap));
-        assert!(should_stop(false, 0, 0, cap, cap), "上限到達は他条件によらず停止");
+        assert!(
+            should_stop(false, 0, 0, cap, cap),
+            "上限到達は他条件によらず停止"
+        );
     }
 
     #[test]
@@ -206,6 +239,10 @@ mod tests {
         f.on_request("0", false, now);
         assert_eq!(f.len(), 1, "oldest tombstone evicted, new request accepted");
         f.on_request("1", false, now);
-        assert_eq!(f.len(), 1, "next oldest still in tombstone, request ignored");
+        assert_eq!(
+            f.len(),
+            1,
+            "next oldest still in tombstone, request ignored"
+        );
     }
 }

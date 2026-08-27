@@ -207,22 +207,40 @@ mod tests {
 
     #[test]
     fn auto_render_is_replaced_by_render_only_when_rendered() {
-        let cli = Cli::try_parse_from(["webgrab", "https://x.test", "--auto-render", "--no-sandbox", "--wait-ms", "3000"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "webgrab",
+            "https://x.test",
+            "--auto-render",
+            "--no-sandbox",
+            "--wait-ms",
+            "3000",
+        ])
+        .unwrap();
         let r = extra_flags(&cli, RenderStatus::Rendered);
         assert_eq!(r.iter().filter(|s| *s == "--render").count(), 1);
         assert!(!r.iter().any(|s| s == "--auto-render"));
         assert!(r.contains(&"--no-sandbox".to_string()));
         assert!(r.contains(&"--wait-ms 3000".to_string()));
-        for st in [RenderStatus::Static, RenderStatus::NoGain, RenderStatus::Failed("render"), RenderStatus::Skipped("timeout")] {
+        for st in [
+            RenderStatus::Static,
+            RenderStatus::NoGain,
+            RenderStatus::Failed("render"),
+            RenderStatus::Skipped("timeout"),
+        ] {
             let f = extra_flags(&cli, st);
             assert!(!f.iter().any(|s| s.contains("render")), "{st:?}: {f:?}");
-            assert!(!f.iter().any(|s| s.contains("sandbox") || s.contains("wait-ms")), "{st:?}: {f:?}");
+            assert!(
+                !f.iter()
+                    .any(|s| s.contains("sandbox") || s.contains("wait-ms")),
+                "{st:?}: {f:?}"
+            );
         }
     }
 
     #[test]
     fn explicit_render_with_auto_render_emits_render_once() {
-        let cli = Cli::try_parse_from(["webgrab", "https://x.test", "--render", "--auto-render"]).unwrap();
+        let cli = Cli::try_parse_from(["webgrab", "https://x.test", "--render", "--auto-render"])
+            .unwrap();
         let f = extra_flags(&cli, RenderStatus::Rendered);
         assert_eq!(f.iter().filter(|s| *s == "--render").count(), 1);
     }
@@ -231,18 +249,37 @@ mod tests {
     fn wait_ms_default_is_not_reproduced_but_explicit_is() {
         let d = Cli::try_parse_from(["webgrab", "https://x.test", "--render"]).unwrap();
         assert_eq!(d.wait_ms, None);
-        assert!(!extra_flags(&d, RenderStatus::Rendered).iter().any(|s| s.contains("wait-ms")));
-        let e = Cli::try_parse_from(["webgrab", "https://x.test", "--render", "--wait-ms", "2000"]).unwrap();
+        assert!(
+            !extra_flags(&d, RenderStatus::Rendered)
+                .iter()
+                .any(|s| s.contains("wait-ms"))
+        );
+        let e = Cli::try_parse_from(["webgrab", "https://x.test", "--render", "--wait-ms", "2000"])
+            .unwrap();
         assert!(extra_flags(&e, RenderStatus::Rendered).contains(&"--wait-ms 2000".to_string()));
-        let same = Cli::try_parse_from(["webgrab", "https://x.test", "--render", "--wait-ms", "5000"]).unwrap();
+        let same =
+            Cli::try_parse_from(["webgrab", "https://x.test", "--render", "--wait-ms", "5000"])
+                .unwrap();
         assert!(extra_flags(&same, RenderStatus::Rendered).contains(&"--wait-ms 5000".to_string()));
     }
 
     #[test]
     fn value_flags_are_shell_quoted() {
-        let cli = Cli::try_parse_from(["webgrab", "https://x.test", "--render", "--user-agent", "a'; id; #", "--chrome-path", "/opt/x y"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "webgrab",
+            "https://x.test",
+            "--render",
+            "--user-agent",
+            "a'; id; #",
+            "--chrome-path",
+            "/opt/x y",
+        ])
+        .unwrap();
         let f = extra_flags(&cli, RenderStatus::Rendered);
-        assert!(f.contains(&r"--user-agent 'a'\''; id; #'".to_string()), "{f:?}");
+        assert!(
+            f.contains(&r"--user-agent 'a'\''; id; #'".to_string()),
+            "{f:?}"
+        );
         assert!(f.contains(&"--chrome-path '/opt/x y'".to_string()), "{f:?}");
     }
 

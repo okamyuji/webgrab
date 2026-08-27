@@ -214,7 +214,10 @@ fn render_markdown(
         out.push_str(&format!("chars: {}\n", slice.content.chars().count()));
         out.push_str(&format!("total_chars: {}\n", slice.total));
         out.push_str(&format!("truncated: {}\n", slice.truncated));
-        out.push_str(&format!("render_status: {}\n", yaml_scalar(meta.render_status.label())));
+        out.push_str(&format!(
+            "render_status: {}\n",
+            yaml_scalar(meta.render_status.label())
+        ));
         out.push_str("---\n\n");
     } else {
         out.push_str(&format!("Title: {title}\n"));
@@ -289,7 +292,10 @@ fn render_plain(
     let mut markers: Vec<String> = Vec::new();
 
     if max_chars_zero {
-        out.push_str(&wrap_marker(&format!("[webgrab:meta-only total {} chars]", slice.total), is_html));
+        out.push_str(&wrap_marker(
+            &format!("[webgrab:meta-only total {} chars]", slice.total),
+            is_html,
+        ));
     } else {
         let url = sanitize_line(&meta.url);
         out.push_str(&fenced_body(&slice.content, &url, meta.fence, is_html));
@@ -297,7 +303,10 @@ fn render_plain(
             markers.push(f);
         }
         if let Some(total) = meta.short_content {
-            markers.push(budget::short_content_marker(total, meta.short_content_suggest));
+            markers.push(budget::short_content_marker(
+                total,
+                meta.short_content_suggest,
+            ));
         }
     }
     if let Some(mk) = meta.render_status.marker() {
@@ -671,8 +680,13 @@ mod tests {
         let i_fence = md.find(FENCE_CLOSE).unwrap();
         let i_trunc = md.find("[webgrab:truncated").unwrap();
         let i_short = md.find("[webgrab:short-content").unwrap();
-        let i_rs = md.find("[webgrab:render-status failed reason=render]").unwrap();
-        assert!(i_fence < i_trunc && i_trunc < i_short && i_short < i_rs, "{md}");
+        let i_rs = md
+            .find("[webgrab:render-status failed reason=render]")
+            .unwrap();
+        assert!(
+            i_fence < i_trunc && i_trunc < i_short && i_short < i_rs,
+            "{md}"
+        );
         // rendered / static では出ない
         for st in [RenderStatus::Static, RenderStatus::Rendered] {
             let mut m3 = meta();
@@ -682,9 +696,17 @@ mod tests {
         }
         // html はコメント、直前に閉じ忘れ対策の --> が出る
         let html = render(Format::Html, &m, &s, false, &[]);
-        assert!(html.contains("-->\n<!-- [webgrab:render-status failed reason=render] -->"), "{html}");
+        assert!(
+            html.contains("-->\n<!-- [webgrab:render-status failed reason=render] -->"),
+            "{html}"
+        );
         // --max-chars 0 の text でも出る
         let txt = render(Format::Text, &m, &slc("", false, false, 42), true, &[]);
-        assert!(txt.contains("[webgrab:meta-only total 42 chars]\n[webgrab:render-status failed reason=render]"), "{txt}");
+        assert!(
+            txt.contains(
+                "[webgrab:meta-only total 42 chars]\n[webgrab:render-status failed reason=render]"
+            ),
+            "{txt}"
+        );
     }
 }

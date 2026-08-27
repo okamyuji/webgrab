@@ -120,7 +120,12 @@ pub fn sanitize_detail(s: &str) -> String {
 
 impl WebgrabError {
     pub fn new(code: ExitCode, message: impl Into<String>) -> Self {
-        Self { code, message: message.into(), detail: None, tokens: Vec::new() }
+        Self {
+            code,
+            message: message.into(),
+            detail: None,
+            tokens: Vec::new(),
+        }
     }
 
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
@@ -137,10 +142,22 @@ impl WebgrabError {
     pub fn stderr_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         if self.tokens.is_empty() {
-            lines.push(format!("webgrab: error={} {}", self.code.token(), self.message));
+            lines.push(format!(
+                "webgrab: error={} {}",
+                self.code.token(),
+                self.message
+            ));
         } else {
-            let toks: Vec<String> = self.tokens.iter().map(|(k, v)| format!("{k}={v}")).collect();
-            lines.push(format!("webgrab: error={} {}", self.code.token(), toks.join(" ")));
+            let toks: Vec<String> = self
+                .tokens
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
+            lines.push(format!(
+                "webgrab: error={} {}",
+                self.code.token(),
+                toks.join(" ")
+            ));
             lines.push(self.message.clone());
         }
         if let Some(d) = &self.detail {

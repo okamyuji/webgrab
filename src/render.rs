@@ -80,7 +80,9 @@ fn proxy_args(port: u16) -> [String; 2] {
 
 /// `goto`直前に確定する実効待機上限: min(--wait-ms, deadline − now − 予備2000ms)。
 fn effective_cap(wait_ms: u64, deadline: Instant, now: Instant) -> Duration {
-    let remaining = deadline.saturating_duration_since(now).saturating_sub(CONTENT_RESERVE);
+    let remaining = deadline
+        .saturating_duration_since(now)
+        .saturating_sub(CONTENT_RESERVE);
     Duration::from_millis(wait_ms).min(remaining)
 }
 
@@ -110,7 +112,9 @@ fn finalize(
     if proxy_exceeded {
         return Err(WebgrabError::new(
             ExitCode::Http,
-            format!("render download exceeds remaining --max-bytes budget ({proxy_bytes} of {max_bytes_total})"),
+            format!(
+                "render download exceeds remaining --max-bytes budget ({proxy_bytes} of {max_bytes_total})"
+            ),
         ));
     }
     result
@@ -121,20 +125,29 @@ pub async fn render(url_str: &str, opts: &RenderOptions) -> Result<String> {
     let deadline = Instant::now() + opts.timeout;
     match tokio::time::timeout(opts.timeout, render_inner(url_str, opts, deadline)).await {
         Ok(r) => r,
-        Err(_) => Err(WebgrabError::new(ExitCode::Render, "render timed out (--timeout exceeded)")),
+        Err(_) => Err(WebgrabError::new(
+            ExitCode::Render,
+            "render timed out (--timeout exceeded)",
+        )),
     }
 }
 
 async fn render_inner(url_str: &str, opts: &RenderOptions, deadline: Instant) -> Result<String> {
     // 一時user-data-dirを生成する。TempDirのDrop（RAII）でディレクトリが削除されるため、
     // --timeoutキャンセルやpanic時もプロファイルが残置されない（設計§4）。
-    let user_data = tempfile::Builder::new().prefix("webgrab-chrome-").tempdir().map_err(|e| {
-        WebgrabError::new(ExitCode::Render, "temp dir failed").with_detail(e.to_string())
-    })?;
+    let user_data = tempfile::Builder::new()
+        .prefix("webgrab-chrome-")
+        .tempdir()
+        .map_err(|e| {
+            WebgrabError::new(ExitCode::Render, "temp dir failed").with_detail(e.to_string())
+        })?;
     let cache = Arc::new(HostCache::new(opts.allow_private));
     let (proxy_addr, proxy_state, proxy_handle) = renderproxy::spawn(cache.clone(), opts.max_bytes)
         .await
-        .map_err(|e| WebgrabError::new(ExitCode::Render, "ssrf proxy start failed").with_detail(e.to_string()))?;
+        .map_err(|e| {
+            WebgrabError::new(ExitCode::Render, "ssrf proxy start failed")
+                .with_detail(e.to_string())
+        })?;
     let _proxy_guard = AbortOnDrop(proxy_handle);
 
     let mut builder = BrowserConfig::builder()
@@ -151,12 +164,25 @@ async fn render_inner(url_str: &str, opts: &RenderOptions, deadline: Instant) ->
         .build()
         .map_err(|e| WebgrabError::new(ExitCode::Render, "chrome config failed").with_detail(e))?;
     let (mut browser, mut handler) = Browser::launch(config).await.map_err(|e| {
-        WebgrabError::new(ExitCode::Render, "chrome launch failed (is Chrome installed?)").with_detail(e.to_string())
+        WebgrabError::new(
+            ExitCode::Render,
+            "chrome launch failed (is Chrome installed?)",
+        )
+        .with_detail(e.to_string())
     })?;
     let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
     let main_blocked = Arc::new(AtomicBool::new(false));
-    let (result, blocked_intercept) = drive(&mut browser, url_str, opts, deadline, cache, &proxy_state, main_blocked.clone()).await;
+    let (result, blocked_intercept) = drive(
+        &mut browser,
+        url_str,
+        opts,
+        deadline,
+        cache,
+        &proxy_state,
+        main_blocked.clone(),
+    )
+    .await;
 
     let _ = browser.close().await;
     let _ = handler_task.await;
@@ -182,8 +208,23 @@ async fn drive(
     main_blocked: Arc<AtomicBool>,
 ) -> (Result<String>, u64) {
     let shared_holder: Arc<Mutex<Option<Arc<Shared>>>> = Arc::new(Mutex::new(None));
-    let r = drive_inner(browser, url_str, opts, deadline, cache, proxy_state, main_blocked, shared_holder.clone()).await;
-    let blocked = shared_holder.lock().unwrap().as_ref().map(|s| s.blocked_intercept.load(Ordering::SeqCst)).unwrap_or(0);
+    let r = drive_inner(
+        browser,
+        url_str,
+        opts,
+        deadline,
+        cache,
+        proxy_state,
+        main_blocked,
+        shared_holder.clone(),
+    )
+    .await;
+    let blocked = shared_holder
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.blocked_intercept.load(Ordering::SeqCst))
+        .unwrap_or(0);
     (r, blocked)
 }
 
@@ -198,8 +239,12 @@ async fn drive_inner(
     main_blocked: Arc<AtomicBool>,
     shared_holder: Arc<Mutex<Option<Arc<Shared>>>>,
 ) -> Result<String> {
-    let render_err = |m: &'static str, e: String| WebgrabError::new(ExitCode::Render, m).with_detail(e);
-    let page = browser.new_page("about:blank").await.map_err(|e| render_err("new page failed", e.to_string()))?;
+    let render_err =
+        |m: &'static str, e: String| WebgrabError::new(ExitCode::Render, m).with_detail(e);
+    let page = browser
+        .new_page("about:blank")
+        .await
+        .map_err(|e| render_err("new page failed", e.to_string()))?;
 
     // 手順0: メインフレームID（Fetch.enable前に取得。取れなければfail-closedで終了コード7）
     let main_frame = page
@@ -223,13 +268,27 @@ async fn drive_inner(
     // main_blockedは外側(finalize)が読むArcへ転写するため、Shared側の変化を都度反映する。
     let mirror = main_blocked;
 
-    page.execute(EnableParams::default()).await.map_err(|e| render_err("fetch enable failed", e.to_string()))?;
+    page.execute(EnableParams::default())
+        .await
+        .map_err(|e| render_err("fetch enable failed", e.to_string()))?;
 
     // 手順1: 監視タスク（Network 4イベント）
-    let mut sent = page.event_listener::<EventRequestWillBeSent>().await.map_err(|e| render_err("listener failed", e.to_string()))?;
-    let mut fin = page.event_listener::<EventLoadingFinished>().await.map_err(|e| render_err("listener failed", e.to_string()))?;
-    let mut fail = page.event_listener::<EventLoadingFailed>().await.map_err(|e| render_err("listener failed", e.to_string()))?;
-    let mut data = page.event_listener::<EventDataReceived>().await.map_err(|e| render_err("listener failed", e.to_string()))?;
+    let mut sent = page
+        .event_listener::<EventRequestWillBeSent>()
+        .await
+        .map_err(|e| render_err("listener failed", e.to_string()))?;
+    let mut fin = page
+        .event_listener::<EventLoadingFinished>()
+        .await
+        .map_err(|e| render_err("listener failed", e.to_string()))?;
+    let mut fail = page
+        .event_listener::<EventLoadingFailed>()
+        .await
+        .map_err(|e| render_err("listener failed", e.to_string()))?;
+    let mut data = page
+        .event_listener::<EventDataReceived>()
+        .await
+        .map_err(|e| render_err("listener failed", e.to_string()))?;
     let sh = shared.clone();
     let _monitor = AbortOnDrop(tokio::spawn(async move {
         loop {
@@ -246,7 +305,10 @@ async fn drive_inner(
     }));
 
     // 手順1: interceptタスク（個別タスク化、同時16、ホスト判定キャッシュ）
-    let mut paused = page.event_listener::<EventRequestPaused>().await.map_err(|e| render_err("listener failed", e.to_string()))?;
+    let mut paused = page
+        .event_listener::<EventRequestPaused>()
+        .await
+        .map_err(|e| render_err("listener failed", e.to_string()))?;
     let page_i = page.clone();
     let sh = shared.clone();
     let mirror_i = mirror.clone();
@@ -266,12 +328,22 @@ async fn drive_inner(
                         mirror.store(true, Ordering::SeqCst);
                     }
                     if let Some(nid) = &ev.network_id {
-                        sh.inflight.lock().unwrap().on_done(nid.inner(), Instant::now());
+                        sh.inflight
+                            .lock()
+                            .unwrap()
+                            .on_done(nid.inner(), Instant::now());
                     }
-                    if let Ok(p) = FailRequestParams::builder().request_id(ev.request_id.clone()).error_reason(ErrorReason::AccessDenied).build() {
+                    if let Ok(p) = FailRequestParams::builder()
+                        .request_id(ev.request_id.clone())
+                        .error_reason(ErrorReason::AccessDenied)
+                        .build()
+                    {
                         let _ = page.execute(p).await;
                     }
-                } else if let Ok(p) = ContinueRequestParams::builder().request_id(ev.request_id.clone()).build() {
+                } else if let Ok(p) = ContinueRequestParams::builder()
+                    .request_id(ev.request_id.clone())
+                    .build()
+                {
                     let _ = page.execute(p).await;
                 }
                 sh.processed.fetch_add(1, Ordering::SeqCst);
@@ -280,12 +352,17 @@ async fn drive_inner(
     }));
 
     let blocked_now = |sh: &Shared| sh.main_blocked.load(Ordering::SeqCst);
-    let netguard_err = || WebgrabError::new(ExitCode::Netguard, "refused internal address during render");
+    let netguard_err =
+        || WebgrabError::new(ExitCode::Netguard, "refused internal address during render");
     let exceed_err = |sh: &Shared, what: &str| {
-        WebgrabError::new(ExitCode::Http, format!(
-            "render download exceeds remaining --max-bytes budget ({} of {}) [{what}]",
-            sh.decoded.total().max(opts.max_bytes), opts.max_bytes_total
-        ))
+        WebgrabError::new(
+            ExitCode::Http,
+            format!(
+                "render download exceeds remaining --max-bytes budget ({} of {}) [{what}]",
+                sh.decoded.total().max(opts.max_bytes),
+                opts.max_bytes_total
+            ),
+        )
     };
 
     // 手順2: goto（失敗時も同期待ち+再確認してから8/7を決める）
@@ -293,44 +370,66 @@ async fn drive_inner(
     let cap = effective_cap(opts.wait_ms, deadline, t_goto);
     if let Err(e) = page.goto(url_str).await {
         sync_wait(&shared).await;
-        if blocked_now(&shared) { return Err(netguard_err()); }
+        if blocked_now(&shared) {
+            return Err(netguard_err());
+        }
         return Err(render_err("navigation failed", e.to_string()));
     }
     let nav_wait = NAV_WAIT_MAX.min(deadline.saturating_duration_since(Instant::now()));
     let _ = tokio::time::timeout(nav_wait, page.wait_for_navigation()).await; // 最善努力
 
     // 分離ワールド（ページ側の上書きが効かない文脈で評価する）。goto後に遅延生成する（about:blankの文脈は破棄済み）。
-    let mut world = IsolatedWorld { page: page.clone(), frame: main_frame.clone(), ctx: None };
+    let mut world = IsolatedWorld {
+        page: page.clone(),
+        frame: main_frame.clone(),
+        ctx: None,
+    };
 
     // 手順3〜5: ポーリング
     let mut prev: Option<[u64; 2]> = None;
     let mut stable: u32 = 0;
     loop {
-        if blocked_now(&shared) { return Err(netguard_err()); }
-        if shared.decoded.exceeded() { return Err(exceed_err(&shared, "network")); }
+        if blocked_now(&shared) {
+            return Err(netguard_err());
+        }
+        if shared.decoded.exceeded() {
+            return Err(exceed_err(&shared, "network"));
+        }
         let idle = shared.inflight.lock().unwrap().is_idle(Instant::now());
         let remaining = deadline.saturating_duration_since(Instant::now());
         match world.measure(remaining).await {
             Some(cur) => {
-                if prev == Some(cur) { stable += 1 } else { stable = 0 }
+                if prev == Some(cur) {
+                    stable += 1
+                } else {
+                    stable = 0
+                }
                 prev = Some(cur);
             }
             None => stable = 0,
         }
         let text_len = prev.map(|c| c[1] as usize).unwrap_or(0);
-        if wait::should_stop(idle, stable, text_len, t_goto.elapsed(), cap) { break; }
+        if wait::should_stop(idle, stable, text_len, t_goto.elapsed(), cap) {
+            break;
+        }
         let left = cap.saturating_sub(t_goto.elapsed());
         tokio::time::sleep(Duration::from_millis(wait::POLL_MS).min(left)).await;
     }
 
     // 手順6: 同期待ち → 再確認 → DOM長 → content()
     sync_wait(&shared).await;
-    if blocked_now(&shared) { return Err(netguard_err()); }
-    if shared.decoded.exceeded() { return Err(exceed_err(&shared, "network")); }
+    if blocked_now(&shared) {
+        return Err(netguard_err());
+    }
+    if shared.decoded.exceeded() {
+        return Err(exceed_err(&shared, "network"));
+    }
     let remaining = deadline.saturating_duration_since(Instant::now());
     if let Some(dom_len) = world.dom_length(remaining).await {
         let budget_left = opts.max_bytes.saturating_sub(shared.decoded.total());
-        if dom_len > budget_left { return Err(exceed_err(&shared, "dom")); }
+        if dom_len > budget_left {
+            return Err(exceed_err(&shared, "dom"));
+        }
     }
     let remaining = deadline.saturating_duration_since(Instant::now());
     // page.content()はメインワールド評価でgetter上書きに弱いため、分離ワールドで取得する。
@@ -338,7 +437,9 @@ async fn drive_inner(
         .dom_html(remaining)
         .await
         .ok_or_else(|| WebgrabError::new(ExitCode::Render, "content read failed or timed out"))?;
-    if blocked_now(&shared) { return Err(netguard_err()); }
+    if blocked_now(&shared) {
+        return Err(netguard_err());
+    }
     let _ = proxy_state; // 超過判定はrender_innerがfinalizeへ渡す（exceeded()/downloaded()を使用）
     Ok(content)
 }
@@ -363,10 +464,20 @@ struct IsolatedWorld {
 
 impl IsolatedWorld {
     async fn ensure_ctx(&mut self) -> Option<ExecutionContextId> {
-        if let Some(c) = self.ctx { return Some(c); }
-        let r = self.page.execute(
-            CreateIsolatedWorldParams::builder().frame_id(self.frame.clone()).world_name("webgrab").build().ok()?
-        ).await.ok()?;
+        if let Some(c) = self.ctx {
+            return Some(c);
+        }
+        let r = self
+            .page
+            .execute(
+                CreateIsolatedWorldParams::builder()
+                    .frame_id(self.frame.clone())
+                    .world_name("webgrab")
+                    .build()
+                    .ok()?,
+            )
+            .await
+            .ok()?;
         self.ctx = Some(r.execution_context_id);
         self.ctx
     }
@@ -375,14 +486,25 @@ impl IsolatedWorld {
     async fn eval_numbers(&mut self, expr: &str, limit: Duration) -> Option<Vec<u64>> {
         for attempt in 0..2 {
             let ctx = self.ensure_ctx().await?;
-            let params = EvaluateParams::builder().expression(expr).context_id(ctx).return_by_value(true).build().ok()?;
+            let params = EvaluateParams::builder()
+                .expression(expr)
+                .context_id(ctx)
+                .return_by_value(true)
+                .build()
+                .ok()?;
             match tokio::time::timeout(limit, self.page.execute(params)).await {
                 Ok(Ok(resp)) => {
                     let v = resp.result.result.value.clone()?;
                     let arr = v.as_array()?;
-                    return arr.iter().map(|x| x.as_f64().map(|f| f.max(0.0) as u64)).collect();
+                    return arr
+                        .iter()
+                        .map(|x| x.as_f64().map(|f| f.max(0.0) as u64))
+                        .collect();
                 }
-                Ok(Err(_)) if attempt == 0 => { self.ctx = None; continue; } // 文脈破棄→作り直して1回だけ再試行
+                Ok(Err(_)) if attempt == 0 => {
+                    self.ctx = None;
+                    continue;
+                } // 文脈破棄→作り直して1回だけ再試行
                 _ => return None,
             }
         }
@@ -398,7 +520,12 @@ impl IsolatedWorld {
     }
 
     async fn dom_length(&mut self, limit: Duration) -> Option<u64> {
-        let v = self.eval_numbers("(function(){var d=document.documentElement;return [d?d.outerHTML.length:0];})()", limit).await?;
+        let v = self
+            .eval_numbers(
+                "(function(){var d=document.documentElement;return [d?d.outerHTML.length:0];})()",
+                limit,
+            )
+            .await?;
         v.first().copied()
     }
 
@@ -407,10 +534,26 @@ impl IsolatedWorld {
         const EXPR: &str = "(function(){var s='';if(document.doctype){s=new XMLSerializer().serializeToString(document.doctype);}var d=document.documentElement;if(d){s+=d.outerHTML;}return s;})()";
         for attempt in 0..2 {
             let ctx = self.ensure_ctx().await?;
-            let params = EvaluateParams::builder().expression(EXPR).context_id(ctx).return_by_value(true).build().ok()?;
+            let params = EvaluateParams::builder()
+                .expression(EXPR)
+                .context_id(ctx)
+                .return_by_value(true)
+                .build()
+                .ok()?;
             match tokio::time::timeout(limit, self.page.execute(params)).await {
-                Ok(Ok(resp)) => return resp.result.result.value.as_ref()?.as_str().map(|s| s.to_string()),
-                Ok(Err(_)) if attempt == 0 => { self.ctx = None; continue; }
+                Ok(Ok(resp)) => {
+                    return resp
+                        .result
+                        .result
+                        .value
+                        .as_ref()?
+                        .as_str()
+                        .map(|s| s.to_string());
+                }
+                Ok(Err(_)) if attempt == 0 => {
+                    self.ctx = None;
+                    continue;
+                }
                 _ => return None,
             }
         }
@@ -420,10 +563,18 @@ impl IsolatedWorld {
 
 /// リクエストURLのホストを判定する（第一層）。http(s)以外はChromeに任せる。
 async fn host_is_internal(cache: &HostCache, request_url: &str, allow_private: bool) -> bool {
-    if allow_private { return false; }
-    let Ok(u) = Url::parse(request_url) else { return false; };
-    if !netguard::is_allowed_scheme(u.scheme()) { return false; }
-    let Some(host) = u.host_str() else { return false; };
+    if allow_private {
+        return false;
+    }
+    let Ok(u) = Url::parse(request_url) else {
+        return false;
+    };
+    if !netguard::is_allowed_scheme(u.scheme()) {
+        return false;
+    }
+    let Some(host) = u.host_str() else {
+        return false;
+    };
     let port = u.port_or_known_default().unwrap_or(80);
     cache.resolve(host, port).await.is_none()
 }
@@ -449,15 +600,29 @@ mod tests {
     fn effective_cap_is_clamped_by_deadline() {
         let now = Instant::now();
         let deadline = now + Duration::from_millis(3500);
-        assert_eq!(effective_cap(5000, deadline, now), Duration::from_millis(1500));
-        assert_eq!(effective_cap(1000, deadline, now), Duration::from_millis(1000));
+        assert_eq!(
+            effective_cap(5000, deadline, now),
+            Duration::from_millis(1500)
+        );
+        assert_eq!(
+            effective_cap(1000, deadline, now),
+            Duration::from_millis(1000)
+        );
         assert_eq!(effective_cap(5000, now, now), Duration::ZERO);
     }
 
     #[test]
     fn exit8_takes_precedence_over_any_drive_result() {
         let blocked = Arc::new(AtomicBool::new(true));
-        let r = finalize(&blocked, Err(WebgrabError::new(ExitCode::Http, "x")), 0, 0, false, 0, 0);
+        let r = finalize(
+            &blocked,
+            Err(WebgrabError::new(ExitCode::Http, "x")),
+            0,
+            0,
+            false,
+            0,
+            0,
+        );
         assert_eq!(r.unwrap_err().code, ExitCode::Netguard);
         let r2 = finalize(&blocked, Ok("<html></html>".into()), 0, 0, false, 0, 0);
         assert_eq!(r2.unwrap_err().code, ExitCode::Netguard);
@@ -468,16 +633,36 @@ mod tests {
     #[test]
     fn proxy_exceeded_maps_to_http_exit_when_not_blocked() {
         let clear = Arc::new(AtomicBool::new(false));
-        let r = finalize(&clear, Ok("<html></html>".into()), 0, 0, true, 12_000, 10_000);
+        let r = finalize(
+            &clear,
+            Ok("<html></html>".into()),
+            0,
+            0,
+            true,
+            12_000,
+            10_000,
+        );
         let e = r.unwrap_err();
         assert_eq!(e.code, ExitCode::Http);
-        assert!(e.message.starts_with("render download exceeds remaining --max-bytes budget (12000 of 10000)"));
+        assert!(
+            e.message.starts_with(
+                "render download exceeds remaining --max-bytes budget (12000 of 10000)"
+            )
+        );
     }
 
     #[test]
     fn main_blocked_takes_precedence_over_proxy_exceeded() {
         let blocked = Arc::new(AtomicBool::new(true));
-        let r = finalize(&blocked, Ok("<html></html>".into()), 0, 0, true, 12_000, 10_000);
+        let r = finalize(
+            &blocked,
+            Ok("<html></html>".into()),
+            0,
+            0,
+            true,
+            12_000,
+            10_000,
+        );
         assert_eq!(r.unwrap_err().code, ExitCode::Netguard);
     }
 
@@ -490,7 +675,9 @@ mod tests {
     #[tokio::test]
     async fn unresolvable_host_is_fail_closed() {
         // .invalid は名前解決できない（RFC 6761）。fail-closedで遮断されること（A10）。
-        assert!(host_is_internal(&HostCache::new(false), "http://nonexistent.invalid/", false).await);
+        assert!(
+            host_is_internal(&HostCache::new(false), "http://nonexistent.invalid/", false).await
+        );
     }
 
     #[tokio::test]
@@ -502,7 +689,14 @@ mod tests {
     #[tokio::test]
     async fn literal_internal_ip_denied_in_render() {
         // ホストがIPリテラルで内部レンジなら解決成功→遮断（A10）。
-        assert!(host_is_internal(&HostCache::new(false), "http://169.254.169.254/latest/meta-data/", false).await);
+        assert!(
+            host_is_internal(
+                &HostCache::new(false),
+                "http://169.254.169.254/latest/meta-data/",
+                false
+            )
+            .await
+        );
         assert!(host_is_internal(&HostCache::new(false), "http://[::1]/", false).await);
     }
 }
