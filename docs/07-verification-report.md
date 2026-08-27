@@ -106,7 +106,7 @@
 
 ### CIのsandbox観測
 
-CIの`test`と`coverage`ジョブは`.github/workflows/ci.yml`で最初から`WEBGRAB_E2E_NO_SANDBOX=1`を与えている（設計08 §3の決定）。このフラグ無しでubuntu-24.04ランナーのsandboxが起動するかは未確認である。PRのCI結果はTask 15で記録する。
+CIの`test`と`coverage`ジョブは`.github/workflows/ci.yml`で最初から`WEBGRAB_E2E_NO_SANDBOX=1`を与えている（設計08 §3の決定）。このフラグ無しでubuntu-24.04ランナーのsandboxが起動するかは未確認である。PR #1のCI（run 33104618349、2026-08-28）では`test`ジョブのE2Eが19件すべて合格し、`coverage`ジョブは除外なしで行カバレッジ92.54%（閾値80）を達成した。`check`（fmt・clippy・doclint・SHAピン留め検証）と`security`（gitleaks）も合格。`actions/checkout`のv4ピンにNode.js 20非推奨の注記が出たため、v7のSHAへ更新した。
 
 ### coverageの二択
 
