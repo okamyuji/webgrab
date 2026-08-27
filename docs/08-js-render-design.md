@@ -75,7 +75,7 @@ Round 3所見の検証として2回目のprobeで次を実測した。(7) メイ
    すべて満たしたら終了する。評価式は`(function(){var b=document.body;return [document.getElementsByTagName('*').length,(b&&b.innerText||'').trim().length];})()`のように、常に数値配列を返し、`body`が無い文書でも例外を投げない形にし、分離ワールドの`context_id`を付けた`Page::evaluate_expression`（`EvaluateParams`）で送る。evaluateの失敗・タイムアウト・数値以外の戻り値は「条件未達」として扱い、終了コード7にはしない。各evaluateは残り時間を上限にタイムアウトさせる。
 4. 各ポーリングの前後と手順3の終了後に`main_blocked`を再確認し、立っていれば終了コード8で中断する。`main_blocked`は`resource_type == Document`かつ`frame_id`がメインフレームIDに一致する要求（＝メインナビゲーション）が内部アドレス宛だったときに限って立てる。サブフレーム（iframe）やサブリソースの内部アドレス要求は`Fetch.failRequest`で遮断するだけで`main_blocked`を立てない（1個のiframeで終了コード8を強制されないため）。判定は純関数`is_main_navigation(resource_type, frame_id, main_frame_id)`とし単体テストする。
 5. 経過時間が実効上限に達したら、条件未達でも終了する。実効上限は`goto`直前に`min(--wait-ms, deadline − now − 2000ms)`（`saturating_sub`、負なら0）として確定し、待機上限到達は正常終了として外側のタイムアウト（終了コード7）に先んじる。2000msは手順6（同期待ち500ms + DOM長評価 + `content()`）の予備。
-6. interceptが受け取った`requestPaused`の個別タスクがすべて完了するのを最大500ms待ってから（受信+1 / 完了+1のカウンタ一致。処理中のイベントの完了だけを保証し、未受信のイベントは対象外）、手順4の再確認を再度行う。次に分離ワールドで`document.documentElement.outerHTML.length`を1回評価し（この1回だけO(DOMサイズ)）、`RenderOptions.max_bytes − decoded_total`を超えていれば終了コード4（`--auto-render`時は`reason=max-bytes`）で中断する（JSでネットワークを経ずに膨らませたDOMを`content()`前に塞ぐ。文字数はUTF-8バイト数の下界なので安全側）。最後にDOM HTML（doctype + `document.documentElement.outerHTML`）を同じ分離ワールドの評価で残り時間を上限に取得して返す（超過は終了コード7）。chromiumoxideの`page.content()`はメインワールドで評価するためページ側のgetter上書きで偽装でき（§1 probe(14)）、使わない。
+6. interceptが受け取った`requestPaused`の個別タスクがすべて完了するのを最大500ms待ってから（受信+1 / 完了+1のカウンタ一致。処理中のイベントの完了だけを保証し、未受信のイベントは対象外）、手順4の再確認を再度行う。次に分離ワールドで`document.documentElement.outerHTML.length`を1回評価し（この1回だけO(DOMサイズ)）、`RenderOptions.max_bytes − decoded_total`を超えていれば終了コード4（`--auto-render`時は`reason=max-bytes`）で中断する（JSでネットワークを経ずに膨らませたDOMを`content()`前に塞ぐ。文字数はUTF-8バイト数の下界なので安全側）。最後にDOM HTML（doctype + `document.documentElement.outerHTML`）を同じ分離ワールドの評価で取得して返す。この評価の上限は`min(残り時間, 実効wait残余 + 2000ms)`とし、超過は終了コード7にする。chromiumoxideの`page.content()`はメインワールドで評価するためページ側のgetter上書きで偽装でき（§1 probe(14)）、使わない。
 7. 終了コード8の判定は単一の経路で行う。`render_inner`は`drive`の戻り値（`Ok`/どの`Err`か）によらず、`drive`完了後にまず`main_blocked`を読み、立っていれば終了コード8を返す（`goto`失敗、evaluate/`content()`タイムアウト、展開後超過、DOM長超過、プロキシ`exceeded()`のいずれで戻った場合も同じ）。プロキシ側で遮断した要求はカウントし、1件以上あればstderrに`webgrab: warn=netguard-blocked layer=proxy count=N`を1行出す（interceptで遮断したサブリソースも`layer=intercept`で同様）。この2行は終了コード8で終わる実行でも`error=`ブロックの前に出す。これにより、メインナビゲーション以外のSSRF試行も無通知にはならない。終了コード8の詳細行は`layer=intercept host=<host> resolved=<ip> range=<range> (intercept=N proxy=M; use --allow-private to override)`とし、解決IPと拒否レンジを含める（04-design.md §7）。名前解決に失敗した場合は`resolved=unresolved`、2秒の解決上限を超えた場合は`resolved=timeout`とし、いずれも`range=`を省く。静的経路（fetch.rs）の終了コード8詳細行も`host=... resolved=... range=...`で同じ書式にそろえる。
 
 判定と計数は`src/render/wait.rs`に純関数として切り出し、Chromeなしで単体テストする。`InFlight::on_request(id, is_redirect)` / `on_done(id)` / `is_idle()`、および`should_stop(idle, stable_polls, text_len, elapsed, cap) -> bool`。
@@ -231,7 +231,8 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@<40桁SHA> # v2
       - run: '! grep -nE "uses: .*@(v[0-9]|stable|cargo-llvm-cov)" .github/workflows/ci.yml | grep -v reusable-workflows'
-      - run: test "$(grep -c 'persist-credentials: false' .github/workflows/ci.yml)" -eq "$(grep -c 'uses: actions/checkout@' .github/workflows/ci.yml)"
+      - run: |
+          test "$(grep -c 'persist-credentials: false' .github/workflows/ci.yml)" -eq "$(grep -c 'uses: actions/checkout@' .github/workflows/ci.yml)"
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: python3 tools/doclint.py docs/

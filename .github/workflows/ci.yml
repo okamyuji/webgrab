@@ -21,7 +21,8 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: '! grep -nE "uses: .*@(v[0-9]|stable|cargo-llvm-cov)" .github/workflows/ci.yml | grep -v reusable-workflows'
-      - run: test "$(grep -c 'persist-credentials: false' .github/workflows/ci.yml)" -eq "$(grep -c 'uses: actions/checkout@' .github/workflows/ci.yml)"
+      - run: |
+          test "$(grep -c 'persist-credentials: false' .github/workflows/ci.yml)" -eq "$(grep -c 'uses: actions/checkout@' .github/workflows/ci.yml)"
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: python3 tools/doclint.py docs/
