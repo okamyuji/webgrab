@@ -85,11 +85,15 @@ fn effective_cap(wait_ms: u64, deadline: Instant, now: Instant) -> Duration {
 }
 
 /// 終了コード8を単一経路で判定する（設計§4.2 手順7）。driveの結果によらず先にmain_blockedを見る。
+#[allow(clippy::too_many_arguments)]
 fn finalize(
     main_blocked: &AtomicBool,
     result: Result<String>,
     blocked_intercept: u64,
     blocked_proxy: u64,
+    proxy_exceeded: bool,
+    proxy_bytes: u64,
+    max_bytes_total: u64,
 ) -> Result<String> {
     if main_blocked.load(Ordering::SeqCst) {
         return Err(WebgrabError::new(ExitCode::Netguard, "refused internal address during render")
@@ -100,6 +104,14 @@ fn finalize(
     }
     if blocked_proxy > 0 {
         eprintln!("webgrab: warn=netguard-blocked layer=proxy count={blocked_proxy}");
+    }
+    // プロキシ層はChromeの全接続（メイン以外を含む）を通すため、Fetch intercept層が見ない
+    // 超過（例: 単一の大きなクロスオリジンiframe）もここで終了コード4に写像する。
+    if proxy_exceeded {
+        return Err(WebgrabError::new(
+            ExitCode::Http,
+            format!("render download exceeds remaining --max-bytes budget ({proxy_bytes} of {max_bytes_total})"),
+        ));
     }
     result
 }
@@ -149,7 +161,15 @@ async fn render_inner(url_str: &str, opts: &RenderOptions, deadline: Instant) ->
     let _ = browser.close().await;
     let _ = handler_task.await;
 
-    finalize(&main_blocked, result, blocked_intercept, proxy_state.denied())
+    finalize(
+        &main_blocked,
+        result,
+        blocked_intercept,
+        proxy_state.denied(),
+        proxy_state.exceeded(),
+        proxy_state.downloaded(),
+        opts.max_bytes_total,
+    )
 }
 
 async fn drive(
@@ -319,7 +339,7 @@ async fn drive_inner(
         .await
         .ok_or_else(|| WebgrabError::new(ExitCode::Render, "content read failed or timed out"))?;
     if blocked_now(&shared) { return Err(netguard_err()); }
-    let _ = proxy_state; // 超過はfinalize後にrender_innerが見る（denied()のみ使用）
+    let _ = proxy_state; // 超過判定はrender_innerがfinalizeへ渡す（exceeded()/downloaded()を使用）
     Ok(content)
 }
 
@@ -437,12 +457,28 @@ mod tests {
     #[test]
     fn exit8_takes_precedence_over_any_drive_result() {
         let blocked = Arc::new(AtomicBool::new(true));
-        let r = finalize(&blocked, Err(WebgrabError::new(ExitCode::Http, "x")), 0, 0);
+        let r = finalize(&blocked, Err(WebgrabError::new(ExitCode::Http, "x")), 0, 0, false, 0, 0);
         assert_eq!(r.unwrap_err().code, ExitCode::Netguard);
-        let r2 = finalize(&blocked, Ok("<html></html>".into()), 0, 0);
+        let r2 = finalize(&blocked, Ok("<html></html>".into()), 0, 0, false, 0, 0);
         assert_eq!(r2.unwrap_err().code, ExitCode::Netguard);
         let clear = Arc::new(AtomicBool::new(false));
-        assert!(finalize(&clear, Ok("<html></html>".into()), 0, 0).is_ok());
+        assert!(finalize(&clear, Ok("<html></html>".into()), 0, 0, false, 0, 0).is_ok());
+    }
+
+    #[test]
+    fn proxy_exceeded_maps_to_http_exit_when_not_blocked() {
+        let clear = Arc::new(AtomicBool::new(false));
+        let r = finalize(&clear, Ok("<html></html>".into()), 0, 0, true, 12_000, 10_000);
+        let e = r.unwrap_err();
+        assert_eq!(e.code, ExitCode::Http);
+        assert!(e.message.starts_with("render download exceeds remaining --max-bytes budget (12000 of 10000)"));
+    }
+
+    #[test]
+    fn main_blocked_takes_precedence_over_proxy_exceeded() {
+        let blocked = Arc::new(AtomicBool::new(true));
+        let r = finalize(&blocked, Ok("<html></html>".into()), 0, 0, true, 12_000, 10_000);
+        assert_eq!(r.unwrap_err().code, ExitCode::Netguard);
     }
 
     #[tokio::test]

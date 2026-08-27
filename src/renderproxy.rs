@@ -88,6 +88,11 @@ impl ProxyState {
     pub fn denied(&self) -> u64 {
         self.denied.load(Ordering::SeqCst)
     }
+
+    /// これまでにプロキシ経由で転送した総バイト数（超過メッセージの表示用）。
+    pub fn downloaded(&self) -> u64 {
+        self.downloaded.load(Ordering::SeqCst)
+    }
 }
 
 /// プロキシを127.0.0.1の空きポートで起動し、待受アドレス・共有状態・タスクハンドルを返す。
