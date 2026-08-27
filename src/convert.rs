@@ -15,10 +15,29 @@ pub fn strip_non_content(html: &str) -> String {
 
 /// `<tag ...>...</tag>` を要素ごと除去する（大小無視、複数対応）。
 /// 開始タグ名の直後が区切り（空白/`>`/`/`）であることを確認し、`<scripts>`等の別タグは残す。
+/// `</tag` の直後に空白（HTMLとして正当）を挟んで `>` が来る閉じタグを探す。
+/// 見つかった場合、`haystack` 先頭からの終端直後のバイトオフセットを返す。
+fn find_close_tag_end(haystack: &str, close_prefix: &str) -> Option<usize> {
+    let bytes = haystack.as_bytes();
+    let mut search_start = 0;
+    while let Some(rel) = haystack[search_start..].find(close_prefix) {
+        let match_start = search_start + rel;
+        let mut j = match_start + close_prefix.len();
+        while j < bytes.len() && matches!(bytes[j], b' ' | b'\t' | b'\n' | b'\r') {
+            j += 1;
+        }
+        if j < bytes.len() && bytes[j] == b'>' {
+            return Some(j + 1);
+        }
+        search_start = match_start + 1;
+    }
+    None
+}
+
 fn remove_element(html: &str, tag: &str) -> String {
     let lower = html.to_ascii_lowercase();
     let open = format!("<{tag}");
-    let close = format!("</{tag}>");
+    let close_prefix = format!("</{tag}");
     let mut out = String::with_capacity(html.len());
     let mut i = 0;
     while i < html.len() {
@@ -26,9 +45,9 @@ fn remove_element(html: &str, tag: &str) -> String {
             let boundary = lower[i + open.len()..].chars().next();
             let is_tag = matches!(boundary, Some(' ' | '\t' | '\n' | '\r' | '>' | '/') | None);
             if is_tag {
-                match lower[i..].find(&close) {
+                match find_close_tag_end(&lower[i..], &close_prefix) {
                     Some(rel) => {
-                        i += rel + close.len();
+                        i += rel;
                         continue;
                     }
                     // 閉じタグが無い場合は以降をすべて捨てる（壊れたHTMLの防御）
@@ -273,6 +292,20 @@ mod tests {
         assert!(out.contains("keep"));
         assert!(!out.to_ascii_lowercase().contains("script"));
         assert!(!out.to_ascii_lowercase().contains("style"));
+    }
+
+    #[test]
+    fn visible_text_len_handles_closing_tag_with_space_before_gt() {
+        // `</script >` のように閉じタグの `>` 前に空白があっても正当なHTML。
+        // 誤って未終端扱いすると以降の本文が丸ごと落ちる回帰ガード。
+        let html = "<script>x</script ><article><p>body</p></article>";
+        assert_eq!(visible_text_len(html), 4);
+    }
+
+    #[test]
+    fn visible_text_len_handles_closing_tag_with_newline_before_gt() {
+        let html = "<script>x</SCRIPT\n><article><p>body</p></article>";
+        assert_eq!(visible_text_len(html), 4);
     }
 
     #[test]

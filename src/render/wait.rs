@@ -37,12 +37,21 @@ pub fn exceed_msg(n: u64, max_bytes_total: u64, what: &str) -> String {
 
 /// 未完了要求の集合。挿入・削除とも冪等。削除済みIDは短命のtombstoneに残し、
 /// 順序が入れ替わって後から届いた挿入を無視する。
+///
+/// `MAX_TRACKED`はメモリ上限であり、超過時は最古のlive IDを追跡から外す
+/// （§4.2 (g)）。追い出したIDがまだ実際には完了していない場合、
+/// `live`が空になっても「静止」と早合点してはならない。`saturated`は
+/// 一度でも追い出しが起きたことを記録し、`is_idle`をfalse固定にすることで
+/// この誤判定（早期終了）を防ぐ。待機ループ自体は`should_stop`の
+/// `elapsed >= cap`規則で必ず上限到達時に終わるため、ハングはしない。
 pub struct InFlight {
     live: HashSet<String>,
     live_order: VecDeque<String>,
     tombstones: HashMap<String, Instant>,
     /// 挿入順（=時刻順）。失効は先頭からのpopだけで済ませ、毎回の全走査を避ける。
     tombstone_order: VecDeque<(String, Instant)>,
+    /// `MAX_TRACKED`到達により最古のlive IDを追い出したら真になる（以降不変）。
+    saturated: bool,
 }
 
 impl Default for InFlight {
@@ -58,6 +67,7 @@ impl InFlight {
             live_order: VecDeque::new(),
             tombstones: HashMap::new(),
             tombstone_order: VecDeque::new(),
+            saturated: false,
         }
     }
 
@@ -73,6 +83,7 @@ impl InFlight {
         if self.live.len() >= MAX_TRACKED {
             while let Some(old) = self.live_order.pop_front() {
                 if self.live.remove(&old) {
+                    self.saturated = true;
                     break;
                 }
             }
@@ -99,7 +110,7 @@ impl InFlight {
 
     pub fn is_idle(&mut self, now: Instant) -> bool {
         self.expire(now);
-        self.live.is_empty()
+        !self.saturated && self.live.is_empty()
     }
 
     pub fn len(&self) -> usize {
@@ -239,6 +250,30 @@ mod tests {
             f.on_request(&i.to_string(), false, now);
         }
         assert_eq!(f.len(), MAX_TRACKED);
+    }
+
+    #[test]
+    fn saturation_suppresses_idle_until_cap() {
+        // 上限到達で最古のIDを追い出した後、それが実際は未完了のまま
+        // 残っている可能性があるため、trackedな全IDが完了しても
+        // is_idleはtrueに戻らない（should_stopの上限規則が最終的な出口）。
+        let now = Instant::now();
+        let mut f = InFlight::new();
+        let ids: Vec<String> = (0..(MAX_TRACKED + 1)).map(|i| i.to_string()).collect();
+        for id in &ids {
+            f.on_request(id, false, now);
+        }
+        assert_eq!(f.len(), MAX_TRACKED, "上限を超えて追跡しない");
+
+        // 現在追跡中のIDのみ完了させる（追い出された最古のIDは対象外）。
+        for id in &ids {
+            f.on_done(id, now);
+        }
+        assert!(f.is_empty(), "追跡中の要求はすべて完了扱いになる");
+        assert!(
+            !f.is_idle(now),
+            "追い出された要求が未完了の可能性がある間はidleと判定しない"
+        );
     }
 
     #[test]
