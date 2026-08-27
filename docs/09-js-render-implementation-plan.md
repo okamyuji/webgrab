@@ -2701,6 +2701,10 @@ Run: `python3 tools/verify_render.py /tmp/webgrab-verify`
 
 `render.rs`の`render_inner`で`Browser::launch`の前後に一時的な`eprintln!("webgrab: info=render-launch-ms={}", t.elapsed().as_millis())`を入れ、`./target/release/webgrab https://example.com --render`を5回実行して中央値Lを取り、その行を削除する（コミットしない）。判定は`5000 >= L + 2000 + 1000`ならskip閾値5秒は妥当。満たさなければ`src/pipeline.rs`の`SKIP_TIMEOUT_MIN`を`L + 3000ms`へ切り上げ、設計書§3決定表のskip閾値行と§4.3手順2の数値を同じ値に更新する。
 
+- [ ] Step 4b:SKILL経由の呼び出し確認（Claude Codeから）
+
+`cargo install --path .`でPATHの`webgrab`を更新し、`~/.claude/skills/webgrab/SKILL.md`をTask 13で更新した`samples/skills/claude/webgrab/SKILL.md`に差し替える（`diff -u`で差分を確認してから`cp`）。次にClaude Codeのセッションで`webgrab-fetch`スキルを起動し、スキル本文が指示するコマンド形（既定呼び出し、`--auto-render --format json`、一覧向け`--raw`、`[webgrab:truncated ...]`の継続コマンド）をJS描画ページ（`https://demo.playwright.dev/todomvc/`と`https://react.dev/learn`）に対して実行する。確認項目は、(a) 既定呼び出しで`render_status`が`rendered`または`static`になり本文が取れること、(b) `--format json`の`render_status` / `static_chars` / `rendered_chars`が出ること、(c) 終了コード6のときの`hint=`がスキル本文の説明と一致すること、(d) 継続コマンドに`--render`と描画系フラグが再現されること。結果はStep 4の表に「SKILL経由」列として加える。
+
 - [ ] Step 4:07に表で記録する
 
 記録項目は次のとおり。Step 2の表（URL / 比較文字列 / 一致 / 終了コード / `render_status` / 早期終了か上限到達か。後者は`.err`の`time`のrealと`--wait-ms`既定5000の比較で判定）、Lの実測値とskip閾値の判定、CIのsandbox観測（`WEBGRAB_E2E_NO_SANDBOX`が必要だったか）、coverageの二択（除外なしで80以上か、除外を戻したか）。
