@@ -85,9 +85,17 @@ pub fn extract(html: &str, base_url: &str) -> Result<Extracted> {
             WebgrabError::new(ExitCode::Internal, "readability init failed")
                 .with_detail(e.to_string())
         })?;
-    let article = readability.parse().map_err(|e| {
-        WebgrabError::new(ExitCode::Internal, "readability parse failed").with_detail(e.to_string())
-    })?;
+    let article = match readability.parse() {
+        Ok(a) => a,
+        Err(dom_smoothie::ReadabilityError::GrabFailed) => {
+            eprintln!("webgrab: warn=extract-grab-failed");
+            return Ok(Extracted::default());
+        }
+        Err(e) => {
+            return Err(WebgrabError::new(ExitCode::Internal, "readability parse failed")
+                .with_detail(e.to_string()));
+        }
+    };
 
     let title = {
         let t = article.title.to_string();
@@ -133,5 +141,20 @@ mod tests {
         let e = extract(doc, "https://example.com").unwrap();
         assert_eq!(e.published_time.as_deref(), Some("2026-01-02T03:04:05Z"));
         assert!(e.content_html.contains("本文"));
+    }
+
+    #[test]
+    fn empty_shell_maps_to_empty_body_not_error() {
+        // JSで本文を後から入れる空シェル。dom_smoothieはGrabFailedを返すが、Ok(空)にする（設計§4.1）。
+        let e = extract("<html><body><div id=\"app\"></div></body></html>", "https://x.test").unwrap();
+        assert!(e.content_html.trim().is_empty());
+    }
+
+    #[test]
+    fn placeholder_text_is_extracted_as_short_body() {
+        // F2の再現markup。8文字が抽出される（E7の前提を固定）。
+        let e = extract("<html><body><div id=\"app\">読み込み中...</div></body></html>", "https://x.test").unwrap();
+        let text = crate::convert::to_text(&e.content_html).unwrap();
+        assert_eq!(text.trim(), "読み込み中...");
     }
 }
