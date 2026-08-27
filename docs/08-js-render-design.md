@@ -224,7 +224,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@<40桁SHA> # v4（実装時に解決）
+      - uses: actions/checkout@<40桁SHA> # v7（実装時に解決）
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@<40桁SHA> # stable
@@ -244,7 +244,7 @@ jobs:
       WEBGRAB_E2E: "1"
       WEBGRAB_E2E_NO_SANDBOX: "1"
     steps:
-      - uses: actions/checkout@<40桁SHA> # v4
+      - uses: actions/checkout@<40桁SHA> # v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@<40桁SHA> # stable
@@ -259,7 +259,7 @@ jobs:
       WEBGRAB_E2E: "1"
       WEBGRAB_E2E_NO_SANDBOX: "1"
     steps:
-      - uses: actions/checkout@<40桁SHA> # v4
+      - uses: actions/checkout@<40桁SHA> # v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@<40桁SHA> # stable
