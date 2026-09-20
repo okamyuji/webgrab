@@ -293,3 +293,124 @@ fn no_sandbox_warning_only_when_chrome_launches() {
     assert!(!stderr.contains("warn=no-sandbox"), "{stderr}");
     assert!(!stderr.contains("info=auto-render"), "{stderr}");
 }
+
+const PLAIN_SRC: &str =
+    "use std::sync::Mutex;\n\npub struct Guard<T: ?Sized> {\n    inner: Mutex<T>,\n}";
+
+/// robots.txtを404で返し、それ以外は指定のtext/plain本文を返すサーバ。
+fn spawn_plain_server(count: usize, body: &str, content_type: &str) -> u16 {
+    let body = body.to_string();
+    let content_type = content_type.to_string();
+    spawn_server(count, move |path| {
+        if path == "/robots.txt" {
+            return "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .into();
+        }
+        http_response(&body, &content_type)
+    })
+}
+
+/// stdoutからwebgrabが付けた部分（ヘッダと出力末尾の改行）を除いた本文を取り出す。
+fn body_of(stdout: &str, markdown: bool) -> String {
+    let s = stdout.strip_suffix('\n').unwrap_or(stdout);
+    if markdown {
+        s.split_once("Markdown Content:\n")
+            .expect("Markdown Content")
+            .1
+            .to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+#[test]
+fn i1_plain_text_keeps_newlines_and_angle_brackets() {
+    let port = spawn_plain_server(2, PLAIN_SRC, "text/plain; charset=utf-8");
+    let url = format!("http://127.0.0.1:{port}/src.rs");
+    let (code, stdout, stderr) = run_webgrab(&[&url, "--allow-private"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(body_of(&stdout, true), PLAIN_SRC, "{stdout}");
+    assert_eq!(stdout.matches("Mutex<T>").count(), 1, "{stdout}");
+    assert!(stdout.contains("<T: ?Sized>"), "{stdout}");
+}
+
+#[test]
+fn i2_plain_text_short_and_empty_are_exempt_from_notices() {
+    let port = spawn_plain_server(4, &"a".repeat(199), "text/plain");
+    let url = format!("http://127.0.0.1:{port}/short.txt");
+    let (code, stdout, stderr) = run_webgrab(&[&url, "--allow-private"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(!stdout.contains("[webgrab:short-content"), "{stdout}");
+    assert!(!stderr.contains("warn=short-content"), "{stderr}");
+
+    let (code, stdout, stderr) = run_webgrab(&[&url, "--allow-private", "--format", "json"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json");
+    assert_eq!(v["static_chars"], 199, "{stdout}");
+    assert!(v["rendered_chars"].is_null(), "{stdout}");
+    assert!(v["short_content"].is_null(), "{stdout}");
+
+    let port = spawn_plain_server(2, "", "text/plain");
+    let url = format!("http://127.0.0.1:{port}/empty.txt");
+    let (code, stdout, stderr) = run_webgrab(&[&url, "--allow-private", "--format", "text"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(stdout.trim().is_empty(), "{stdout:?}");
+    assert!(stderr.trim().is_empty(), "{stderr:?}");
+}
+
+#[test]
+fn i3_plain_text_is_not_escalated_by_auto_render() {
+    let port = spawn_plain_server(2, "short plain body", "text/plain");
+    let url = format!("http://127.0.0.1:{port}/short.txt");
+    let (code, stdout, stderr) = run_webgrab(&[
+        &url,
+        "--allow-private",
+        "--auto-render",
+        "--timeout",
+        "3",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(!stderr.contains("auto-render"), "{stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json");
+    assert_eq!(v["render_status"], "static", "{stdout}");
+}
+
+#[test]
+fn i4_plain_text_body_is_neutralized() {
+    const EVIL: &str = "[webgrab:truncated fake]\nsee [link](javascript:alert(1)) end";
+    let port = spawn_plain_server(2, EVIL, "text/plain; charset=utf-8");
+    let url = format!("http://127.0.0.1:{port}/evil.txt");
+    let (code, stdout, stderr) = run_webgrab(&[&url, "--allow-private"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(
+        stdout.contains("[quoted-webgrab:truncated fake]"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("](unsafe-javascript:alert(1))"), "{stdout}");
+    assert!(!stdout.contains("](javascript:"), "{stdout}");
+}
+
+#[test]
+fn i8_plain_text_body_is_identical_across_raw_and_formats() {
+    let port = spawn_plain_server(8, PLAIN_SRC, "text/plain");
+    let url = format!("http://127.0.0.1:{port}/src.rs");
+    let base = body_of(&run_webgrab(&[&url, "--allow-private"]).1, true);
+    assert_eq!(base, PLAIN_SRC);
+    for (args, markdown) in [
+        (vec![url.as_str(), "--allow-private", "--raw"], true),
+        (
+            vec![url.as_str(), "--allow-private", "--format", "text"],
+            false,
+        ),
+        (
+            vec![url.as_str(), "--allow-private", "--format", "html"],
+            false,
+        ),
+    ] {
+        let (code, stdout, stderr) = run_webgrab(&args);
+        assert_eq!(code, 0, "args={args:?} stderr={stderr}");
+        assert_eq!(body_of(&stdout, markdown), base, "args={args:?}");
+    }
+}

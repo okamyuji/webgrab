@@ -16,6 +16,17 @@ fn is_supported_media_type(main: &str) -> bool {
     m.is_empty() || m == "text/html" || m == "application/xhtml+xml" || m == "text/plain"
 }
 
+/// Content-Typeの主タイプが`text/plain`か（大小無視、`; charset=`等のパラメータは無視）。
+pub fn is_plain_text(content_type: Option<&str>) -> bool {
+    content_type.is_some_and(|ct| {
+        ct.split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .eq_ignore_ascii_case("text/plain")
+    })
+}
+
 /// 取得結果。
 pub struct Fetched {
     pub final_url: String,
@@ -330,6 +341,18 @@ mod tests {
         assert!(is_supported_media_type("")); // Content-Type欠落は許可
         assert!(!is_supported_media_type("application/pdf"));
         assert!(!is_supported_media_type("image/png"));
+    }
+
+    #[test]
+    fn plain_text_detection_ignores_case_and_parameters() {
+        assert!(is_plain_text(Some("text/plain")));
+        assert!(is_plain_text(Some("Text/PLAIN")));
+        assert!(is_plain_text(Some("text/plain; charset=utf-8")));
+        assert!(is_plain_text(Some("  text/plain  ; charset=shift_jis")));
+        assert!(!is_plain_text(Some("text/html")));
+        assert!(!is_plain_text(Some("text/plain-ish")));
+        assert!(!is_plain_text(Some("application/xhtml+xml")));
+        assert!(!is_plain_text(None));
     }
 
     #[tokio::test]

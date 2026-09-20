@@ -99,12 +99,21 @@ fn to_format(f: FormatArg) -> Format {
     }
 }
 
+/// 本文の作り方。終了コード6・short-content・エスカレーションの免除条件が経路ごとに違う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    Extracted,
+    Raw,
+    Plain,
+}
+
 /// 抽出・変換済みの中間結果。
 struct Stage {
     title: Option<String>,
     published: Option<String>,
     body: String,
     visible: usize,
+    route: Route,
 }
 
 fn build_stage(cli: &Cli, html: &str, final_url: &str) -> Result<Stage> {
@@ -125,7 +134,25 @@ fn build_stage(cli: &Cli, html: &str, final_url: &str) -> Result<Stage> {
         published,
         body,
         visible,
+        route: if cli.raw {
+            Route::Raw
+        } else {
+            Route::Extracted
+        },
     })
+}
+
+/// text/plainの素通し（設計10 §4.1）。抽出もMarkdown変換も行わず、危険リンクスキームの
+/// 無害化だけを掛ける。抽出HTMLが無いため`visible`は本文そのものの文字数になる。
+fn plain_stage(text: &str) -> Stage {
+    let body = convert::sanitize_link_schemes(text);
+    Stage {
+        title: None,
+        published: None,
+        visible: body.chars().count(),
+        body,
+        route: Route::Plain,
+    }
 }
 
 /// Chromeを実際に起動する直前にだけ出す。エスカレーションしない実行では出さない。
@@ -154,118 +181,144 @@ fn render_options(cli: &Cli, timeout: Duration, max_bytes: u64) -> RenderOptions
     }
 }
 
-/// CLIを実行し、最終出力文字列を返す。
-pub async fn run(cli: &Cli) -> Result<String> {
-    let start = Instant::now();
-    let ua = cli
-        .user_agent
-        .clone()
-        .unwrap_or_else(cli::default_user_agent);
-    let timeout = Duration::from_secs(cli.timeout);
-    if cli.wait_ms.is_some() && !cli.render && !cli.auto_render {
-        eprintln!("webgrab: warn=flag-ignored flag=--wait-ms");
-    }
+/// 本文を得たフェーズの成果。エスカレーションで差し替わりうる。
+struct Acquired {
+    stage: Stage,
+    final_url: String,
+    /// 静的フェーズが消費した展開後バイト数（残余予算の計算に使う）。
+    consumed: u64,
+}
 
-    // 1. 静的フェーズ（または --render 明示）
-    let mut status = RenderStatus::Static;
-    let mut static_chars: Option<usize> = None;
-    let mut rendered_chars: Option<usize> = None;
-    let (html, mut final_url, consumed) = if cli.render {
-        if !cli.no_robots {
-            let fopts = FetchOptions {
-                user_agent: ua,
-                timeout,
-                max_bytes: cli.max_bytes,
-                allow_private: cli.allow_private,
-                check_robots: true,
-            };
-            if !fetch::robots_precheck(&cli.url, &fopts).await? {
-                return Err(WebgrabError::new(ExitCode::Robots, "blocked by robots.txt")
-                    .with_detail(format!("url={}", cli.url)));
-            }
-        }
-        warn_no_sandbox(cli);
-        let r = render::render(&cli.url, &render_options(cli, timeout, cli.max_bytes)).await?;
-        status = RenderStatus::Rendered;
-        (r.html, r.final_url, 0u64)
+/// 可視テキスト長の記録（設計§4.4）。
+struct CharCounts {
+    static_chars: Option<usize>,
+    rendered_chars: Option<usize>,
+}
+
+/// エスカレーションの結果。
+struct Escalation {
+    status: RenderStatus,
+    rendered_chars: Option<usize>,
+}
+
+fn fetch_options(cli: &Cli, ua: String, timeout: Duration, check_robots: bool) -> FetchOptions {
+    FetchOptions {
+        user_agent: ua,
+        timeout,
+        max_bytes: cli.max_bytes,
+        allow_private: cli.allow_private,
+        check_robots,
+    }
+}
+
+/// 1. 静的フェーズ。Content-Typeが`text/plain`なら素通し経路に入る（設計10 §4.1）。
+async fn static_phase(cli: &Cli, ua: String, timeout: Duration) -> Result<Acquired> {
+    let fopts = fetch_options(cli, ua, timeout, !cli.no_robots);
+    let fetched = fetch::fetch(&cli.url, &fopts).await?;
+    let ct = fetched.content_type.as_deref();
+    let plain = fetch::is_plain_text(ct);
+    let (text, enc, had_errors) = decode::decode(&fetched.body, ct, !plain);
+    if had_errors {
+        eprintln!("webgrab: warn=decode-replacement enc={enc}");
+    }
+    let stage = if plain {
+        plain_stage(&text)
     } else {
-        let fopts = FetchOptions {
-            user_agent: ua,
-            timeout,
-            max_bytes: cli.max_bytes,
-            allow_private: cli.allow_private,
-            check_robots: !cli.no_robots,
-        };
-        let fetched = fetch::fetch(&cli.url, &fopts).await?;
-        let (text, enc, had_errors) =
-            decode::decode(&fetched.body, fetched.content_type.as_deref());
-        if had_errors {
-            eprintln!("webgrab: warn=decode-replacement enc={enc}");
-        }
-        (text, fetched.final_url, fetched.consumed_bytes)
+        build_stage(cli, &text, &fetched.final_url)?
     };
+    Ok(Acquired {
+        stage,
+        final_url: fetched.final_url,
+        consumed: fetched.consumed_bytes,
+    })
+}
 
-    let mut stage = build_stage(cli, &html, &final_url)?;
-    if cli.render {
-        rendered_chars = Some(stage.visible);
-    } else {
-        static_chars = Some(stage.visible);
-    }
-
-    // 2〜5. エスカレーション（--auto-render、--render明示時は無効）
-    if cli.auto_render
-        && !cli.render
-        && let Some(reason) = escalation_reason(stage.visible)
-    {
-        match remaining_budget(timeout, start.elapsed(), cli.max_bytes, consumed) {
-            Err(skip) => {
-                eprintln!("webgrab: warn=auto-render-skipped reason={}", skip.token());
-                status = RenderStatus::Skipped(skip.token());
-            }
-            Ok((rt, rb)) => {
-                eprintln!(
-                    "webgrab: info=auto-render reason={reason} chars={}",
-                    stage.visible
-                );
-                warn_no_sandbox(cli);
-                match render::render(&final_url, &render_options(cli, rt, rb)).await {
-                    // renderフェーズの抽出は常にrender後URLを基準にする。結果を捨てる場合は
-                    // 本文ごと捨てるため、URLの出どころと本文の出どころが食い違わない。
-                    Ok(r) => match build_stage(cli, &r.html, &r.final_url) {
-                        Ok(rs) => {
-                            rendered_chars = Some(rs.visible);
-                            status = choose_result(stage.visible, rs.visible);
-                            if status.is_rendered() {
-                                stage = rs;
-                                final_url = r.final_url;
-                            } else {
-                                eprintln!("webgrab: warn=auto-render-no-gain reason=shorter");
-                            }
-                        }
-                        Err(e) => match fallback_reason(Phase::Extract, &e) {
-                            Some(r) => {
-                                eprintln!("webgrab: warn=auto-render-failed reason={r}");
-                                eprintln!("{}", failure_detail(&e));
-                                status = RenderStatus::Failed(r);
-                            }
-                            None => return Err(e),
-                        },
-                    },
-                    Err(e) => match fallback_reason(Phase::Render, &e) {
-                        Some(r) => {
-                            eprintln!("webgrab: warn=auto-render-failed reason={r}");
-                            eprintln!("{}", failure_detail(&e));
-                            status = RenderStatus::Failed(r);
-                        }
-                        None => return Err(e),
-                    },
-                }
-            }
+/// 1'. `--render`明示のフェーズ。静的取得は行わないため消費バイトは0。
+async fn render_phase(cli: &Cli, ua: String, timeout: Duration) -> Result<Acquired> {
+    if !cli.no_robots {
+        let fopts = fetch_options(cli, ua, timeout, true);
+        if !fetch::robots_precheck(&cli.url, &fopts).await? {
+            return Err(WebgrabError::new(ExitCode::Robots, "blocked by robots.txt")
+                .with_detail(format!("url={}", cli.url)));
         }
     }
+    warn_no_sandbox(cli);
+    let r = render::render(&cli.url, &render_options(cli, timeout, cli.max_bytes)).await?;
+    let stage = build_stage(cli, &r.html, &r.final_url)?;
+    Ok(Acquired {
+        stage,
+        final_url: r.final_url,
+        consumed: 0,
+    })
+}
 
-    // 6. 空本文チェック（--rawは免除、設計§4.3 4）
-    if !cli.raw && stage.body.trim().is_empty() {
+/// renderフェーズの失敗をwarnへ落とす。落とせないエラーはそのまま返す。
+fn escalation_failed(phase: Phase, e: WebgrabError) -> Result<Escalation> {
+    match fallback_reason(phase, &e) {
+        Some(r) => {
+            eprintln!("webgrab: warn=auto-render-failed reason={r}");
+            eprintln!("{}", failure_detail(&e));
+            Ok(Escalation {
+                status: RenderStatus::Failed(r),
+                rendered_chars: None,
+            })
+        }
+        None => Err(e),
+    }
+}
+
+/// 2〜5. エスカレーション。採用したときだけ`acq`の本文とURLを差し替える。
+async fn escalate(
+    cli: &Cli,
+    acq: &mut Acquired,
+    timeout: Duration,
+    elapsed: Duration,
+    reason: &'static str,
+) -> Result<Escalation> {
+    let (rt, rb) = match remaining_budget(timeout, elapsed, cli.max_bytes, acq.consumed) {
+        Err(skip) => {
+            eprintln!("webgrab: warn=auto-render-skipped reason={}", skip.token());
+            return Ok(Escalation {
+                status: RenderStatus::Skipped(skip.token()),
+                rendered_chars: None,
+            });
+        }
+        Ok(v) => v,
+    };
+    eprintln!(
+        "webgrab: info=auto-render reason={reason} chars={}",
+        acq.stage.visible
+    );
+    warn_no_sandbox(cli);
+    let rendered = match render::render(&acq.final_url, &render_options(cli, rt, rb)).await {
+        Ok(r) => r,
+        Err(e) => return escalation_failed(Phase::Render, e),
+    };
+    // renderフェーズの抽出は常にrender後URLを基準にする。結果を捨てる場合は本文ごと捨てる
+    // ため、URLの出どころと本文の出どころが食い違わない。
+    let rs = match build_stage(cli, &rendered.html, &rendered.final_url) {
+        Ok(s) => s,
+        Err(e) => return escalation_failed(Phase::Extract, e),
+    };
+    let status = choose_result(acq.stage.visible, rs.visible);
+    let rendered_chars = Some(rs.visible);
+    if status.is_rendered() {
+        acq.stage = rs;
+        acq.final_url = rendered.final_url;
+    } else {
+        eprintln!("webgrab: warn=auto-render-no-gain reason=shorter");
+    }
+    Ok(Escalation {
+        status,
+        rendered_chars,
+    })
+}
+
+/// 6〜8. 空本文チェック・文字量制御・通知・出力の組み立て。
+fn assemble(cli: &Cli, acq: Acquired, status: RenderStatus, chars: CharCounts) -> Result<String> {
+    let stage = acq.stage;
+    // 6. 空本文チェック（--rawとtext/plainは免除、設計§4.3 4と設計10 §4.1）
+    if stage.route == Route::Extracted && stage.body.trim().is_empty() {
         let (tok, prose) = hint_for(status);
         return Err(WebgrabError::new(
             ExitCode::Empty,
@@ -276,7 +329,6 @@ pub async fn run(cli: &Cli) -> Result<String> {
 
     // 7. 文字量制御・トークン
     let slice = budget::slice(&stage.body, cli.start_index, cli.max_chars);
-    let max_chars_zero = cli.max_chars == 0;
     let tok = if cli.no_tokens {
         None
     } else {
@@ -285,43 +337,105 @@ pub async fn run(cli: &Cli) -> Result<String> {
 
     // 8. 短い本文の通知（提案はrender_status基準）
     let content_len = slice.content.chars().count();
-    let (short_content, short_content_suggest) =
-        if !cli.raw && content_len > 0 && slice.total < SHORT_CONTENT_CHARS {
-            let (hint, suggest) = hint_for(status);
-            eprintln!(
-                "webgrab: warn=short-content chars={} hint={hint}",
-                slice.total
-            );
-            (Some(slice.total), suggest)
-        } else {
-            (None, "")
-        };
+    let (short_content, short_content_suggest) = if stage.route == Route::Extracted
+        && content_len > 0
+        && slice.total < SHORT_CONTENT_CHARS
+    {
+        let (hint, suggest) = hint_for(status);
+        eprintln!(
+            "webgrab: warn=short-content chars={} hint={hint}",
+            slice.total
+        );
+        (Some(slice.total), suggest)
+    } else {
+        (None, "")
+    };
 
     let meta = Meta {
         title: stage.title,
-        url: final_url,
+        url: acq.final_url,
         published_time: stage.published,
         tokens: tok,
         short_content,
         short_content_suggest,
         fence: cli.fence,
         render_status: status,
-        static_chars,
-        rendered_chars,
+        static_chars: chars.static_chars,
+        rendered_chars: chars.rendered_chars,
     };
     let extra = cli::extra_flags(cli, status);
     Ok(output::render(
         to_format(cli.format),
         &meta,
         &slice,
-        max_chars_zero,
+        cli.max_chars == 0,
         &extra,
     ))
+}
+
+/// `--wait-ms`はrender経路でしか効かない。
+fn warn_ignored_flags(cli: &Cli) {
+    if cli.wait_ms.is_some() && !cli.render && !cli.auto_render {
+        eprintln!("webgrab: warn=flag-ignored flag=--wait-ms");
+    }
+}
+
+/// CLIを実行し、最終出力文字列を返す。
+pub async fn run(cli: &Cli) -> Result<String> {
+    let start = Instant::now();
+    let ua = cli
+        .user_agent
+        .clone()
+        .unwrap_or_else(cli::default_user_agent);
+    let timeout = Duration::from_secs(cli.timeout);
+    warn_ignored_flags(cli);
+
+    let (mut acq, mut status, mut chars) = if cli.render {
+        let acq = render_phase(cli, ua, timeout).await?;
+        let chars = CharCounts {
+            static_chars: None,
+            rendered_chars: Some(acq.stage.visible),
+        };
+        (acq, RenderStatus::Rendered, chars)
+    } else {
+        let acq = static_phase(cli, ua, timeout).await?;
+        let chars = CharCounts {
+            static_chars: Some(acq.stage.visible),
+            rendered_chars: None,
+        };
+        (acq, RenderStatus::Static, chars)
+    };
+
+    // text/plainはChromeで描画しても同じテキストしか得られない（設計10 §3）。
+    if cli.auto_render
+        && !cli.render
+        && acq.stage.route != Route::Plain
+        && let Some(reason) = escalation_reason(acq.stage.visible)
+    {
+        let e = escalate(cli, &mut acq, timeout, start.elapsed(), reason).await?;
+        status = e.status;
+        chars.rendered_chars = e.rendered_chars;
+    }
+
+    assemble(cli, acq, status, chars)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_stage_passes_text_through() {
+        let s = plain_stage("行1\nMutex<T>\n[x](javascript:a)\n");
+        assert_eq!(s.body, "行1\nMutex<T>\n[x](unsafe-javascript:a)\n");
+        assert_eq!(s.visible, s.body.chars().count());
+        assert!(s.title.is_none());
+        assert!(s.published.is_none());
+        assert_eq!(s.route, Route::Plain);
+        let empty = plain_stage("");
+        assert_eq!(empty.body, "");
+        assert_eq!(empty.visible, 0);
+    }
 
     #[test]
     fn escalation_reason_thresholds() {

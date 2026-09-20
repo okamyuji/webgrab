@@ -70,28 +70,60 @@ pub fn to_markdown(html: &str) -> Result<String> {
     Ok(sanitize_link_schemes(&md))
 }
 
-/// Markdownリンク/画像ターゲット `](...)` のうち、クリックでスクリプトが走りうる
-/// 実行系スキームだけを`unsafe-`接頭辞で無害化する（A03）。通常のURLや
-/// `data:image/png`等の非実行データURLはそのまま残す。
-fn sanitize_link_schemes(md: &str) -> String {
-    const DANGER: &[&str] = &[
-        "javascript:",
-        "vbscript:",
-        "data:text/html",
-        "data:image/svg+xml",
-    ];
+const DANGER_SCHEMES: &[&str] = &[
+    "javascript:",
+    "vbscript:",
+    "data:text/html",
+    "data:image/svg+xml",
+];
+
+/// リンクターゲットが始まる位置の区切り。戻り値は (区切りのバイト長, 直後の空白を読み飛ばすか)。
+/// オートリンク`<`で空白を読み飛ばさないのは、`< javascript:`がオートリンクではないため。
+fn link_delimiter_at(bytes: &[u8], i: usize) -> Option<(usize, bool)> {
+    match bytes[i] {
+        b'<' => Some((1, false)),
+        b']' if matches!(bytes.get(i + 1), Some(b'(' | b':')) => Some((2, true)),
+        _ => None,
+    }
+}
+
+fn starts_with_danger_scheme(s: &str) -> bool {
+    let b = s.as_bytes();
+    DANGER_SCHEMES
+        .iter()
+        .any(|d| b.len() >= d.len() && b[..d.len()].eq_ignore_ascii_case(d.as_bytes()))
+}
+
+/// インラインリンク`](`、参照定義`]:`、オートリンク`<`のターゲットのうち、クリックで
+/// スクリプトが走りうる実行系スキームだけを`unsafe-`接頭辞で無害化する（A03）。
+/// 通常のURLや`data:image/png`等の非実行データURLはそのまま残す。文字は削らないため、
+/// `Mutex<T>`や生のHTMLタグ（`<a href="javascript:x">`）は変わらない。
+pub fn sanitize_link_schemes(md: &str) -> String {
+    let bytes = md.as_bytes();
     let mut out = String::with_capacity(md.len());
-    let mut rest = md;
-    while let Some(pos) = rest.find("](") {
-        out.push_str(&rest[..pos + 2]);
-        let after = &rest[pos + 2..];
-        let lower = after.to_ascii_lowercase();
-        if DANGER.iter().any(|d| lower.starts_with(d)) {
+    let mut i = 0;
+    while i < bytes.len() {
+        let Some((delim_len, skip_ws)) = link_delimiter_at(bytes, i) else {
+            // 区切り以外は1文字ずつ写す。区切りと空白はASCIIなのでiは常にchar境界に乗る。
+            let ch = md[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        };
+        out.push_str(&md[i..i + delim_len]);
+        i += delim_len;
+        if skip_ws {
+            let ws = bytes[i..]
+                .iter()
+                .take_while(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+                .count();
+            out.push_str(&md[i..i + ws]);
+            i += ws;
+        }
+        if starts_with_danger_scheme(&md[i..]) {
             out.push_str("unsafe-");
         }
-        rest = after;
     }
-    out.push_str(rest);
     out
 }
 
@@ -260,6 +292,43 @@ mod tests {
 
         let md3 = to_markdown(r#"<a href="data:text/html,<script>1</script>">z</a>"#).unwrap();
         assert!(md3.contains("](unsafe-data:text/html"));
+    }
+
+    #[test]
+    fn sanitize_link_schemes_covers_three_forms() {
+        for (input, want) in [
+            ("[x](javascript:a)", "[x](unsafe-javascript:a)"),
+            ("[x](  javascript:a)", "[x](  unsafe-javascript:a)"),
+            ("<javascript:a>", "<unsafe-javascript:a>"),
+            ("[x]: javascript:a", "[x]: unsafe-javascript:a"),
+            ("[x]:\n  javascript:a", "[x]:\n  unsafe-javascript:a"),
+            ("[x](JavaScript:a)", "[x](unsafe-JavaScript:a)"),
+            ("<VBScript:a>", "<unsafe-VBScript:a>"),
+            ("[x](data:text/html,y)", "[x](unsafe-data:text/html,y)"),
+            (
+                "[x](data:image/svg+xml,y)",
+                "[x](unsafe-data:image/svg+xml,y)",
+            ),
+        ] {
+            assert_eq!(sanitize_link_schemes(input), want, "input={input:?}");
+        }
+    }
+
+    #[test]
+    fn sanitize_link_schemes_keeps_everything_else_byte_identical() {
+        for s in [
+            "[x](https://ok.test/p)",
+            "[x](data:image/png;base64,AAAA)",
+            "struct G<T: ?Sized> { inner: Mutex<T> }",
+            r#"<a href="javascript:x">y</a>"#,
+            "<script>var s='javascript:a';</script>",
+            "a < b > c",
+            "[x]: javascript-ish",
+            "[x]javascript:a",
+            "日本語のテキスト <T> です",
+        ] {
+            assert_eq!(sanitize_link_schemes(s), s, "input={s:?}");
+        }
     }
 
     #[test]
