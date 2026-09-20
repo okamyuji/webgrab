@@ -39,7 +39,13 @@ pub fn slice(body: &str, start_index: usize, max_chars: usize) -> Slice {
         };
     }
 
-    let end = start_index.saturating_add(max_chars).min(total);
+    let raw_end = start_index.saturating_add(max_chars).min(total);
+    let will_truncate = max_chars > 0 && start_index.saturating_add(max_chars) < total;
+    let end = if will_truncate {
+        snap_to_newline(body, start_index, raw_end, max_chars)
+    } else {
+        raw_end
+    };
     let mut start_byte = body.len();
     let mut end_byte = body.len();
     for (char_idx, (byte_idx, _)) in body.char_indices().enumerate() {
@@ -61,6 +67,25 @@ pub fn slice(body: &str, start_index: usize, max_chars: usize) -> Slice {
         total,
         truncated: end < total,
         ended: false,
+    }
+}
+
+/// 切り詰め終端を、範囲後半の最後の改行の直後まで戻す（設計§4.4 G4）。
+/// 戻し幅はmax_charsの半分まで。半分を超える戻しは1ページの量を極端に減らすため採らない。
+///
+/// ponytail: フェンス非認識のため、改行境界に戻してもコードフェンスの内側で切れることがある。
+fn snap_to_newline(body: &str, start: usize, end: usize, max_chars: usize) -> usize {
+    let last_newline = body
+        .char_indices()
+        .enumerate()
+        .skip_while(|(idx, _)| *idx < start)
+        .take_while(|(idx, _)| *idx < end)
+        .filter_map(|(idx, (_, ch))| (ch == '\n').then_some(idx))
+        .last();
+
+    match last_newline {
+        Some(i) if i + 1 >= start + max_chars.div_ceil(2) => i + 1,
+        _ => end,
     }
 }
 
@@ -198,5 +223,115 @@ mod tests {
     #[test]
     fn end_footer_format() {
         assert_eq!(end_footer(83000), "[webgrab:end total 83000 chars]");
+    }
+
+    #[test]
+    fn slice_snaps_to_newline_in_back_half() {
+        // "1234567890" + "\n" + "1234567890" 。\nはchar index10（[0,14)の後半、ceil(14/2)=7以降）。
+        let s = slice("1234567890\n1234567890", 0, 14);
+        assert_eq!(s.content, "1234567890\n");
+        assert_eq!(s.end, 11);
+        assert!(s.truncated);
+    }
+
+    #[test]
+    fn slice_does_not_snap_when_newline_only_in_front_half() {
+        // \nはchar index1（[0,14)の前半、ceil(14/2)=7未満）なので戻さない。
+        let body = format!("a\n{}", "b".repeat(20));
+        let s = slice(&body, 0, 14);
+        assert_eq!(s.end, 14);
+        assert_eq!(s.content, format!("a\n{}", "b".repeat(12)));
+        assert!(s.truncated);
+    }
+
+    #[test]
+    fn slice_does_not_snap_when_no_newline_in_range() {
+        let body = "x".repeat(30);
+        let s = slice(&body, 0, 10);
+        assert_eq!(s.end, 10);
+        assert!(s.truncated);
+    }
+
+    #[test]
+    fn slice_last_page_is_untouched_by_snap() {
+        // 最終ページは改行があっても戻さない（truncatedが発生しないため）。
+        let s = slice("hello\nworld", 6, 100);
+        assert_eq!(s.content, "world");
+        assert_eq!(s.end, 11);
+        assert!(!s.truncated);
+    }
+
+    #[test]
+    fn slice_max_chars_one_no_newline_at_start() {
+        let s = slice("ab\ncd", 0, 1);
+        assert_eq!(s.content, "a");
+        assert_eq!(s.end, 1);
+        assert!(s.truncated);
+    }
+
+    #[test]
+    fn slice_max_chars_one_newline_at_start() {
+        let s = slice("\nabcd", 0, 1);
+        assert_eq!(s.content, "\n");
+        assert_eq!(s.end, 1);
+        assert!(s.truncated);
+    }
+
+    #[test]
+    fn slice_snap_handles_multibyte_chars_without_panic() {
+        // 絵文字(4バイト)を跨ぐ範囲でも、char単位のスナップがバイト境界パニックを起こさない。
+        let s = slice("😀😀\n😀😀😀😀😀😀", 0, 6);
+        assert_eq!(s.content, "😀😀\n");
+        assert_eq!(s.end, 3);
+        assert!(s.truncated);
+    }
+
+    #[test]
+    fn slice_snaps_on_crlf_body() {
+        let s = slice("12345\r\n1234567890", 0, 12);
+        assert_eq!(s.content, "12345\r\n");
+        assert_eq!(s.end, 7);
+        assert!(s.truncated);
+    }
+
+    #[test]
+    fn slice_end_already_right_after_newline_is_unchanged() {
+        let s = slice("abc\ndefghij", 0, 4);
+        assert_eq!(s.content, "abc\n");
+        assert_eq!(s.end, 4);
+        assert!(s.truncated);
+    }
+
+    #[test]
+    fn slice_pagination_concatenation_matches_body_for_various_max_chars() {
+        let bodies = [
+            "line one\nline two\nline three\nline four\nline five\n",
+            "no newlines at all here just plain text of some length",
+            "あ\nい\nう\nえ\nお\nか\nき\nく\nけ\nこ\n",
+            "short",
+        ];
+        for body in bodies {
+            for max_chars in [1usize, 2, 3, 5, 7, 11, 100] {
+                let mut start = 0usize;
+                let mut collected = String::new();
+                loop {
+                    let s = slice(body, start, max_chars);
+                    if s.ended {
+                        break;
+                    }
+                    assert!(
+                        s.end > start,
+                        "body={body:?} max_chars={max_chars} start={start} end={}",
+                        s.end
+                    );
+                    collected.push_str(&s.content);
+                    start = s.end;
+                    if !s.truncated {
+                        break;
+                    }
+                }
+                assert_eq!(collected, body, "body={body:?} max_chars={max_chars}");
+            }
+        }
     }
 }

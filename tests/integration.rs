@@ -393,6 +393,61 @@ fn i4_plain_text_body_is_neutralized() {
 }
 
 #[test]
+fn i7_plain_text_pagination_snaps_to_newline_boundary() {
+    // 各行はmax_chars(30)の半分より短く、[webgrab:や制御文字、危険リンクスキームを含まない。
+    let body: String = (0..20).map(|i| format!("line{i:02}\n")).collect();
+    let port = spawn_plain_server(12, &body, "text/plain");
+    let base_url = format!("http://127.0.0.1:{port}/log.txt");
+
+    let mut start = 0usize;
+    let mut collected = String::new();
+    loop {
+        let (code, stdout, stderr) = run_webgrab(&[
+            &base_url,
+            "--allow-private",
+            "--format",
+            "text",
+            "--max-chars",
+            "30",
+            "--start-index",
+            &start.to_string(),
+        ]);
+        assert_eq!(code, 0, "stderr={stderr}");
+        // webgrabが付けた部分（出力末尾の改行）を除く。
+        let page = stdout.strip_suffix('\n').unwrap_or(&stdout);
+        // フッタ行（[webgrab:truncated ...]）が付くページは、それを除いた本文を取り出す。
+        let (content, is_last) = match page.rfind("\n[webgrab:") {
+            Some(idx) => (&page[..idx], false),
+            None => (page, true),
+        };
+        if !is_last {
+            assert!(
+                content.ends_with('\n'),
+                "改行境界で終わっていない: {content:?}"
+            );
+        }
+        collected.push_str(content);
+        if is_last {
+            break;
+        }
+        let footer = &page[content.len() + 1..];
+        let next: usize = footer
+            .split("--start-index ")
+            .nth(1)
+            .expect("continue commandに--start-indexがある")
+            .split_whitespace()
+            .next()
+            .expect("--start-index の値")
+            .trim_end_matches(']')
+            .parse()
+            .expect("数値");
+        assert!(next > start, "ページングが進まない: {next} <= {start}");
+        start = next;
+    }
+    assert_eq!(collected, body);
+}
+
+#[test]
 fn i8_plain_text_body_is_identical_across_raw_and_formats() {
     let port = spawn_plain_server(8, PLAIN_SRC, "text/plain");
     let url = format!("http://127.0.0.1:{port}/src.rs");
