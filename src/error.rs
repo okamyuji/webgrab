@@ -292,4 +292,36 @@ mod tests {
         let d = sanitize_detail(input);
         assert_eq!(d, "mtext");
     }
+
+    #[test]
+    fn sanitize_detail_handles_csi_and_size_boundaries() {
+        let full = "a".repeat(DETAIL_MAX_BYTES);
+        let near = "a".repeat(DETAIL_MAX_BYTES - 2);
+        let ones = "1".repeat(100);
+        let cases = [
+            (
+                "未終端CSIは多バイト文字を残し制御文字を空白へ畳む",
+                format!("\u{1b}[あ\t{}", "1".repeat(98)),
+                format!("[あ {}", "1".repeat(98)),
+            ),
+            (
+                "上限到達後の終端CSIは空白へ畳まず切り詰める",
+                format!("{full}\u{1b}[31mtail"),
+                format!("{full}…"),
+            ),
+            (
+                "上限到達後の未終端CSIは`[`を出さず切り詰める",
+                format!("{full}\u{1b}[{ones}"),
+                format!("{full}…"),
+            ),
+            (
+                "未終端CSIの本文の途中で切り詰める",
+                format!("{near}\u{1b}[{ones}"),
+                format!("{near}[1…"),
+            ),
+        ];
+        for (name, raw, want) in cases {
+            assert_eq!(sanitize_detail(&raw), want, "{name}");
+        }
+    }
 }
