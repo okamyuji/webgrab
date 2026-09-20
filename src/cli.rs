@@ -287,4 +287,28 @@ mod tests {
     fn default_ua_has_product_token() {
         assert!(default_user_agent().starts_with("webgrab/"));
     }
+
+    #[test]
+    fn extra_flags_reproduces_only_non_default_value_flags() {
+        let set = Cli::try_parse_from([
+            "webgrab",
+            "https://x.test",
+            "--format",
+            "frontmatter",
+            "--fence",
+            "--max-bytes",
+            "1048576",
+        ])
+        .unwrap();
+        let f = extra_flags(&set, RenderStatus::Static);
+        for want in ["--format frontmatter", "--fence", "--max-bytes 1048576"] {
+            assert!(f.contains(&want.to_string()), "{want}: {f:?}");
+        }
+
+        let unset = Cli::try_parse_from(["webgrab", "https://x.test"]).unwrap();
+        let g = extra_flags(&unset, RenderStatus::Static);
+        for absent in ["format", "fence", "max-bytes"] {
+            assert!(!g.iter().any(|s| s.contains(absent)), "{absent}: {g:?}");
+        }
+    }
 }
