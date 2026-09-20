@@ -40,8 +40,8 @@ pub fn slice(body: &str, start_index: usize, max_chars: usize) -> Slice {
     }
 
     let raw_end = start_index.saturating_add(max_chars).min(total);
-    let will_truncate = max_chars > 0 && start_index.saturating_add(max_chars) < total;
-    let end = if will_truncate {
+    // max_chars == 0 は範囲が空で戻し先が無いため、ここで除外しなくても結果は変わらない。
+    let end = if start_index.saturating_add(max_chars) < total {
         snap_to_newline(body, start_index, raw_end, max_chars)
     } else {
         raw_end
@@ -75,12 +75,12 @@ pub fn slice(body: &str, start_index: usize, max_chars: usize) -> Slice {
 ///
 /// ponytail: フェンス非認識のため、改行境界に戻してもコードフェンスの内側で切れることがある。
 fn snap_to_newline(body: &str, start: usize, end: usize, max_chars: usize) -> usize {
+    // startより前の改行は下の閾値（start以上）で必ず落ちるため、走査の下限は設けない。
     let last_newline = body
-        .char_indices()
+        .chars()
+        .take(end)
         .enumerate()
-        .skip_while(|(idx, _)| *idx < start)
-        .take_while(|(idx, _)| *idx < end)
-        .filter_map(|(idx, (_, ch))| (ch == '\n').then_some(idx))
+        .filter_map(|(idx, ch)| (ch == '\n').then_some(idx))
         .last();
 
     match last_newline {
@@ -259,6 +259,39 @@ mod tests {
         assert_eq!(s.content, "world");
         assert_eq!(s.end, 11);
         assert!(!s.truncated);
+    }
+
+    #[test]
+    fn slice_exact_fit_last_page_is_not_snapped() {
+        // start + max_chars == total は切り詰めではない。後半に改行があっても全量を返す。
+        let s = slice("abcd\nef", 0, 7);
+        assert_eq!(s.content, "abcd\nef");
+        assert_eq!(s.end, 7);
+        assert!(!s.truncated);
+    }
+
+    #[test]
+    fn slice_ignores_newline_exactly_at_range_end() {
+        // 範囲は半開区間[start, end)。end位置の改行を拾うとmax_charsを超える。
+        let s = slice("abcde\nxyz", 0, 5);
+        assert_eq!(s.content, "abcde");
+        assert_eq!(s.end, 5);
+    }
+
+    #[test]
+    fn slice_snaps_to_newline_at_range_start() {
+        // 範囲先頭の改行も対象（ceil(2/2)=1 なので i+1=1 で条件を満たす）。
+        let s = slice("\nabc", 0, 2);
+        assert_eq!(s.content, "\n");
+        assert_eq!(s.end, 1);
+    }
+
+    #[test]
+    fn slice_does_not_snap_to_newline_before_start() {
+        // start より前の改行は戻し先にならない。
+        let s = slice("a\nbcdefgh", 3, 4);
+        assert_eq!(s.content, "cdef");
+        assert_eq!((s.start, s.end), (3, 7));
     }
 
     #[test]

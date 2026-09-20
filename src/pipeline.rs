@@ -314,6 +314,12 @@ async fn escalate(
     })
 }
 
+/// short-contentを通知するか。`content_len == 0`は`--max-chars 0`や末尾超過で、
+/// 出力が空なのは本文が短いせいではないため通知しない。
+fn is_short_content(route: Route, content_len: usize, total: usize) -> bool {
+    route == Route::Extracted && content_len > 0 && total < SHORT_CONTENT_CHARS
+}
+
 /// 6〜8. 空本文チェック・文字量制御・通知・出力の組み立て。
 fn assemble(cli: &Cli, acq: Acquired, status: RenderStatus, chars: CharCounts) -> Result<String> {
     let stage = acq.stage;
@@ -337,19 +343,17 @@ fn assemble(cli: &Cli, acq: Acquired, status: RenderStatus, chars: CharCounts) -
 
     // 8. 短い本文の通知（提案はrender_status基準）
     let content_len = slice.content.chars().count();
-    let (short_content, short_content_suggest) = if stage.route == Route::Extracted
-        && content_len > 0
-        && slice.total < SHORT_CONTENT_CHARS
-    {
-        let (hint, suggest) = hint_for(status);
-        eprintln!(
-            "webgrab: warn=short-content chars={} hint={hint}",
-            slice.total
-        );
-        (Some(slice.total), suggest)
-    } else {
-        (None, "")
-    };
+    let (short_content, short_content_suggest) =
+        if is_short_content(stage.route, content_len, slice.total) {
+            let (hint, suggest) = hint_for(status);
+            eprintln!(
+                "webgrab: warn=short-content chars={} hint={hint}",
+                slice.total
+            );
+            (Some(slice.total), suggest)
+        } else {
+            (None, "")
+        };
 
     let meta = Meta {
         title: stage.title,
@@ -513,5 +517,20 @@ mod tests {
         assert_eq!(hint_for(RenderStatus::Rendered), ("--raw", "--raw"));
         assert_eq!(hint_for(RenderStatus::Failed("render")), ("--raw", "--raw"));
         assert_eq!(hint_for(RenderStatus::NoGain), ("--raw", "--raw"));
+    }
+
+    #[test]
+    fn short_content_notice_boundaries() {
+        assert!(is_short_content(Route::Extracted, 1, 199));
+        assert!(
+            !is_short_content(Route::Extracted, 1, 200),
+            "200文字は短文でない"
+        );
+        assert!(
+            !is_short_content(Route::Extracted, 0, 199),
+            "出力が空なら通知しない"
+        );
+        assert!(!is_short_content(Route::Raw, 1, 199));
+        assert!(!is_short_content(Route::Plain, 1, 199));
     }
 }

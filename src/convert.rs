@@ -325,6 +325,7 @@ mod tests {
             "a < b > c",
             "[x]: javascript-ish",
             "[x]javascript:a",
+            "[x] javascript:a",
             "日本語のテキスト <T> です",
         ] {
             assert_eq!(sanitize_link_schemes(s), s, "input={s:?}");

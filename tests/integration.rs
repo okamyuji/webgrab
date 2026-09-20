@@ -594,3 +594,15 @@ fn render_robots_disallow_exits_5_before_chrome_launches() {
     assert_eq!(code, 5, "stderr={stderr}");
     assert!(stderr.contains("error=robots"), "{stderr}");
 }
+
+#[test]
+fn plain_text_ignores_meta_charset_in_body() {
+    // HTMLを含むソースコードの本文中の<meta charset>を採用すると文字化けする（設計10 §4.1）。
+    let body = "<meta charset=\"shift_jis\">\n// 日本語のコメントです\n";
+    let port = spawn_plain_server(2, body, "text/plain");
+    let url = format!("http://127.0.0.1:{port}/page.html.txt");
+    let (code, stdout, stderr) = run_webgrab(&[&url, "--allow-private"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(body_of(&stdout, true), body);
+    assert!(!stderr.contains("decode-replacement"), "{stderr}");
+}

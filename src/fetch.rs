@@ -375,6 +375,16 @@ mod tests {
     }
 
     #[test]
+    fn check_media_type_rejects_unsupported_with_exit_4() {
+        assert!(check_media_type(None).is_ok());
+        assert!(check_media_type(Some("text/html; charset=utf-8")).is_ok());
+        assert!(check_media_type(Some("text/plain")).is_ok());
+        let e = check_media_type(Some("application/pdf; q=1")).unwrap_err();
+        assert_eq!(e.code, ExitCode::Http);
+        assert_eq!(e.message, "unsupported content-type: application/pdf");
+    }
+
+    #[test]
     fn plain_text_detection_ignores_case_and_parameters() {
         assert!(is_plain_text(Some("text/plain")));
         assert!(is_plain_text(Some("Text/PLAIN")));
