@@ -1,6 +1,6 @@
 # 品質ルーブリック — webgrab設計書レビュー用
 
-- バージョン: 1.2（対象は設計書docs/04-design.md v1.2およびdocs/08-js-render-design.md v1.0。R9を追加）
+- バージョン: 1.3（対象は設計書docs/04-design.md、docs/08-js-render-design.md、docs/10-fetch-fidelity-design.md。R10を追加）
 - レビュアーへの指示: 語彙・表記ゆれ・未決定マーカーはdoclintの担当なので再検査しないこと。以下の観点と、技術的妥当性の特別カテゴリ（データ喪失、セキュリティ欠陥、サービス停止リスク、文書間の決定的矛盾、契約と実装の不一致）を報告すること。特別カテゴリはルーブリック外でも単独報告で採用される。
 
 ## 観点（rubric-listed findings）
@@ -16,3 +16,4 @@
 | R7 | 依存の妥当性 | 各crateの採用理由が03-research-report.mdの調査結果に紐づいている |
 | R8 | SSRF/ページング契約の実装可能性 | §3.1のnetguard（IPピン留め・リダイレクト手動追従・render経路interception）とページング契約が、選定crateのAPIで実装可能で自己矛盾がない |
 | R9 | render待機とエスカレーションの実装可能性 | 08-js-render-design.md §4.2の待機条件（in-flight計数・DOM安定・本文長）と§4.3の`--auto-render`がchromiumoxide 0.9.1のAPIで実装可能で、終了コード表・継続コマンド規則・SSRF二層防御と自己矛盾がない |
+| R10 | 取得忠実度の改善の実装可能性 | 10-fetch-fidelity-design.md §4の各仕様（`text/plain`の素通し、render後URLの採用、`Accept`ヘッダ、切り詰め位置の調整、403時の提案）が現行の`src/`とreqwest・chromiumoxide 0.9.1のAPIで実装可能で、04と08のページング契約・無害化・終了コード表・`--auto-render`の規定と自己矛盾がない |
