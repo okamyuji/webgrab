@@ -481,15 +481,19 @@ fn i8_plain_text_body_is_identical_across_raw_and_formats() {
 }
 
 /// リクエスト全文から`Accept`ヘッダの値を取り出す（大小無視でヘッダ名照合）。
+/// 複数行あれば` || `で連結して返す。既定の`*/*`が置換されず2値送られた場合に、
+/// 期待値との比較が失敗する。
 fn accept_header_value(req: &str) -> Option<String> {
-    req.lines().find_map(|l| {
-        let (name, value) = l.split_once(':')?;
-        if name.trim().eq_ignore_ascii_case("accept") {
-            Some(value.trim().to_string())
-        } else {
-            None
-        }
-    })
+    let values: Vec<&str> = req
+        .lines()
+        .filter_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("accept")
+                .then_some(value.trim())
+        })
+        .collect();
+    (!values.is_empty()).then(|| values.join(" || "))
 }
 
 const G3_ACCEPT: &str = "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8";
@@ -605,4 +609,19 @@ fn plain_text_ignores_meta_charset_in_body() {
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(body_of(&stdout, true), body);
     assert!(!stderr.contains("decode-replacement"), "{stderr}");
+}
+
+#[test]
+fn plain_text_control_byte_cannot_revive_dangerous_link() {
+    // 無害化の判定（convert）と制御文字の削除（output）は別の段にある。判定が制御文字で
+    // 途切れると、削除後に`](javascript:`が復元される。両段を通した出力で確かめる。
+    let body = "a [x](\u{1}javascript:alert(1)) b\nc <\u{1}javascript:alert(2)> d\n";
+    let port = spawn_plain_server(2, body, "text/plain");
+    let url = format!("http://127.0.0.1:{port}/t.txt");
+    let (code, stdout, stderr) = run_webgrab(&[&url, "--allow-private", "--format", "text"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(
+        body_of(&stdout, false),
+        "a [x](unsafe-javascript:alert(1)) b\nc <unsafe-javascript:alert(2)> d\n"
+    );
 }

@@ -87,11 +87,31 @@ fn link_delimiter_at(bytes: &[u8], i: usize) -> Option<(usize, bool)> {
     }
 }
 
+/// 制御文字（Cc）を読み飛ばして`scheme`に前方一致するか。C0・DEL・C1は出力段の
+/// `output::strip_terminal_controls`が削除し、タブと改行はURLの解釈時に無視される。判定が
+/// これらで途切れると、`](\x01javascript:`が無害化をすり抜けたあと危険リンクへ戻る。
+/// 最初の不一致で打ち切るため、走査量は入力全体で線形に収まる。
+fn matches_scheme_ignoring_controls(s: &str, scheme: &str) -> bool {
+    let mut want = scheme.bytes().peekable();
+    for c in s.chars() {
+        let Some(&w) = want.peek() else {
+            return true;
+        };
+        if c.is_control() {
+            continue;
+        }
+        if !c.is_ascii() || (c as u8).to_ascii_lowercase() != w {
+            return false;
+        }
+        want.next();
+    }
+    want.peek().is_none()
+}
+
 fn starts_with_danger_scheme(s: &str) -> bool {
-    let b = s.as_bytes();
     DANGER_SCHEMES
         .iter()
-        .any(|d| b.len() >= d.len() && b[..d.len()].eq_ignore_ascii_case(d.as_bytes()))
+        .any(|d| matches_scheme_ignoring_controls(s, d))
 }
 
 /// インラインリンク`](`、参照定義`]:`、オートリンク`<`のターゲットのうち、クリックで
@@ -311,6 +331,30 @@ mod tests {
             ),
         ] {
             assert_eq!(sanitize_link_schemes(input), want, "input={input:?}");
+        }
+    }
+
+    #[test]
+    fn sanitize_link_schemes_sees_through_control_characters() {
+        // 制御文字は出力段が削除し、タブと改行はURLの解釈時に無視される。判定が
+        // これらで途切れると、無害化をすり抜けた文字列が出力時に危険リンクへ戻る。
+        for (input, want) in [
+            ("[x](\u{1}javascript:a)", "[x](unsafe-\u{1}javascript:a)"),
+            ("<\u{1}javascript:a>", "<unsafe-\u{1}javascript:a>"),
+            ("[x]: \u{1}javascript:a", "[x]: unsafe-\u{1}javascript:a"),
+            ("[x](java\tscript:a)", "[x](unsafe-java\tscript:a)"),
+            ("[x](java\nscript:a)", "[x](unsafe-java\nscript:a)"),
+            (
+                "[x](j\u{7f}a\u{85}vascript\u{1b}:a)",
+                "[x](unsafe-j\u{7f}a\u{85}vascript\u{1b}:a)",
+            ),
+            ("<data\u{0}:text/html,y>", "<unsafe-data\u{0}:text/html,y>"),
+        ] {
+            assert_eq!(sanitize_link_schemes(input), want, "input={input:?}");
+        }
+        // 制御文字だけで危険スキームにならないものは変えない。
+        for s in ["[x](\u{1}https://ok.test/)", "<\u{1}T>", "[x](java\u{1}"] {
+            assert_eq!(sanitize_link_schemes(s), s, "input={s:?}");
         }
     }
 
