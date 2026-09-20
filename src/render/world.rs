@@ -89,9 +89,12 @@ impl IsolatedWorld {
         v.first().copied()
     }
 
-    /// DOM HTML（doctype + outerHTML）を分離ワールドで取得する。失敗・タイムアウトはNone。
-    pub(super) async fn dom_html(&mut self, limit: Duration) -> Option<String> {
-        const EXPR: &str = "(function(){var s='';if(document.doctype){s=new XMLSerializer().serializeToString(document.doctype);}var d=document.documentElement;if(d){s+=d.outerHTML;}return s;})()";
+    /// `location.href`とDOM HTML（doctype + outerHTML）を1回の評価で取得する（設計10 §4.2）。
+    /// URLとDOMが同じ時点の値になる。失敗・タイムアウト・DOM HTMLが文字列でない場合はNone。
+    /// `location.href`が文字列でない場合は、URLだけNoneでDOM HTMLは返す。
+    pub(super) async fn dom_html(&mut self, limit: Duration) -> Option<(Option<String>, String)> {
+        // slice(0, 8193)は転送量を抑える。上限超えは採用側（resolve_final_url）が捨てる。
+        const EXPR: &str = "(function(){var s='';if(document.doctype){s=new XMLSerializer().serializeToString(document.doctype);}var d=document.documentElement;if(d){s+=d.outerHTML;}return [location.href.slice(0, 8193), s];})()";
         for attempt in 0..2 {
             let ctx = self.ensure_ctx().await?;
             let params = EvaluateParams::builder()
@@ -102,13 +105,10 @@ impl IsolatedWorld {
                 .ok()?;
             match tokio::time::timeout(limit, self.page.execute(params)).await {
                 Ok(Ok(resp)) => {
-                    return resp
-                        .result
-                        .result
-                        .value
-                        .as_ref()?
-                        .as_str()
-                        .map(|s| s.to_string());
+                    let arr = resp.result.result.value.as_ref()?.as_array()?;
+                    let html = arr.get(1)?.as_str()?.to_string();
+                    let url = arr.first().and_then(|v| v.as_str()).map(str::to_string);
+                    return Some((url, html));
                 }
                 Ok(Err(_)) if attempt == 0 => {
                     self.ctx = None;

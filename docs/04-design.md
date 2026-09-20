@@ -1,8 +1,8 @@
 # webgrab 設計書
 
-- バージョン: 1.3（[08-js-render-design.md](08-js-render-design.md)（`--auto-render`によるJSレンダリング自動エスカレーション）の実装を反映。変更履歴は末尾）
+- バージョン: 1.4（[08-js-render-design.md](08-js-render-design.md)（`--auto-render`によるJSレンダリング自動エスカレーション）と[10-fetch-fidelity-design.md](10-fetch-fidelity-design.md)（取得忠実度の改善）の実装を反映。変更履歴は末尾）
 - 日付: 2026-08-27
-- 根拠文書: [01-measurement-report.md](01-measurement-report.md)（問題の実測）, [03-research-report.md](03-research-report.md)（技術選定の根拠）, [08-js-render-design.md](08-js-render-design.md)（`--auto-render`の差分設計）
+- 根拠文書: [01-measurement-report.md](01-measurement-report.md)（問題の実測）, [03-research-report.md](03-research-report.md)（技術選定の根拠）, [08-js-render-design.md](08-js-render-design.md)（`--auto-render`の差分設計）, [10-fetch-fidelity-design.md](10-fetch-fidelity-design.md)（text/plain素通し・render後URL・切り詰め改行境界・403提案の差分設計）
 
 ## 1. 目的と背景
 
@@ -17,12 +17,12 @@
 
 | 決定 | 選択肢 | 採用 | 理由（詳細は03-research-report.md） |
 |---|---|---|---|
-| HTTP取得 | reqwest / ureq | reqwest | JSレンダリングでtokioが必要なため非同期が自然。デファクト |
+| HTTP取得 | reqwest / ureq | reqwest | JSレンダリングでtokioが必要なため非同期が自然。デファクト。本文取得は`Accept: text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8`をHTML優先で固定送信する。robots.txt取得は既定の`*/*`のまま |
 | JSレンダリング | chromiumoxide / headless_chrome / サブプロセス | chromiumoxide（tokio専用・デフォルトfeatureで動作。§8のsmoke testで既定featureのままtokioで動くことを検証済み。特別なfeature指定は不要） | CDP制御の細かさとメンテ活発さ。--dump-domは完了待ち制御不能。調査報告書B枝の「Chrome未検出時は静的取得へ暗黙フォールバック」案は不採用（取得内容が静かに変わるsilent degradationを避け、終了コード7でエージェントに判断を返す）。例外: `--auto-render`時の終了コード7に限り、静的結果への復帰を`warn=`と`render_status`で明示して行う（08-js-render-design.md §4.3 5） |
 | 本文抽出 | dom_smoothie / readability / llm_readability | dom_smoothie | readability.js忠実移植で2026-06更新。第三者ベンチで旧readability系は本文53バイトのみ返す失敗例あり |
 | HTML→Markdown | htmd / fast_html2md / html2md | htmd | 品質・DL数（117万/直近）・Apache-2.0。html2mdはGPLかつ出力肥大例あり |
 | トークン概算 | tiktoken-rs / 文字数近似 | tiktoken-rs（o200k_base）。ただし量の制御は文字ベースのみで、トークンによる切り詰めは非対応と契約に明記。計数は出力直前の遅延実行とし、--no-tokensで省略可（起動レイテンシ対策） | 日本語で文字数/4近似は過小見積もりし予算超過を招く。安全側のBPE実測 |
-| 文字コード | encoding_rs単体 / +chardetng | encoding_rs + chardetng | reqwestのtext()はmeta charsetを見ないため、ヘッダ→metaスニッフ→推定の3段判定が定石 |
+| 文字コード | encoding_rs単体 / +chardetng | encoding_rs + chardetng | reqwestのtext()はmeta charsetを見ないため、ヘッダ→metaスニッフ→推定の3段判定が定石（text/plainはHTML metaの走査を省き、ヘッダ→推定の2段で判定する） |
 | robots.txt解析 | 外部crate / 自前最小実装 | 自前最小実装（User-agent / Disallow / Allow。前置一致に加えRFC 9309の`*`と`$`をサポート。解釈できないパターンに一致候補がある場合は安全側=disallow扱い+stderr注記） | 必要仕様が小さく枯れているため。ladder: これ以上の仕様が必要になったらcrate導入 |
 | 内部アドレスの取得 | 無制限 / デフォルト拒否+明示解除 | デフォルト拒否+--allow-privateで解除。詳細な拒否レンジと判定方式は§3.1 | SSRF防止（レビュー合意所見。エージェントは注入されたURLをそのまま渡しうる） |
 | CLI引数解析 | clap / 自前 | clap v4（derive） | デファクト。終了コード2が引数エラーの慣例と一致 |
@@ -30,7 +30,7 @@
 | デフォルト出力形式 | Markdown / テキスト / JSON | Jina Reader互換ヘッダ付きMarkdown | ユーザー決定+デファクト形式 |
 | レンダリング既定 | 常時Chrome / 常時静的 / 静的既定+明示フラグ | 静的既定 + --renderフラグ。加えてopt-inの`--auto-render`（既定off）で、静的取得の可視テキストが空または200文字未満のとき同一プロセス内でJSレンダリングへ自動エスカレーションする（詳細は08-js-render-design.md §4.3） | 速度と依存の軽さ。本文が短い場合の再実行提案は7章。`--auto-render`は既定挙動を変えずエージェントの再呼び出しを不要にする |
 
-「文字」の定義: 本書のすべての文字数（--start-index、--max-chars、フッタの範囲表記、chars値）はUnicodeスカラー値（Rustの`char`）で数える。スライスは`char_indices`ベースで行い、バイト境界パニックを起こさない。範囲表記は半開区間`[start, start+max)`とする。
+「文字」の定義: 本書のすべての文字数（--start-index、--max-chars、フッタの範囲表記、chars値）はUnicodeスカラー値（Rustの`char`）で数える。スライスは`char_indices`ベースで行い、バイト境界パニックを起こさない。範囲表記は半開区間`[start, 実際の終端)`とする。切り詰めが発生する場合、終端は範囲後半の最後の改行の直後まで戻すため、出力は`--max-chars`より短くなることがある（詳細は10-fetch-fidelity-design.md §4.4）。
 
 ## 3.1 SSRF防止（netguard）の詳細仕様
 
@@ -115,10 +115,10 @@ webgrab <URL> [OPTIONS]
 |---|---|---|---|
 | `<URL>` | 必須位置引数 | なし | http/httpsのみ受理。それ以外は終了コード2 |
 | --format | markdown \| frontmatter \| json \| text \| html | markdown | 出力形式（6章） |
-| --max-chars | usize | 24000 | 本文（変換後Markdown）の最大文字数。Claude CodeのBash 30,000文字制限の内側。0を指定した場合はメタデータヘッダのみ出力し終了コード0 |
+| --max-chars | usize | 24000 | 本文（変換後Markdown）の最大文字数の上限。Claude CodeのBash 30,000文字制限の内側。0を指定した場合はメタデータヘッダのみ出力し終了コード0。切り詰め位置は範囲後半の最後の改行の直後まで戻すため出力が上限より短くなることがある。フッタ・`chars`・継続コマンドの`--start-index`は実際の終端を指す |
 | --start-index | usize | 0 | 本文の開始文字オフセット（続き取得用）。総文字数以上を指定した場合は空本文+ヘッダ+終端フッタ`[webgrab:end total N chars]`で終了コード0 |
 | --render | フラグ | off | chromiumoxideでJSレンダリング後のDOMを取得 |
-| --auto-render | フラグ | off | 静的取得の可視テキスト（スライス前）が空または200文字未満のとき、同一プロセス内でJSレンダリングに切り替える。`--raw`でも同じ基準で切り替える（`--raw`の終了コード6・short-content免除は維持）。切替・失敗・skipはstderrの`info=`・`warn=`行、`render_status`、markdown/text/htmlの`[webgrab:render-status ...]`行で通知する。`--render`と同時指定時は`--render`が優先（stderr注記なし）。注意: 外部ページは本文を短くするだけでChrome起動を誘発でき、エスカレーション時は対象オリジンへ描画1ページ分（サブリソース含む）の要求が追加で発生する。自側のコストは残余`--timeout`と残余`--max-bytes`（両経路とも展開後バイト）で上限づける |
+| --auto-render | フラグ | off | 静的取得の可視テキスト（スライス前）が空または200文字未満のとき、同一プロセス内でJSレンダリングに切り替える。`--raw`でも同じ基準で切り替える（`--raw`の終了コード6・short-content免除は維持）。切替・失敗・skipはstderrの`info=`・`warn=`行、`render_status`、markdown/text/htmlの`[webgrab:render-status ...]`行で通知する。`--render`と同時指定時は`--render`が優先（stderr注記なし）。注意: 外部ページは本文を短くするだけでChrome起動を誘発でき、エスカレーション時は対象オリジンへ描画1ページ分（サブリソース含む）の要求が追加で発生する。自側のコストは残余`--timeout`と残余`--max-bytes`（両経路とも展開後バイト）で上限づける。text/plainはこのエスカレーション判定の対象外で、`render_status`は`static`のままになる |
 | --wait-ms | Option\<u64\>（未指定時は5000） | 5000 | `--render`/`--auto-render`のrender時、`goto`開始からDOM取得までの上限ミリ秒（ナビゲーション時間を含む）。ネットワーク静止・DOM安定・可視テキスト200文字以上を満たせば上限前に終了する。`--auto-render`時は残余`--timeout`に丸める。`--render`と`--auto-render`のどちらも指定されていない場合は無視しstderrに`warn=flag-ignored flag=--wait-ms`を出す |
 | --no-sandbox | フラグ | off | Chromeのsandboxを無効化する。起動直前にstderrへ`warn=no-sandbox`を1行出す（エスカレーションしない実行やskipされた実行では出さない）。継続コマンドにも再現する（用途はsandboxが起動しないCI環境に限り、通常利用では指定しない。「セキュリティと信頼モデル」参照） |
 | --raw | フラグ | off | 本文抽出をスキップしページ全体をMarkdown化。--renderとの併用可 |
@@ -133,7 +133,7 @@ webgrab <URL> [OPTIONS]
 
 - stdoutには本文のみ、診断・警告・進捗はstderrのみに出す
 - stderrのエラー・警告・情報の先頭行は機械可読の固定書式とする（`error=` / `warn=` / `info=`の3種。例: `webgrab: error=http status=503 retryable=true`、`webgrab: warn=short-content chars=42 hint=--render/--raw`、`webgrab: info=auto-render reason=empty chars=0`）。`info=`は失敗を意味せず、失敗する実行では`info=`の後に必ず`error=`ブロックが続く。「先頭行」とは各メッセージブロック（`webgrab: `で始まる行とそれに続く詳細行）の1行目を指し、プロセスのstderr全体の1行目ではない（`warn=`や`info=`が`error=`に先行してよい）
-- 抽出後の本文が1文字以上200文字未満の場合、stdout本文の末尾に自己記述行`[webgrab:short-content 42 chars — if unexpected, retry with <提案>]`を付け、stderrにも同内容の警告を出す（終了コードは0）。提案は`render_status`で決める。`static`/`skipped`なら`--render/--raw`（JS描画ページか一覧ページの可能性）、`rendered`/`failed`/`no-gain`なら`--raw`（抽出が一覧等を落としている可能性。`--render`明示時も`rendered`扱い）。抑制せず通知する。0文字の場合は7章のとおり終了コード6
+- 抽出後の本文が1文字以上200文字未満の場合、stdout本文の末尾に自己記述行`[webgrab:short-content 42 chars — if unexpected, retry with <提案>]`を付け、stderrにも同内容の警告を出す（終了コードは0）。提案は`render_status`で決める。`static`/`skipped`なら`--render/--raw`（JS描画ページか一覧ページの可能性）、`rendered`/`failed`/`no-gain`なら`--raw`（抽出が一覧等を落としている可能性。`--render`明示時も`rendered`扱い）。抑制せず通知する。0文字の場合は7章のとおり終了コード6。text/plainは`--raw`と同じく本節の対象外で、この判定もマーカーも出ない
 
 ### 終了コード表（--helpに全掲載）
 
@@ -143,7 +143,7 @@ webgrab <URL> [OPTIONS]
 | 1 | 内部エラー（バグ相当・出力ファイル書き込み失敗を含む） | internal |
 | 2 | 引数・URL形式エラー（clap既定と一致） | usage |
 | 3 | ネットワーク失敗（DNS・接続・タイムアウト・TLS・リダイレクトループ等のトランスポート層全般。リトライ可） | network |
-| 4 | HTTPエラー（4xx/5xx）、サイズ超過、非HTMLコンテンツ。5xx/429は`retryable=true`を併記 | http |
+| 4 | HTTPエラー（4xx/5xx）、サイズ超過、未対応のContent-Type。5xx/429は`retryable=true`を併記 | http |
 | 5 | robots.txtによる拒否 | robots |
 | 6 | 本文が空（抽出結果0文字） | empty |
 | 7 | JSレンダリング失敗（Chrome未検出・起動失敗・CDPエラー・renderタイムアウト） | render |
@@ -167,7 +167,9 @@ Markdown Content:
 <本文Markdown>
 ```
 
-切り詰めが発生した場合は末尾に次の1行を付ける。継続コマンドの生成規則は次のとおり。(1) --start-index以外の非デフォルトフラグをすべて再現する（--renderや--formatが欠けると続きのオフセット基準が変わるため）。例外: `render_status`が`rendered`なら`--auto-render`を`--render`に置換し、それ以外（`static`/`no-gain`/`failed`/`skipped`）なら`--auto-render`とrender系フラグ（`--wait-ms`、`--no-sandbox`、`--chrome-path`）を省略して静的経路を再現する（`--render`と`--auto-render`の同時指定では`--render`を1回だけ出す）。(2) --start-indexは再現ではなく新オフセットに置換する。(3) -o/--outputは再現対象から除外する（同一パス上書きによる部分結果の喪失を防ぐため、継続はstdoutに出す）。(4) `rendered`のときは置換後の`--render`と同じ環境設定で再現できるよう`--chrome-path`と`--no-sandbox`も再現する。値付きフラグ（`--user-agent`、`--chrome-path`）はURLと同じ`shell_quote`で囲む。
+`URL Source`はリダイレクト後の最終URLである。`--render`または採用された`--auto-render`（`render_status=rendered`）では、render後URL（`location.href`、httpまたはhttpsのみ、userinfoを除去、8192バイト以下）になる。それ以外の経路では静的経路の`final_url`のままである（詳細は10-fetch-fidelity-design.md §4.2）。
+
+切り詰めが発生した場合は末尾に次の1行を付ける。終端は範囲後半の最後の改行の直後まで戻すため、フッタの範囲表記は実際の終端を指す（10-fetch-fidelity-design.md §4.4）。継続コマンドの生成規則は次のとおり。(1) --start-index以外の非デフォルトフラグをすべて再現する（--renderや--formatが欠けると続きのオフセット基準が変わるため）。例外: `render_status`が`rendered`なら`--auto-render`を`--render`に置換し、それ以外（`static`/`no-gain`/`failed`/`skipped`）なら`--auto-render`とrender系フラグ（`--wait-ms`、`--no-sandbox`、`--chrome-path`）を省略して静的経路を再現する（`--render`と`--auto-render`の同時指定では`--render`を1回だけ出す）。(2) --start-indexは再現ではなく新オフセットに置換する。(3) -o/--outputは再現対象から除外する（同一パス上書きによる部分結果の喪失を防ぐため、継続はstdoutに出す）。(4) `rendered`のときは置換後の`--render`と同じ環境設定で再現できるよう`--chrome-path`と`--no-sandbox`も再現する。値付きフラグ（`--user-agent`、`--chrome-path`）はURLと同じ`shell_quote`で囲む。
 
 ```text
 [webgrab:truncated chars 0-24000 of 83000 — continue: webgrab <URL> --render --start-index 24000]
@@ -181,11 +183,11 @@ Markdown Content:
 
 ### json
 
-`{"title", "url", "published_time", "tokens", "chars", "total_chars", "truncated", "ended", "continue_command", "short_content", "untrusted", "untrusted_note", "render_status", "static_chars", "rendered_chars", "markdown"}` のFirecrawl風エンベロープ（1行JSON）。`untrusted`は常にtrue、`untrusted_note`は`markdown`が非信頼の外部データである旨の短い説明で、構造化消費者へも非信頼シグナルを渡す（テキスト形式の`--fence`に相当）。切り詰め時はtruncated=trueかつcontinue_commandに継続コマンド全文を入れる。終端（--start-index末尾超過）はended=true・markdown空文字列・truncated=falseで表す。--max-chars=0はmarkdown空文字列・total_chars入りで表す（total取得用途）。--no-tokens時もtokensキーはnullにするがchars/total_charsは常に保持する。`render_status`（`static`/`rendered`/`failed`/`no-gain`/`skipped`）はfrontmatterにも同じキーで加える。`--render`明示時は`rendered`、既定の静的経路は`static`。`static_chars`と`rendered_chars`（可視テキスト長）は、`static_chars`が静的フェーズを実行したら常に値（`--render`明示時のみnull）、`rendered_chars`がrenderを実行してDOMを得たときのみ値（`rendered`/`no-gain`、および`--render`明示時。`static`/`skipped`/`failed`ではnull）を持つ。
+`{"title", "url", "published_time", "tokens", "chars", "total_chars", "truncated", "ended", "continue_command", "short_content", "untrusted", "untrusted_note", "render_status", "static_chars", "rendered_chars", "markdown"}` のFirecrawl風エンベロープ（1行JSON）。`untrusted`は常にtrue、`untrusted_note`は`markdown`が非信頼の外部データである旨の短い説明で、構造化消費者へも非信頼シグナルを渡す（テキスト形式の`--fence`に相当）。切り詰め時はtruncated=trueかつcontinue_commandに継続コマンド全文を入れる。終端（--start-index末尾超過）はended=true・markdown空文字列・truncated=falseで表す。--max-chars=0はmarkdown空文字列・total_chars入りで表す（total取得用途）。--no-tokens時もtokensキーはnullにするがchars/total_charsは常に保持する。`render_status`（`static`/`rendered`/`failed`/`no-gain`/`skipped`）はfrontmatterにも同じキーで加える。`--render`明示時は`rendered`、既定の静的経路は`static`。`static_chars`と`rendered_chars`（可視テキスト長）は、`static_chars`が静的フェーズを実行したら常に値（`--render`明示時のみnull）、`rendered_chars`がrenderを実行してDOMを得たときのみ値（`rendered`/`no-gain`、および`--render`明示時。`static`/`skipped`/`failed`ではnull）を持つ。text/plainでは抽出HTMLが存在しないため、`static_chars`は本文の文字数になる。
 
 ### text / html
 
-textはMarkdown変換のかわりにタグ除去テキスト、htmlは抽出後（--raw時は取得まま）のHTMLを出す。メタデータヘッダは付けない。切り詰め時はmarkdownと同じ`[webgrab:truncated ...]`行を末尾に付ける（htmlではHTMLコメントとして付ける）。終端フッタ`[webgrab:end ...]`も同様に末尾（htmlはコメント）に付ける。--max-chars=0はtext/htmlでは本文が空になるため、`[webgrab:meta-only total N chars]`の1行（htmlはコメント）を出しstderrにも注記する。ただしこの1行の直後に`[webgrab:render-status ...]`行が続きうる（`render_status`が`failed`/`no-gain`/`skipped`のとき）ため、text/htmlのstdout末尾が必ず1行だけとは限らない。
+textはMarkdown変換のかわりにタグ除去テキスト、htmlは抽出後（--raw時は取得まま）のHTMLを出す。メタデータヘッダは付けない。text/plainはこのhtml形式の定義の例外で、抽出やタグ除去を経ないため、既定・--raw・text・htmlのどの形式でも同じ素通しテキストを出す。切り詰め時はmarkdownと同じ`[webgrab:truncated ...]`行を末尾に付ける（htmlではHTMLコメントとして付ける）。終端フッタ`[webgrab:end ...]`も同様に末尾（htmlはコメント）に付ける。--max-chars=0はtext/htmlでは本文が空になるため、`[webgrab:meta-only total N chars]`の1行（htmlはコメント）を出しstderrにも注記する。ただしこの1行の直後に`[webgrab:render-status ...]`行が続きうる（`render_status`が`failed`/`no-gain`/`skipped`のとき）ため、text/htmlのstdout末尾が必ず1行だけとは限らない。
 
 ### render_status行と`[webgrab:render-status ...]`
 
@@ -200,12 +202,12 @@ JSONエンベロープとfrontmatterに`render_status`（`static`/`rendered`/`fa
 | 事象 | 挙動 |
 |---|---|
 | DNS失敗・接続拒否・タイムアウト・TLS証明書エラー・リダイレクトループ | stderrに機械可読1行、終了コード3。名前解決(getaddrinfo)自体も--timeoutで打ち切り、無応答DNSでのハングを防ぐ |
-| HTTP 4xx/5xx | stderrにステータスと1行説明（5xx/429は`retryable=true`）、終了コード4 |
-| Content-Typeが text/html・application/xhtml+xml・text/plain 以外 | 終了コード4（メディアタイプは大文字小文字を無視して判定、text/plainはそのまま出力） |
+| HTTP 4xx/5xx | stderrにステータスと1行説明（5xx/429は`retryable=true`）、終了コード4。403はメッセージ末尾に`hint=--render`を付ける（先頭行の書式と終了コード4は不変。自動エスカレーションはしない） |
+| Content-Typeが text/html・application/xhtml+xml・text/plain 以外 | 終了コード4（メディアタイプは大文字小文字を無視して判定）。text/plainは抽出とMarkdown変換を通さず素通しする。変更点は、危険リンクスキーム（インラインリンク・オートリンク・参照定義の3形）の無害化、端末制御文字の除去、webgrab制御マーカーの無害化に限り、生のHTMLタグは変更しない |
 | 本文HTMLの要素ネストが深すぎる（抽出処理が計算量爆発する水準） | 抽出前に線形の深さ判定で打ち切り、終了コード4（stderrに--raw提案） |
 | --max-bytes超過（展開後バイト数、ストリーミング判定） | ダウンロード中断、終了コード4 |
 | 文字コード判定失敗 | chardetng推定で強制デコード（置換文字許容）、stderrに警告、継続 |
-| 本文抽出0文字 | stderrに`hint=`トークン付き提案（`render_status`が`static`/`skipped`なら`--render/--raw`、`rendered`/`failed`/`no-gain`なら`--raw`）、終了コード6 |
+| 本文抽出0文字 | stderrに`hint=`トークン付き提案（`render_status`が`static`/`skipped`なら`--render/--raw`、`rendered`/`failed`/`no-gain`なら`--raw`）、終了コード6。`--raw`とtext/plainは抽出自体を行わないため対象外で、空本文でも終了コード0 |
 | robots.txt disallow | stderrに対象ルール、終了コード5（--no-robotsで回避） |
 | robots.txt自体の取得失敗 | 許可とみなし継続（相場どおり）、stderrに注記 |
 | 内部アドレス着地（初回またはリダイレクト先） | stderrに`host=<host> resolved=<ip> range=<range>`（静的経路・render経路とも同じ書式。名前解決失敗は`resolved=unresolved`、2秒の解決上限超過は`resolved=timeout`で`range=`は省く）、終了コード8（--allow-privateで回避） |
@@ -216,7 +218,7 @@ JSONエンベロープとfrontmatterに`render_status`（`static`/`rendered`/`fa
 ## 8. テスト戦略
 
 - カバレッジ: cargo-llvm-covで計測する。機械判定の合格線は`--fail-under-lines 80`。coverageジョブはE2E（実Chrome）を含めて計測し、render.rsの除外はしない（従来はChrome依存のため既定計測から除外していたが、`--auto-render`の中心実装であるrender.rsとpipelineのrenderフェーズを計測対象に入れないと閾値が新規コードを見ないため解除した）。80%未満で合格した場合は`--ignore-filename-regex 'render\.rs'`を戻して達成するか、差分をIMPROVEMENT_BACKLOG.mdに記録する
-- 単体テスト: netguard（プライベート/リンクローカル/ループバック/パブリックの判定）、decode（Shift_JIS/EUC-JP/UTF-8/charset無しの4ケース）、extract（記事系・空本文、F2のプレースホルダmarkup）、convert（見出し・コード・リンク・表、`visible_text_len`）、budget（境界: start-index=0/中間/末尾超過、max-chars=0/巨大、マルチバイト境界）、robots（Disallow/Allow/ワイルドカード/UA別/取得失敗）、render/wait.rs（`InFlight`・`should_stop`・`is_main_navigation`等の純関数）、pipeline（`escalation_reason`・`remaining_budget`・`choose_result`・`fallback_reason`・`hint_for`）、cli（`extra_flags`の置換・省略規則）、output（`render_status`・`static_chars`/`rendered_chars`のnull規則）、error（先頭行トークン付与、詳細行のサニタイズ）
+- 単体テスト: netguard（プライベート/リンクローカル/ループバック/パブリックの判定）、decode（Shift_JIS/EUC-JP/UTF-8/charset無しの4ケース）、extract（記事系・空本文、F2のプレースホルダmarkup）、convert（見出し・コード・リンク・表、`visible_text_len`）、budget（境界: start-index=0/中間/末尾超過、max-chars=0/巨大、マルチバイト境界）、robots（Disallow/Allow/ワイルドカード/UA別/取得失敗）、render/wait.rs（`InFlight`・`should_stop`・`is_main_navigation`等の純関数）、pipeline（`escalation_reason`・`remaining_budget`・`choose_result`・`fallback_reason`・`hint_for`）、cli（`extra_flags`の置換・省略規則）、output（`render_status`・`static_chars`/`rendered_chars`のnull規則）、error（先頭行トークン付与、詳細行のサニタイズ）、budget（切り詰め終端を改行境界へ調整する規則）、fetch（`http_error_message`・`is_plain_text`）、decode（HTML metaの走査を省く経路）、render（`resolve_final_url`）、convert（`sanitize_link_schemes`の3形）、pipeline（`plain_stage`）
 - 統合テスト: tests/配下でstd::net::TcpListenerの最小HTTPサーバを立て、実HTTP経由でCLIバイナリを起動して終了コード・stdout/stderr分離を検証する。統合テストはcargo llvm-cov経由で実行し、子プロセスのprofrawが合流されカバレッジに計上されることを実装フェーズ最初に確認する
 - E2Eテスト（実Chrome、tests/render_e2e.rs）: ローカルfixture（最小HTTPサーバ + 実Chrome）でF2の待機戦略、`--auto-render`のエスカレーション・no-gain・skip、`--max-bytes`超過（gzip fixture・DOM膨張fixture）、内部アドレス到達（終了コード8）を検証する。`WEBGRAB_E2E=1`で有効化し、未設定かつ`CI`未設定ならskip、未設定かつ`CI`設定済みなら失敗とする。詳細は08-js-render-design.md §6
 - smoke test（examples/smoke.rsで実施済み、2026-07-17）: (1) chromiumoxide 0.9.1でChrome 150とCDP接続しexample.comを559バイト取得できた。なおtokio-runtimeという名のfeatureは存在せず、既定featureのままtokioで動作した（設計の必須feature指定は不要と判明） (2) htmdはtableをMarkdownテーブルへ変換できた（`| A | B |`形式、素通しフォールバック不要） (3) dom_smoothieはpublished_timeフィールドを取得できた（metaタグ自前抽出フォールバック不要）。(4) llvm-covの子プロセスカバレッジ合流は実装フェーズで確認済み
@@ -232,7 +234,7 @@ JSONエンベロープとfrontmatterに`render_status`（`static`/`rendered`/`fa
 
 ## 10. やらないこと（再掲）
 
-検索統合、クローリング、キャッシュ、並列複数URL、PDF等の非HTML形式対応、crates.io公開。これらは必要が生じた時点で別バージョンとして起案する。
+検索統合、クローリング、キャッシュ、並列複数URL、crates.io公開。非HTML形式はtext/plain（素通し）のみ対応し、PDF等それ以外の形式は対象外のままとする。これらは必要が生じた時点で別バージョンとして起案する。
 
 ## 11. 非信頼データに関する注記
 

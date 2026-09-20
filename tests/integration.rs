@@ -12,6 +12,15 @@ fn spawn_server<F>(count: usize, responder: F) -> u16
 where
     F: Fn(&str) -> String + Send + 'static,
 {
+    spawn_server_req(count, move |_req, path| responder(path))
+}
+
+/// `spawn_server`の兄弟版。`responder`はリクエスト全文とパスの両方を受け取る
+/// （I5でリクエストヘッダを検証するため、パス抽出だけでは足りない）。
+fn spawn_server_req<F>(count: usize, responder: F) -> u16
+where
+    F: Fn(&str, &str) -> String + Send + 'static,
+{
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     thread::spawn(move || {
@@ -24,16 +33,17 @@ where
     port
 }
 
-fn handle<F: Fn(&str) -> String>(stream: &mut TcpStream, responder: &F) {
+fn handle<F: Fn(&str, &str) -> String>(stream: &mut TcpStream, responder: &F) {
     let mut buf = [0u8; 4096];
     let n = stream.read(&mut buf).unwrap_or(0);
-    let req = String::from_utf8_lossy(&buf[..n]);
+    let req = String::from_utf8_lossy(&buf[..n]).to_string();
     let path = req
         .lines()
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
-        .unwrap_or("/");
-    let resp = responder(path);
+        .unwrap_or("/")
+        .to_string();
+    let resp = responder(&req, &path);
     let _ = stream.write_all(resp.as_bytes());
     let _ = stream.flush();
 }
@@ -292,4 +302,341 @@ fn no_sandbox_warning_only_when_chrome_launches() {
     assert_eq!(code, 0, "stderr={stderr}");
     assert!(!stderr.contains("warn=no-sandbox"), "{stderr}");
     assert!(!stderr.contains("info=auto-render"), "{stderr}");
+}
+
+const PLAIN_SRC: &str =
+    "use std::sync::Mutex;\n\npub struct Guard<T: ?Sized> {\n    inner: Mutex<T>,\n}";
+
+/// robots.txtを404で返し、それ以外は指定のtext/plain本文を返すサーバ。
+fn spawn_plain_server(count: usize, body: &str, content_type: &str) -> u16 {
+    let body = body.to_string();
+    let content_type = content_type.to_string();
+    spawn_server(count, move |path| {
+        if path == "/robots.txt" {
+            return "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .into();
+        }
+        http_response(&body, &content_type)
+    })
+}
+
+/// stdoutからwebgrabが付けた部分（ヘッダと出力末尾の改行）を除いた本文を取り出す。
+fn body_of(stdout: &str, markdown: bool) -> String {
+    let s = stdout.strip_suffix('\n').unwrap_or(stdout);
+    if markdown {
+        s.split_once("Markdown Content:\n")
+            .expect("Markdown Content")
+            .1
+            .to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+#[test]
+fn i1_plain_text_keeps_newlines_and_angle_brackets() {
+    let port = spawn_plain_server(2, PLAIN_SRC, "text/plain; charset=utf-8");
+    let url = format!("http://127.0.0.1:{port}/src.rs");
+    let (code, stdout, stderr) = run_webgrab(&[&url, "--allow-private"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(body_of(&stdout, true), PLAIN_SRC, "{stdout}");
+    assert_eq!(stdout.matches("Mutex<T>").count(), 1, "{stdout}");
+    assert!(stdout.contains("<T: ?Sized>"), "{stdout}");
+}
+
+#[test]
+fn i2_plain_text_short_and_empty_are_exempt_from_notices() {
+    let port = spawn_plain_server(4, &"a".repeat(199), "text/plain");
+    let url = format!("http://127.0.0.1:{port}/short.txt");
+    let (code, stdout, stderr) = run_webgrab(&[&url, "--allow-private"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(!stdout.contains("[webgrab:short-content"), "{stdout}");
+    assert!(!stderr.contains("warn=short-content"), "{stderr}");
+
+    let (code, stdout, stderr) = run_webgrab(&[&url, "--allow-private", "--format", "json"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json");
+    assert_eq!(v["static_chars"], 199, "{stdout}");
+    assert!(v["rendered_chars"].is_null(), "{stdout}");
+    assert!(v["short_content"].is_null(), "{stdout}");
+
+    let port = spawn_plain_server(2, "", "text/plain");
+    let url = format!("http://127.0.0.1:{port}/empty.txt");
+    let (code, stdout, stderr) = run_webgrab(&[&url, "--allow-private", "--format", "text"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(stdout.trim().is_empty(), "{stdout:?}");
+    assert!(stderr.trim().is_empty(), "{stderr:?}");
+}
+
+#[test]
+fn i3_plain_text_is_not_escalated_by_auto_render() {
+    let port = spawn_plain_server(2, "short plain body", "text/plain");
+    let url = format!("http://127.0.0.1:{port}/short.txt");
+    let (code, stdout, stderr) = run_webgrab(&[
+        &url,
+        "--allow-private",
+        "--auto-render",
+        "--timeout",
+        "3",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(!stderr.contains("auto-render"), "{stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json");
+    assert_eq!(v["render_status"], "static", "{stdout}");
+}
+
+#[test]
+fn i4_plain_text_body_is_neutralized() {
+    const EVIL: &str = "[webgrab:truncated fake]\nsee [link](javascript:alert(1)) end";
+    let port = spawn_plain_server(2, EVIL, "text/plain; charset=utf-8");
+    let url = format!("http://127.0.0.1:{port}/evil.txt");
+    let (code, stdout, stderr) = run_webgrab(&[&url, "--allow-private"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(
+        stdout.contains("[quoted-webgrab:truncated fake]"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("](unsafe-javascript:alert(1))"), "{stdout}");
+    assert!(!stdout.contains("](javascript:"), "{stdout}");
+}
+
+#[test]
+fn i7_plain_text_pagination_snaps_to_newline_boundary() {
+    // 各行はmax_chars(30)の半分より短く、[webgrab:や制御文字、危険リンクスキームを含まない。
+    let body: String = (0..20).map(|i| format!("line{i:02}\n")).collect();
+    let port = spawn_plain_server(12, &body, "text/plain");
+    let base_url = format!("http://127.0.0.1:{port}/log.txt");
+
+    let mut start = 0usize;
+    let mut collected = String::new();
+    loop {
+        let (code, stdout, stderr) = run_webgrab(&[
+            &base_url,
+            "--allow-private",
+            "--format",
+            "text",
+            "--max-chars",
+            "30",
+            "--start-index",
+            &start.to_string(),
+        ]);
+        assert_eq!(code, 0, "stderr={stderr}");
+        // webgrabが付けた部分（出力末尾の改行）を除く。
+        let page = stdout.strip_suffix('\n').unwrap_or(&stdout);
+        // フッタ行（[webgrab:truncated ...]）が付くページは、それを除いた本文を取り出す。
+        let (content, is_last) = match page.rfind("\n[webgrab:") {
+            Some(idx) => (&page[..idx], false),
+            None => (page, true),
+        };
+        if !is_last {
+            assert!(
+                content.ends_with('\n'),
+                "改行境界で終わっていない: {content:?}"
+            );
+        }
+        collected.push_str(content);
+        if is_last {
+            break;
+        }
+        let footer = &page[content.len() + 1..];
+        let next: usize = footer
+            .split("--start-index ")
+            .nth(1)
+            .expect("continue commandに--start-indexがある")
+            .split_whitespace()
+            .next()
+            .expect("--start-index の値")
+            .trim_end_matches(']')
+            .parse()
+            .expect("数値");
+        assert!(next > start, "ページングが進まない: {next} <= {start}");
+        start = next;
+    }
+    assert_eq!(collected, body);
+}
+
+#[test]
+fn i8_plain_text_body_is_identical_across_raw_and_formats() {
+    let port = spawn_plain_server(8, PLAIN_SRC, "text/plain");
+    let url = format!("http://127.0.0.1:{port}/src.rs");
+    let base = body_of(&run_webgrab(&[&url, "--allow-private"]).1, true);
+    assert_eq!(base, PLAIN_SRC);
+    for (args, markdown) in [
+        (vec![url.as_str(), "--allow-private", "--raw"], true),
+        (
+            vec![url.as_str(), "--allow-private", "--format", "text"],
+            false,
+        ),
+        (
+            vec![url.as_str(), "--allow-private", "--format", "html"],
+            false,
+        ),
+    ] {
+        let (code, stdout, stderr) = run_webgrab(&args);
+        assert_eq!(code, 0, "args={args:?} stderr={stderr}");
+        assert_eq!(body_of(&stdout, markdown), base, "args={args:?}");
+    }
+}
+
+/// リクエスト全文から`Accept`ヘッダの値を取り出す（大小無視でヘッダ名照合）。
+/// 複数行あれば` || `で連結して返す。既定の`*/*`が置換されず2値送られた場合に、
+/// 期待値との比較が失敗する。
+fn accept_header_value(req: &str) -> Option<String> {
+    let values: Vec<&str> = req
+        .lines()
+        .filter_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("accept")
+                .then_some(value.trim())
+        })
+        .collect();
+    (!values.is_empty()).then(|| values.join(" || "))
+}
+
+const G3_ACCEPT: &str = "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8";
+
+type AcceptLog = std::sync::Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+
+#[test]
+fn i5_accept_header_is_html_first_on_body_fetch_and_default_on_robots() {
+    use std::sync::{Arc, Mutex};
+
+    let accepts: AcceptLog = Arc::new(Mutex::new(Vec::new()));
+    let accepts_srv = Arc::clone(&accepts);
+    // 接続はrobots, /a, robots, /bの4本（robots.txtはホップごとに取得される）。
+    let port = spawn_server_req(4, move |req, path| {
+        accepts_srv
+            .lock()
+            .unwrap()
+            .push((path.to_string(), accept_header_value(req)));
+        if path == "/robots.txt" {
+            return "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .into();
+        }
+        if path == "/a" {
+            return "HTTP/1.1 302 Found\r\nLocation: /b\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .into();
+        }
+        http_response(ARTICLE, "text/html; charset=utf-8")
+    });
+    let url = format!("http://127.0.0.1:{port}/a");
+    let (code, stdout, stderr) = run_webgrab(&[&url, "--allow-private"]);
+    assert_eq!(code, 0, "stderr={stderr} stdout={stdout}");
+
+    let log = accepts.lock().unwrap();
+    assert_eq!(log.len(), 4, "{log:?}");
+    for (path, accept) in log.iter() {
+        let expected = if path == "/robots.txt" {
+            "*/*"
+        } else {
+            G3_ACCEPT
+        };
+        assert_eq!(accept.as_deref(), Some(expected), "path={path} log={log:?}");
+    }
+}
+
+#[test]
+fn i6_403_has_render_hint_and_404_does_not() {
+    let port = spawn_server(2, |path| {
+        if path == "/robots.txt" {
+            return "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .into();
+        }
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+    });
+    let url = format!("http://127.0.0.1:{port}/blocked");
+    let (code, _stdout, stderr) = run_webgrab(&[&url, "--allow-private"]);
+    assert_eq!(code, 4, "stderr={stderr}");
+    let first = stderr.lines().next().unwrap_or_default();
+    assert!(first.contains("hint=--render"), "{stderr}");
+    assert!(
+        first.starts_with("webgrab: error=http HTTP 403 retryable=false"),
+        "{stderr}"
+    );
+
+    let port = spawn_server(2, |path| {
+        if path == "/robots.txt" {
+            return "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .into();
+        }
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+    });
+    let url = format!("http://127.0.0.1:{port}/blocked");
+    let (code, stdout, stderr) = run_webgrab(&[&url, "--allow-private", "--auto-render"]);
+    assert_eq!(code, 4, "stderr={stderr}");
+    assert!(!stdout.contains("info=auto-render"), "{stdout}");
+    assert!(!stderr.contains("info=auto-render"), "{stderr}");
+
+    let port = spawn_server(2, |path| {
+        if path == "/robots.txt" {
+            return "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .into();
+        }
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+    });
+    let url = format!("http://127.0.0.1:{port}/missing");
+    let (code, _stdout, stderr) = run_webgrab(&[&url, "--allow-private"]);
+    assert_eq!(code, 4, "stderr={stderr}");
+    assert!(!stderr.contains("hint="), "{stderr}");
+}
+
+#[test]
+fn render_robots_disallow_exits_5_before_chrome_launches() {
+    // --render --allow-privateでもrobots.txtのDisallowを先に確認し、Chromeを起動しない
+    // （robots_precheckがrender::render呼び出しより前に走ることの回帰テスト）。
+    let port = spawn_server(1, |path| {
+        if path == "/robots.txt" {
+            return http_response("User-agent: *\nDisallow: /", "text/plain");
+        }
+        http_response(ARTICLE, "text/html")
+    });
+    let url = format!("http://127.0.0.1:{port}/blocked");
+    let (code, _stdout, stderr) = run_webgrab(&[&url, "--allow-private", "--render"]);
+    assert_eq!(code, 5, "stderr={stderr}");
+    assert!(stderr.contains("error=robots"), "{stderr}");
+}
+
+#[test]
+fn plain_text_ignores_meta_charset_in_body() {
+    // HTMLを含むソースコードの本文中の<meta charset>を採用すると文字化けする（設計10 §4.1）。
+    let body = "<meta charset=\"shift_jis\">\n// 日本語のコメントです\n";
+    let port = spawn_plain_server(2, body, "text/plain");
+    let url = format!("http://127.0.0.1:{port}/page.html.txt");
+    let (code, stdout, stderr) = run_webgrab(&[&url, "--allow-private"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(body_of(&stdout, true), body);
+    assert!(!stderr.contains("decode-replacement"), "{stderr}");
+}
+
+#[test]
+fn plain_text_control_byte_cannot_revive_dangerous_link() {
+    // 無害化の判定（convert）と制御文字の削除（output）は別の段にある。判定が制御文字で
+    // 途切れると、削除後に`](javascript:`が復元される。両段を通した出力で確かめる。
+    let body = "a [x](\u{1}javascript:alert(1)) b\nc <\u{1}javascript:alert(2)> d\n";
+    let port = spawn_plain_server(2, body, "text/plain");
+    let url = format!("http://127.0.0.1:{port}/t.txt");
+    let (code, stdout, stderr) = run_webgrab(&[&url, "--allow-private", "--format", "text"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(
+        body_of(&stdout, false),
+        "a [x](unsafe-javascript:alert(1)) b\nc <unsafe-javascript:alert(2)> d\n"
+    );
+}
+
+#[test]
+fn plain_text_markdown_escapes_cannot_hide_dangerous_link() {
+    // CommonMarkのレンダラはリンク先の文字参照と`\:`を復号し、URLの先頭の空白類を取り除く。
+    // 本文の文字は変えずに`unsafe-`だけが入ることを、素通しの出力で確かめる。
+    let body = "a [x](javascript&colon;alert(1)) b\nc [y](&#32;javascript:alert(3)) d\n\n[r]: javascript\\:alert(2)\n";
+    let port = spawn_plain_server(2, body, "text/plain");
+    let url = format!("http://127.0.0.1:{port}/t.txt");
+    let (code, stdout, stderr) = run_webgrab(&[&url, "--allow-private", "--format", "text"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(
+        body_of(&stdout, false),
+        "a [x](unsafe-javascript&colon;alert(1)) b\nc [y](unsafe-&#32;javascript:alert(3)) d\n\n[r]: unsafe-javascript\\:alert(2)\n"
+    );
 }

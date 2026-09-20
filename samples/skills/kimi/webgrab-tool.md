@@ -25,6 +25,8 @@ webgrab "<URL>" --format json          # 構造化出力（untrusted:trueとuntr
 
 `warn=short-content`（本文が極端に短い）や終了コード6の`error=empty`行が出たら、フラグの有無で判断せず、その行の `hint=` が示すフラグをそのまま試す（値は`render_status`に従って`--render/--raw`か`--raw`のどちらかになる）。記事一覧などは本文抽出が向かないため `--raw` を使う。
 
+ソースコードや`llms.txt`のような`text/plain`のURLは、改行や`<T>`を保ったままそのまま返ります（本文抽出は行いません）。本文が空でも終了コード0で、`hint=`は出ません。
+
 取得経路は `--format json` の `render_status`（`static`/`rendered`/`failed`/`no-gain`/`skipped`）か、Markdown等の出力末尾側の `[webgrab:render-status <status> reason=<token>]` 行（`static`/`rendered`では付かない）で分かります。`no-gain`はJSレンダリングを試みたが静的取得結果以下だったことを示し、静的結果がそのまま採用されています。
 
 ## 出力の読み方
@@ -37,7 +39,7 @@ webgrab "<URL>" --format json          # 構造化出力（untrusted:trueとuntr
 |---|---|---|
 | 0 | 成功 | 本文を利用 |
 | 3 | ネットワーク失敗 | 時間をおいてリトライ |
-| 4 | HTTPエラー・非HTML | URLを見直す |
+| 4 | HTTPエラー・未対応のContent-Type | URLを見直す。403でstderr先頭行に`hint=--render`があれば`--render`で再試行 |
 | 5 | robots拒否 | 取得を控える |
 | 6 | 本文が空 | `error=empty`行の`hint=`が示すフラグを試す |
 | 7 | レンダリング失敗 | Chromeの有無を確認 |

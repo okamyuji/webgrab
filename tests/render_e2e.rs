@@ -23,6 +23,11 @@ fn all_routes() -> Vec<Route> {
         short_static(),
         big_gzip(),
         dom_bomb(),
+        redirect_old(),
+        dir_page(),
+        replace_page(),
+        push_page(),
+        short_push(),
     ];
     v.extend(csr_xhr());
     v
@@ -303,4 +308,86 @@ e2e!(e16_no_sandbox_warns_when_chrome_launches, {
         1,
         "{err}"
     );
+});
+
+// 設計10 §6のE16〜E20（render後URLの採用）。既存の`e16_no_sandbox_...`は設計08の項目であり、
+// 番号は設計書ごとに独立している。
+e2e!(e16_redirect_target_becomes_base_url, {
+    let s = start(all_routes());
+    let (code, out, err) = webgrab(&[&s.url("/old"), "--render", "--allow-private", "--no-robots"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains(&format!("URL Source: {}", s.url("/dir/page"))),
+        "{out}"
+    );
+    assert!(out.contains(&s.url("/dir/next.html")), "{out}");
+});
+
+e2e!(e17_location_replace_updates_url_and_continue_command, {
+    let s = start(all_routes());
+    let (code, out, err) = webgrab(&[
+        &s.url("/replace"),
+        "--auto-render",
+        "--allow-private",
+        "--no-robots",
+        "--format",
+        "json",
+        "--max-chars",
+        "50",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["render_status"], "rendered", "{out}");
+    assert_eq!(v["url"], s.url("/dir/page"), "{out}");
+    let cc = v["continue_command"].as_str().unwrap();
+    assert!(cc.contains(&s.url("/dir/page")), "{cc}");
+});
+
+e2e!(e18_pushstate_changes_path_within_same_origin, {
+    let s = start(all_routes());
+    let (code, out, err) = webgrab(&[
+        &s.url("/push"),
+        "--render",
+        "--allow-private",
+        "--no-robots",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains(SENTINEL_PUSH), "{out}");
+    assert!(
+        out.contains(&format!("URL Source: {}", s.url("/dir/pushed"))),
+        "{out}"
+    );
+});
+
+e2e!(e19_cross_origin_replace_adopts_landing_port, {
+    let b = start(vec![dir_page()]);
+    let a = start(vec![cross_replace(&b.url("/dir/page"))]);
+    let (code, out, err) = webgrab(&[
+        &a.url("/cross"),
+        "--render",
+        "--allow-private",
+        "--no-robots",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains(SENTINEL_DIR), "{out}");
+    assert!(
+        out.contains(&format!("URL Source: {}", b.url("/dir/page"))),
+        "{out}"
+    );
+});
+
+e2e!(e20_no_gain_keeps_static_url, {
+    let s = start(all_routes());
+    let (code, out, err) = webgrab(&[
+        &s.url("/short_push"),
+        "--auto-render",
+        "--allow-private",
+        "--no-robots",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["render_status"], "no-gain", "{out}");
+    assert_eq!(v["url"], s.url("/short_push"), "{out}");
 });

@@ -1,7 +1,7 @@
 # 実動作検証報告書 — webgrab
 
-- バージョン: 1.0
-- 日付: 2026-07-17
+- バージョン: 1.1
+- 日付: 2026-09-21
 - 対応計画: [06-verification-plan.md](06-verification-plan.md)
 - 検証バイナリ: target/release/webgrab（cargo 1.97.1 / edition 2024）
 
@@ -127,3 +127,49 @@ CIの`test`と`coverage`ジョブは`.github/workflows/ci.yml`で最初から`WE
 | (d) 非rendered時の継続コマンド | `webgrab "https://react.dev/learn" --auto-render --wait-ms 3000 --max-chars 100` | `[webgrab:truncated chars 0-100 of 16927 — continue: webgrab 'https://react.dev/learn' --max-chars 100 --start-index 100]`（render系フラグは省略） | 一致 |
 
 補足として、Skillツールが読み込むスキル本文はセッション開始時のキャッシュのため、差し替え後の本文を反映するには新しいセッションが必要である。ディスク上の`~/.claude/skills/webgrab/SKILL.md`は更新版であることを`diff -q`で確認した。実行後にheadless Chromeの残存プロセスは0件だった。
+
+## 取得忠実度の改善の検証（2026-09-21）
+
+設計10の完了条件に沿って、リリースビルドのバイナリで実URLと実テストを検証した。
+
+### V1〜V5
+
+| # | コマンド | 変更前 | 変更後 |
+|---|---|---|---|
+| V1 | `webgrab https://raw.githubusercontent.com/tokio-rs/tokio/master/tokio/src/sync/mutex.rs --max-chars 10000000 --no-tokens` | 1396行が1行に潰れ、`Mutex<T>`が17個から0個、`<T: ?Sized>`が12個から0個 | 既定・`--raw`・`--format text`・`--format html`のいずれもcurlの取得結果とバイト一致（1396行、`Mutex<T>` 17個、`<T: ?Sized>` 12個） |
+| V2 | `webgrab https://docs.rs/tokio --render --max-chars 200000` | `URL Source`が`https://docs.rs/tokio`のままで、本文先頭6本のdocs.rsリンク中5本がHTTP 400 | `URL Source`が`https://docs.rs/tokio/latest/tokio/`になり、先頭6本すべてがHTTP 200 |
+| V3 | `webgrab https://crates.io/crates/tokio --auto-render --max-chars 0` | HTTP 404で終了コード4 | 終了コード0で総文字数8941文字（静的フェーズがHTTP 200と空シェルを取得したのちエスカレーションする） |
+| V4 | `webgrab https://doc.rust-lang.org/book/ch03-02-data-types.html --format text --max-chars N`（Nは1500から900刻みで21通り） | 行の途中で切れた回数21回中18回 | 行の途中で切れた回数0回。N=2400では継続コマンドを最後まで実行すると8ページに分かれ、最終ページを除く7ページすべてが改行で終わり、連結が`--max-chars 10000000`の本文（17250文字）と一致 |
+| V5 | `webgrab https://stackoverflow.com/questions/27535289/what-is-the-correct-way-to-return-an-iterator` | 終了コード4、stderrに再試行の手掛かりなし | 終了コード4、stderr先頭行`webgrab: error=http HTTP 403 retryable=false hint=--render`。`--auto-render`を付けてもエスカレーションしない。404には`hint=`が付かない |
+
+### テストとカバレッジ
+
+- `cargo test --lib --bins --test integration`はunit 189件とintegration 25件がすべてpassし終了コード0
+- `WEBGRAB_E2E=1 cargo test --test render_e2e -- --test-threads=1`は24件がすべてpass（設計10のE16〜E20を含む）
+- `cargo crap --lcov lcov.info --min 30`は、E2Eを含む`cargo llvm-cov`実行後の計測でCRAP値30以上の関数がゼロ件。分割前後の代表値は、`pipeline::run`が循環的複雑度33からCRAP 9.0（分割後の複雑度9）へ、`fetch::fetch`がCRAP 44.3から22.3へ、`fetch::robots_precheck`がCRAP 30.0から5.9へ低下した
+- PR #3のCI（run 35536578396、2026-09-21）では、`test`ジョブがunit 189件、integration 25件、E2E 24件のすべてに合格し、`coverage`ジョブは除外なしで行カバレッジ94.60%（閾値80）を達成した。`check`（fmt・clippy・doclint・SHAピン留め検証）と`security`（gitleaks）も合格
+
+### ミューテーションテスト
+
+`git diff master -- src`の差分を`cargo mutants --in-diff`に渡し、変更行のミュータントだけを対象にした。Chromeを必要としないファイルは既定の`cargo test`で、`src/render.rs`と`src/render/world.rs`は`WEBGRAB_E2E=1`を付けて`--lib --test render_e2e`と`--test-threads=1`で実行した。
+
+| 対象 | ミュータント数 | 検出 | タイムアウト | ビルド不能 | 生存 |
+|---|---|---|---|---|---|
+| `budget.rs`・`convert.rs`・`fetch.rs`・`pipeline.rs` | 94 | 75 | 7 | 12 | 0 |
+| `decode.rs` | 10 | 8 | 0 | 2 | 0 |
+| `render.rs`・`render/world.rs`（E2E込み） | 19 | 18 | 0 | 1 | 0 |
+| `convert.rs`の制御文字を読み飛ばすスキーム判定 | 7 | 7 | 0 | 0 | 0 |
+| `convert.rs`の文字参照・`\:`・先頭の空白類を解釈するスキーム判定 | 17 | 16 | 1 | 0 | 0 |
+
+タイムアウトの8個は、いずれも走査位置が進まなくなり無限ループになるミュータントで、テストが終了しないことにより検出される。7個は`convert::sanitize_link_schemes`の走査位置の更新を壊し、1個は`convert::decode_link_unit`の消費長を0にする。生存したミュータントはない。
+
+### 危険リンクスキームの無害化（CommonMark実装での解釈）
+
+`text/plain`の本文に、文字参照（`javascript&colon;`、`&#58;`、`&#x3a;`、`&#106;avascript:`）、`\:`、先頭の空白類（`&#32;`、`&nbsp;`、`&NonBreakingSpace;`、`&emsp;`、U+00A0、山括弧つきの`](< javascript:`）で書いた危険リンクを置き、リリースビルドのバイナリで取得した。出力をmarkdown-it-py 4.0.0（`commonmark`プリセット、スキームの検査は無効化）で解釈し、`href`が危険スキームで始まるリンクを数えた。
+
+| 入力 | 入力をそのまま解釈 | webgrabの出力を解釈（markdown・text・html・json・frontmatter） |
+|---|---|---|
+| 文字参照と`\:`を使った入力 | 11本中10本が危険リンク | 5形式すべてで0本 |
+| 先頭の空白類を使った入力 | 12本中8本が危険リンク | 5形式すべてで0本 |
+
+どちらの入力も、出力から`unsafe-`を取り除くと入力とバイト一致した。V1の`mutex.rs`（1396行）はcurlの取得結果とバイト一致のままで、`unsafe-`の挿入は0個だった。

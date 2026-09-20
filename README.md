@@ -18,8 +18,9 @@ Claude Code環境で計測したところ、標準のWeb取得には次の制約
 | 本文抽出 | しない（nav/footer/広告も全部） | dom_smoothie（Readability）でボイラープレート除去 |
 | 出力形式 | 生HTML | LLM向けMarkdown（Jina Reader互換ヘッダ付き） |
 | JSレンダリング | 不可 | `--render`でChrome経由（SPA対応） |
-| 量の制御 | なし | `--max-chars`/`--start-index`でページング、トークン概算を表示 |
+| 量の制御 | なし | `--max-chars`/`--start-index`でページング、改行境界で切り詰め、トークン概算を表示 |
 | 文字コード | 手動 | ヘッダ→meta→推定の3段自動判定（Shift_JIS等の日本語ページ対応） |
+| プレーンテキスト | そのまま | `text/plain`（ソースコード、`llms.txt`等）は抽出を通さず素通し（改行と`<T>`を保持） |
 | SSRF防止 | なし | 内部アドレス（メタデータエンドポイント等）をデフォルト拒否 |
 | エージェント連携 | 終了コードのみ | 機械可読なstderr書式・続き取得コマンドの自己提示 |
 
@@ -45,6 +46,7 @@ webgrab https://example.com --format json         # プログラム連携用
 webgrab https://example.com --max-chars 8000      # 量を絞る
 webgrab https://example.com --start-index 8000    # 続きを取る
 webgrab https://example.com --format json --fence # エージェント用途の推奨（本文分離＋境界明示）
+webgrab https://raw.githubusercontent.com/<owner>/<repo>/main/README.md   # text/plainはそのまま返す
 ```
 
 `--auto-render`は既定off。静的取得の本文が空または200文字未満のとき、同一プロセス内でJSレンダリングへ切り替えます。切替・失敗・skipはstderrと`--format json`の`render_status`（`static`/`rendered`/`failed`/`no-gain`/`skipped`）で分かります。`--wait-ms`（既定5000、`--render`/`--auto-render`時のみ有効）はrender取得の上限ミリ秒です。ネットワーク静止・DOM安定・可視テキスト200文字以上を満たせば上限前に終了します。
@@ -71,18 +73,20 @@ Markdown Content:
 | 0 | 成功 |
 | 2 | 引数・URL形式エラー |
 | 3 | ネットワーク失敗（リトライ可） |
-| 4 | HTTPエラー・サイズ超過・非HTML |
+| 4 | HTTPエラー・サイズ超過・未対応のContent-Type（403は`hint=--render`付き） |
 | 5 | robots.txtによる拒否 |
 | 6 | 本文が空 |
 | 7 | JSレンダリング失敗 |
 | 8 | 内部アドレス拒否（`--allow-private`で解除） |
 
+`text/plain`の本文は抽出を通さないため、本文が空でも終了コード0です。
+
 ## セキュリティと信頼モデル
 
 webgrabは任意のWebページ本文をLLMへ渡すため、取得内容は信頼できない外部データとして扱う必要があります。ツール側では次の緩和を行いますが、これは攻撃面の縮小であって完全防御ではありません。
 
-- SSRF防止（内部アドレス拒否・IPピン留め・render経路の検証プロキシ）。詳細は[設計書](docs/04-design.md)§3.1。
-- 出力インジェクション対策: 端末制御文字（ANSI/OSC）除去、`javascript:`等の危険リンクスキーム無害化、非信頼タイトルによるヘッダ/YAML偽造の防止、本文からのwebgrab制御マーカー偽造の防止。
+- SSRF防止（内部アドレス拒否・IPピン留め・render経路の検証プロキシ）。詳細は[設計書](docs/04-design.md)§3.1。`--render`使用時の`URL Source`はrender後URL（`location.href`、userinfoを除去）です。
+- 出力インジェクション対策: 端末制御文字（ANSI/OSC）除去、`javascript:`等の危険リンクスキーム無害化、非信頼タイトルによるヘッダ/YAML偽造の防止、本文からのwebgrab制御マーカー偽造の防止。`text/plain`の本文では、危険リンクスキームの無害化はMarkdownのインラインリンク・オートリンク・参照定義の3形だけが対象です。生のHTMLタグは無害化しません（`Mutex<T>`のようなソースコードを壊さないためです）。出力をHTMLとして描画する消費側は、自身でHTMLタグの無害化を行ってください。
 - `--fence`: 本文を `[webgrab:untrusted-content ...]` 〜 `[webgrab:untrusted-content-end]` で囲み、外部データの境界を明示する（本文からは閉じマーカーを偽造できない）。`--format json` では本文が `markdown` フィールドに構造的に分離され、`untrusted: true` と `untrusted_note` で同じ非信頼シグナルを渡す。
 - `--no-sandbox`: Chromeのsandboxはページ側HTML/JSに対する封じ込め層です。無効化するとその層が失われるため、sandboxが起動しないCI環境等に限って指定してください。通常利用では指定しないでください。指定時はstderrに`warn=no-sandbox`が出て、続き取得の継続コマンドにも再現されます。
 - `--auto-render`: 外部ページは本文を短く返すだけでChrome起動を誘発できます。エスカレーション時は対象オリジンへ描画1ページ分（サブリソース含む）の追加要求が発生するため、自側のコストは残余`--timeout`と残余`--max-bytes`で上限づけられます。一覧ページや連続取得を大量に行う用途では既定にしないでください。

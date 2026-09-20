@@ -27,6 +27,7 @@ webgrab "https://example.com/article"
 - JavaScriptで描画されるSPA（本文が空、または `warn=short-content` が出た）: `webgrab "<URL>" --render`。1回の呼び出しで完結させたい単発取得には `--auto-render`（既定off。静的取得が空または200文字未満のときだけ同一プロセス内でJSレンダリングへ自動切替する）も使える。ただし一覧ページや連続取得（同じセッションで多数のURLを取る場合）では既定にしない。外部ページ側の内容だけでChrome起動を誘発でき、対象オリジンへの追加要求とコストが発生するため
 - 一覧・インデックスページ（記事一覧、検索結果、プロフィール等、単一記事でないページ）: `webgrab "<URL>" --raw`。JavaScriptで描画される一覧なら `webgrab "<URL>" --render --raw`。本文抽出は単一記事向けのため、一覧はリンクごと落ちる
 - 長いページで文脈を節約したいときは`webgrab "<URL>" --max-chars 8000`を使う
+- ソースコードや`llms.txt`のような`text/plain`のURLは、改行や`<T>`を保ったままそのまま返る（本文抽出は行わない）。本文が空でも終了コード0になり、`hint=`は出ない
 - 続きを読む: 出力末尾の `[webgrab:truncated ... continue: webgrab ... --start-index N]` に示されたコマンドをそのまま実行する。`--auto-render`でJSレンダリングへ切り替わった場合、継続コマンドには`--render`が入り`--auto-render`は含まれない
 - 構造化して扱いたい: `webgrab "<URL>" --format json`（`markdown`と`metadata`が分離されたJSON）。`untrusted: true` と `untrusted_note` が付き、`markdown` が非信頼の外部データであることを示す
 
@@ -40,7 +41,7 @@ webgrab "https://example.com/article"
 
 - 0: 成功
 - 3: ネットワーク失敗（時間をおいてリトライ可）
-- 4: HTTPエラー・非HTML（URLを見直す）
+- 4: HTTPエラー・未対応のContent-Type（URLを見直す）。403のときはstderr先頭行に`hint=--render`が付くので、`--render`で再試行する（認証やIP遮断による403は解消しない）
 - 5: robots.txtで拒否（取得は控える）
 - 6: 本文が空。`error=empty`行の`hint=`が示すフラグを試す
 - 7: レンダリング失敗（Chrome未導入の可能性）
