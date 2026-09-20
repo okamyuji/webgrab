@@ -12,6 +12,15 @@ fn spawn_server<F>(count: usize, responder: F) -> u16
 where
     F: Fn(&str) -> String + Send + 'static,
 {
+    spawn_server_req(count, move |_req, path| responder(path))
+}
+
+/// `spawn_server`の兄弟版。`responder`はリクエスト全文とパスの両方を受け取る
+/// （I5でリクエストヘッダを検証するため、パス抽出だけでは足りない）。
+fn spawn_server_req<F>(count: usize, responder: F) -> u16
+where
+    F: Fn(&str, &str) -> String + Send + 'static,
+{
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     thread::spawn(move || {
@@ -24,16 +33,17 @@ where
     port
 }
 
-fn handle<F: Fn(&str) -> String>(stream: &mut TcpStream, responder: &F) {
+fn handle<F: Fn(&str, &str) -> String>(stream: &mut TcpStream, responder: &F) {
     let mut buf = [0u8; 4096];
     let n = stream.read(&mut buf).unwrap_or(0);
-    let req = String::from_utf8_lossy(&buf[..n]);
+    let req = String::from_utf8_lossy(&buf[..n]).to_string();
     let path = req
         .lines()
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
-        .unwrap_or("/");
-    let resp = responder(path);
+        .unwrap_or("/")
+        .to_string();
+    let resp = responder(&req, &path);
     let _ = stream.write_all(resp.as_bytes());
     let _ = stream.flush();
 }
@@ -468,4 +478,119 @@ fn i8_plain_text_body_is_identical_across_raw_and_formats() {
         assert_eq!(code, 0, "args={args:?} stderr={stderr}");
         assert_eq!(body_of(&stdout, markdown), base, "args={args:?}");
     }
+}
+
+/// リクエスト全文から`Accept`ヘッダの値を取り出す（大小無視でヘッダ名照合）。
+fn accept_header_value(req: &str) -> Option<String> {
+    req.lines().find_map(|l| {
+        let (name, value) = l.split_once(':')?;
+        if name.trim().eq_ignore_ascii_case("accept") {
+            Some(value.trim().to_string())
+        } else {
+            None
+        }
+    })
+}
+
+const G3_ACCEPT: &str = "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8";
+
+type AcceptLog = std::sync::Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+
+#[test]
+fn i5_accept_header_is_html_first_on_body_fetch_and_default_on_robots() {
+    use std::sync::{Arc, Mutex};
+
+    let accepts: AcceptLog = Arc::new(Mutex::new(Vec::new()));
+    let accepts_srv = Arc::clone(&accepts);
+    // 接続はrobots, /a, robots, /bの4本（robots.txtはホップごとに取得される）。
+    let port = spawn_server_req(4, move |req, path| {
+        accepts_srv
+            .lock()
+            .unwrap()
+            .push((path.to_string(), accept_header_value(req)));
+        if path == "/robots.txt" {
+            return "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .into();
+        }
+        if path == "/a" {
+            return "HTTP/1.1 302 Found\r\nLocation: /b\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .into();
+        }
+        http_response(ARTICLE, "text/html; charset=utf-8")
+    });
+    let url = format!("http://127.0.0.1:{port}/a");
+    let (code, stdout, stderr) = run_webgrab(&[&url, "--allow-private"]);
+    assert_eq!(code, 0, "stderr={stderr} stdout={stdout}");
+
+    let log = accepts.lock().unwrap();
+    assert_eq!(log.len(), 4, "{log:?}");
+    for (path, accept) in log.iter() {
+        let expected = if path == "/robots.txt" {
+            "*/*"
+        } else {
+            G3_ACCEPT
+        };
+        assert_eq!(accept.as_deref(), Some(expected), "path={path} log={log:?}");
+    }
+}
+
+#[test]
+fn i6_403_has_render_hint_and_404_does_not() {
+    let port = spawn_server(2, |path| {
+        if path == "/robots.txt" {
+            return "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .into();
+        }
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+    });
+    let url = format!("http://127.0.0.1:{port}/blocked");
+    let (code, _stdout, stderr) = run_webgrab(&[&url, "--allow-private"]);
+    assert_eq!(code, 4, "stderr={stderr}");
+    let first = stderr.lines().next().unwrap_or_default();
+    assert!(first.contains("hint=--render"), "{stderr}");
+    assert!(
+        first.starts_with("webgrab: error=http HTTP 403 retryable=false"),
+        "{stderr}"
+    );
+
+    let port = spawn_server(2, |path| {
+        if path == "/robots.txt" {
+            return "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .into();
+        }
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+    });
+    let url = format!("http://127.0.0.1:{port}/blocked");
+    let (code, stdout, stderr) = run_webgrab(&[&url, "--allow-private", "--auto-render"]);
+    assert_eq!(code, 4, "stderr={stderr}");
+    assert!(!stdout.contains("info=auto-render"), "{stdout}");
+    assert!(!stderr.contains("info=auto-render"), "{stderr}");
+
+    let port = spawn_server(2, |path| {
+        if path == "/robots.txt" {
+            return "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .into();
+        }
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+    });
+    let url = format!("http://127.0.0.1:{port}/missing");
+    let (code, _stdout, stderr) = run_webgrab(&[&url, "--allow-private"]);
+    assert_eq!(code, 4, "stderr={stderr}");
+    assert!(!stderr.contains("hint="), "{stderr}");
+}
+
+#[test]
+fn render_robots_disallow_exits_5_before_chrome_launches() {
+    // --render --allow-privateでもrobots.txtのDisallowを先に確認し、Chromeを起動しない
+    // （robots_precheckがrender::render呼び出しより前に走ることの回帰テスト）。
+    let port = spawn_server(1, |path| {
+        if path == "/robots.txt" {
+            return http_response("User-agent: *\nDisallow: /", "text/plain");
+        }
+        http_response(ARTICLE, "text/html")
+    });
+    let url = format!("http://127.0.0.1:{port}/blocked");
+    let (code, _stdout, stderr) = run_webgrab(&[&url, "--allow-private", "--render"]);
+    assert_eq!(code, 5, "stderr={stderr}");
+    assert!(stderr.contains("error=robots"), "{stderr}");
 }

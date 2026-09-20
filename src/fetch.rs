@@ -10,10 +10,25 @@ use url::Url;
 const MAX_HOPS: usize = 10;
 const ROBOTS_MAX_BYTES: usize = 512 * 1024;
 
+/// 本文取得のAcceptヘッダ（G3）。HTMLを優先し、reqwest既定の`*/*`を置き換える。
+/// robots.txtの取得には適用しない（既定の`*/*`のまま）。
+const BODY_ACCEPT: &str = "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8";
+
 /// 対応メディアタイプか（大小無視）。空は許可（Content-Type欠落サーバ向け）。
 fn is_supported_media_type(main: &str) -> bool {
     let m = main.to_ascii_lowercase();
     m.is_empty() || m == "text/html" || m == "application/xhtml+xml" || m == "text/plain"
+}
+
+/// 静的経路のHTTPエラーメッセージ（設計§4.5）。5xxと429は再試行可能。
+/// 403だけ`hint=--render`を末尾に付ける（stderr先頭行の`error=<token> <message>`書式は変わらない）。
+pub fn http_error_message(status: u16) -> String {
+    let retryable = (500..600).contains(&status) || status == 429;
+    let mut msg = format!("HTTP {status} retryable={retryable}");
+    if status == 403 {
+        msg.push_str(" hint=--render");
+    }
+    msg
 }
 
 /// Content-Typeの主タイプが`text/plain`か（大小無視、`; charset=`等のパラメータは無視）。
@@ -192,6 +207,41 @@ pub async fn robots_precheck(url_str: &str, opts: &FetchOptions) -> Result<bool>
     robots_allowed(&url, addr, opts).await
 }
 
+/// 本文取得用クライアントを構築する。`Accept`を§4.3の値に固定する（G3）。
+/// `default_headers`は`insert`で既定の`Accept: */*`を置き換えるため、送るAcceptは1値だけになる。
+fn build_body_client(opts: &FetchOptions, host: &str, addr: SocketAddr) -> Result<reqwest::Client> {
+    let mut headers = reqwest::header::HeaderMap::with_capacity(1);
+    headers.insert(
+        reqwest::header::ACCEPT,
+        reqwest::header::HeaderValue::from_static(BODY_ACCEPT),
+    );
+    reqwest::Client::builder()
+        .user_agent(&opts.user_agent)
+        .timeout(opts.timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve(host, addr)
+        .default_headers(headers)
+        .build()
+        .map_err(|e| {
+            WebgrabError::new(ExitCode::Internal, "client build failed").with_detail(e.to_string())
+        })
+}
+
+/// メディアタイプが対応外なら`ExitCode::Http`で拒否する（メディアタイプは大小無視: RFC 9110 §8.3.1）。
+fn check_media_type(content_type: Option<&str>) -> Result<()> {
+    let Some(ct) = content_type else {
+        return Ok(());
+    };
+    let main = ct.split(';').next().unwrap_or("").trim();
+    if !is_supported_media_type(main) {
+        return Err(WebgrabError::new(
+            ExitCode::Http,
+            format!("unsupported content-type: {main}"),
+        ));
+    }
+    Ok(())
+}
+
 /// 静的取得を手動リダイレクト追従で行う（各ホップでnetguard再適用）。
 pub async fn fetch(url_str: &str, opts: &FetchOptions) -> Result<Fetched> {
     let mut current = Url::parse(url_str).map_err(|e| {
@@ -218,16 +268,7 @@ pub async fn fetch(url_str: &str, opts: &FetchOptions) -> Result<Fetched> {
                 .with_detail(format!("url={current}")));
         }
 
-        let client = reqwest::Client::builder()
-            .user_agent(&opts.user_agent)
-            .timeout(opts.timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .resolve(&host, addr)
-            .build()
-            .map_err(|e| {
-                WebgrabError::new(ExitCode::Internal, "client build failed")
-                    .with_detail(e.to_string())
-            })?;
+        let client = build_body_client(opts, &host, addr)?;
 
         let resp = client.get(current.as_str()).send().await.map_err(|e| {
             WebgrabError::new(ExitCode::Network, "request failed").with_detail(e.to_string())
@@ -251,10 +292,9 @@ pub async fn fetch(url_str: &str, opts: &FetchOptions) -> Result<Fetched> {
         }
 
         if status.is_client_error() || status.is_server_error() {
-            let retryable = status.is_server_error() || status.as_u16() == 429;
             return Err(WebgrabError::new(
                 ExitCode::Http,
-                format!("HTTP {} retryable={}", status.as_u16(), retryable),
+                http_error_message(status.as_u16()),
             ));
         }
 
@@ -264,16 +304,7 @@ pub async fn fetch(url_str: &str, opts: &FetchOptions) -> Result<Fetched> {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        // 非HTML判定（メディアタイプは大小無視: RFC 9110 §8.3.1）
-        if let Some(ct) = &content_type {
-            let main = ct.split(';').next().unwrap_or("").trim();
-            if !is_supported_media_type(main) {
-                return Err(WebgrabError::new(
-                    ExitCode::Http,
-                    format!("unsupported content-type: {main}"),
-                ));
-            }
-        }
+        check_media_type(content_type.as_deref())?;
 
         // ストリーミング読み込みで max_bytes を展開後サイズに適用
         let body = read_capped(resp, opts.max_bytes).await?;
@@ -353,6 +384,17 @@ mod tests {
         assert!(!is_plain_text(Some("text/plain-ish")));
         assert!(!is_plain_text(Some("application/xhtml+xml")));
         assert!(!is_plain_text(None));
+    }
+
+    #[test]
+    fn http_error_message_adds_render_hint_only_for_403() {
+        assert_eq!(
+            http_error_message(403),
+            "HTTP 403 retryable=false hint=--render"
+        );
+        assert_eq!(http_error_message(404), "HTTP 404 retryable=false");
+        assert_eq!(http_error_message(429), "HTTP 429 retryable=true");
+        assert_eq!(http_error_message(500), "HTTP 500 retryable=true");
     }
 
     #[tokio::test]
