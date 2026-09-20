@@ -25,7 +25,7 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t = FormatArg::Markdown)]
     pub format: FormatArg,
 
-    /// 本文の最大文字数（Unicodeスカラー値）。0でメタのみ
+    /// 本文の最大文字数（Unicodeスカラー値）。切り詰め時は改行の直後まで戻すため短くなりうる。0でメタのみ
     #[arg(long, default_value_t = 24000)]
     pub max_chars: usize,
 
