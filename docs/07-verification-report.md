@@ -127,3 +127,25 @@ CIの`test`と`coverage`ジョブは`.github/workflows/ci.yml`で最初から`WE
 | (d) 非rendered時の継続コマンド | `webgrab "https://react.dev/learn" --auto-render --wait-ms 3000 --max-chars 100` | `[webgrab:truncated chars 0-100 of 16927 — continue: webgrab 'https://react.dev/learn' --max-chars 100 --start-index 100]`（render系フラグは省略） | 一致 |
 
 補足として、Skillツールが読み込むスキル本文はセッション開始時のキャッシュのため、差し替え後の本文を反映するには新しいセッションが必要である。ディスク上の`~/.claude/skills/webgrab/SKILL.md`は更新版であることを`diff -q`で確認した。実行後にheadless Chromeの残存プロセスは0件だった。
+
+## 取得忠実度の改善の検証（2026-09-21）
+
+設計10の完了条件に沿って、リリースビルドのバイナリで実URLと実テストを検証した。
+
+### V1〜V5
+
+| # | コマンド | 変更前 | 変更後 |
+|---|---|---|---|
+| V1 | `webgrab https://raw.githubusercontent.com/tokio-rs/tokio/master/tokio/src/sync/mutex.rs --max-chars 10000000 --no-tokens` | 1396行が1行に潰れ、`Mutex<T>`が17個から0個、`<T: ?Sized>`が12個から0個 | 既定・`--raw`・`--format text`・`--format html`のいずれもcurlの取得結果とバイト一致（1396行、`Mutex<T>` 17個、`<T: ?Sized>` 12個） |
+| V2 | `webgrab https://docs.rs/tokio --render --max-chars 200000` | `URL Source`が`https://docs.rs/tokio`のままで、本文先頭6本のdocs.rsリンク中5本がHTTP 400 | `URL Source`が`https://docs.rs/tokio/latest/tokio/`になり、先頭6本すべてがHTTP 200 |
+| V3 | `webgrab https://crates.io/crates/tokio --auto-render --max-chars 0` | HTTP 404で終了コード4 | 終了コード0で総文字数8941文字（静的フェーズがHTTP 200と空シェルを取得したのちエスカレーションする） |
+| V4 | `webgrab https://doc.rust-lang.org/book/ch03-02-data-types.html --format text --max-chars N`（Nは1500から900刻みで21通り） | 行の途中で切れた回数21回中18回 | 行の途中で切れた回数0回。N=2400では継続コマンドを最後まで実行すると8ページに分かれ、最終ページを除く7ページすべてが改行で終わり、連結が`--max-chars 10000000`の本文（17250文字）と一致 |
+| V5 | `webgrab https://stackoverflow.com/questions/27535289/what-is-the-correct-way-to-return-an-iterator` | 終了コード4、stderrに再試行の手掛かりなし | 終了コード4、stderr先頭行`webgrab: error=http HTTP 403 retryable=false hint=--render`。`--auto-render`を付けてもエスカレーションしない。404には`hint=`が付かない |
+
+### テストとカバレッジ
+
+- `cargo test --lib --bins --test integration`はunit 181件とintegration 22件がすべてpassし終了コード0
+- `WEBGRAB_E2E=1 cargo test --test render_e2e -- --test-threads=1`は24件がすべてpass（設計10のE16〜E20を含む）
+- `cargo crap --lcov lcov.info --min 30`は、E2Eを含む`cargo llvm-cov`実行後の計測でCRAP値30以上の関数がゼロ件。分割前後の代表値は、`pipeline::run`が循環的複雑度33からCRAP 9.0（分割後の複雑度9）へ、`fetch::fetch`がCRAP 44.3から22.3へ、`fetch::robots_precheck`がCRAP 30.0から5.9へ低下した
+
+ミューテーションテストの結果は本報告書に含めない。
