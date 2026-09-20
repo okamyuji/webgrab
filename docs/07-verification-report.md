@@ -144,7 +144,7 @@ CIの`test`と`coverage`ジョブは`.github/workflows/ci.yml`で最初から`WE
 
 ### テストとカバレッジ
 
-- `cargo test --lib --bins --test integration`はunit 187件とintegration 23件がすべてpassし終了コード0
+- `cargo test --lib --bins --test integration`はunit 188件とintegration 24件がすべてpassし終了コード0
 - `WEBGRAB_E2E=1 cargo test --test render_e2e -- --test-threads=1`は24件がすべてpass（設計10のE16〜E20を含む）
 - `cargo crap --lcov lcov.info --min 30`は、E2Eを含む`cargo llvm-cov`実行後の計測でCRAP値30以上の関数がゼロ件。分割前後の代表値は、`pipeline::run`が循環的複雑度33からCRAP 9.0（分割後の複雑度9）へ、`fetch::fetch`がCRAP 44.3から22.3へ、`fetch::robots_precheck`がCRAP 30.0から5.9へ低下した
 
@@ -157,5 +157,6 @@ CIの`test`と`coverage`ジョブは`.github/workflows/ci.yml`で最初から`WE
 | `budget.rs`・`convert.rs`・`fetch.rs`・`pipeline.rs` | 94 | 75 | 7 | 12 | 0 |
 | `decode.rs` | 10 | 8 | 0 | 2 | 0 |
 | `render.rs`・`render/world.rs`（E2E込み） | 19 | 18 | 0 | 1 | 0 |
+| `convert.rs`の制御文字を読み飛ばすスキーム判定 | 7 | 7 | 0 | 0 | 0 |
 
 タイムアウトの7個は、いずれも`convert::sanitize_link_schemes`の走査位置の更新を壊して無限ループにするミュータントで、テストが終了しないことにより検出される。生存したミュータントはない。
