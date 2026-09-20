@@ -625,3 +625,18 @@ fn plain_text_control_byte_cannot_revive_dangerous_link() {
         "a [x](unsafe-javascript:alert(1)) b\nc <unsafe-javascript:alert(2)> d\n"
     );
 }
+
+#[test]
+fn plain_text_markdown_escapes_cannot_hide_dangerous_link() {
+    // CommonMarkのレンダラはリンク先の文字参照と`\:`を復号し、URLの先頭の空白類を取り除く。
+    // 本文の文字は変えずに`unsafe-`だけが入ることを、素通しの出力で確かめる。
+    let body = "a [x](javascript&colon;alert(1)) b\nc [y](&#32;javascript:alert(3)) d\n\n[r]: javascript\\:alert(2)\n";
+    let port = spawn_plain_server(2, body, "text/plain");
+    let url = format!("http://127.0.0.1:{port}/t.txt");
+    let (code, stdout, stderr) = run_webgrab(&[&url, "--allow-private", "--format", "text"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(
+        body_of(&stdout, false),
+        "a [x](unsafe-javascript&colon;alert(1)) b\nc [y](unsafe-&#32;javascript:alert(3)) d\n\n[r]: unsafe-javascript\\:alert(2)\n"
+    );
+}

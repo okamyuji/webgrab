@@ -39,7 +39,7 @@ webgrab "<URL>" --format json          # 構造化出力（untrusted:trueとuntr
 |---|---|---|
 | 0 | 成功 | 本文を利用 |
 | 3 | ネットワーク失敗 | 時間をおいてリトライ |
-| 4 | HTTPエラー・非HTML | URLを見直す。403でstderr先頭行に`hint=--render`があれば`--render`で再試行 |
+| 4 | HTTPエラー・未対応のContent-Type | URLを見直す。403でstderr先頭行に`hint=--render`があれば`--render`で再試行 |
 | 5 | robots拒否 | 取得を控える |
 | 6 | 本文が空 | `error=empty`行の`hint=`が示すフラグを試す |
 | 7 | レンダリング失敗 | Chromeの有無を確認 |

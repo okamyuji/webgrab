@@ -35,7 +35,7 @@ webgrab "https://example.com" --format json
 ### 出力と終了コードの扱い
 
 - 本文はstdout、警告・エラーはstderrに出る。stderrの先頭行は `webgrab: error=<token> ...` の機械可読書式（`error=` / `warn=` / `info=`の3種）。
-- 終了コードで成否を判定する: 0=成功 / 3=ネットワーク（リトライ可） / 4=HTTPエラー・非HTML / 5=robots拒否 / 6=本文空 / 7=レンダリング失敗 / 8=内部アドレス拒否。
+- 終了コードで成否を判定する: 0=成功 / 3=ネットワーク（リトライ可） / 4=HTTPエラー・未対応のContent-Type / 5=robots拒否 / 6=本文空 / 7=レンダリング失敗 / 8=内部アドレス拒否。
 - exit 6（本文空）や `warn=short-content`（本文が極端に短い）のときは、フラグの有無で判断せず、その行の `hint=` が示すフラグをそのまま試す（値は取得経路に応じて`--render/--raw`か`--raw`のどちらかになる）。一覧ページは `--raw`、JS描画の一覧は `--render --raw`。
 - HTTP 403のときはstderr先頭行の末尾に`hint=--render`が付く。`--render`で再試行する（認証やIP遮断による403は解消しない）。
 - ソースコードや`llms.txt`のような`text/plain`のURLは、改行や`<T>`を保ったままそのまま返る（本文抽出は行わない）。本文が空でも終了コード0になり、`hint=`は出ない。

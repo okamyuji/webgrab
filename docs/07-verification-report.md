@@ -1,7 +1,7 @@
 # 実動作検証報告書 — webgrab
 
-- バージョン: 1.0
-- 日付: 2026-07-17
+- バージョン: 1.1
+- 日付: 2026-09-21
 - 対応計画: [06-verification-plan.md](06-verification-plan.md)
 - 検証バイナリ: target/release/webgrab（cargo 1.97.1 / edition 2024）
 
@@ -144,7 +144,7 @@ CIの`test`と`coverage`ジョブは`.github/workflows/ci.yml`で最初から`WE
 
 ### テストとカバレッジ
 
-- `cargo test --lib --bins --test integration`はunit 188件とintegration 24件がすべてpassし終了コード0
+- `cargo test --lib --bins --test integration`はunit 189件とintegration 25件がすべてpassし終了コード0
 - `WEBGRAB_E2E=1 cargo test --test render_e2e -- --test-threads=1`は24件がすべてpass（設計10のE16〜E20を含む）
 - `cargo crap --lcov lcov.info --min 30`は、E2Eを含む`cargo llvm-cov`実行後の計測でCRAP値30以上の関数がゼロ件。分割前後の代表値は、`pipeline::run`が循環的複雑度33からCRAP 9.0（分割後の複雑度9）へ、`fetch::fetch`がCRAP 44.3から22.3へ、`fetch::robots_precheck`がCRAP 30.0から5.9へ低下した
 
@@ -158,5 +158,17 @@ CIの`test`と`coverage`ジョブは`.github/workflows/ci.yml`で最初から`WE
 | `decode.rs` | 10 | 8 | 0 | 2 | 0 |
 | `render.rs`・`render/world.rs`（E2E込み） | 19 | 18 | 0 | 1 | 0 |
 | `convert.rs`の制御文字を読み飛ばすスキーム判定 | 7 | 7 | 0 | 0 | 0 |
+| `convert.rs`の文字参照・`\:`・先頭の空白類を解釈するスキーム判定 | 17 | 16 | 1 | 0 | 0 |
 
-タイムアウトの7個は、いずれも`convert::sanitize_link_schemes`の走査位置の更新を壊して無限ループにするミュータントで、テストが終了しないことにより検出される。生存したミュータントはない。
+タイムアウトの8個は、いずれも走査位置が進まなくなり無限ループになるミュータントで、テストが終了しないことにより検出される。7個は`convert::sanitize_link_schemes`の走査位置の更新を壊し、1個は`convert::decode_link_unit`の消費長を0にする。生存したミュータントはない。
+
+### 危険リンクスキームの無害化（CommonMark実装での解釈）
+
+`text/plain`の本文に、文字参照（`javascript&colon;`、`&#58;`、`&#x3a;`、`&#106;avascript:`）、`\:`、先頭の空白類（`&#32;`、`&nbsp;`、`&NonBreakingSpace;`、`&emsp;`、U+00A0、山括弧つきの`](< javascript:`）で書いた危険リンクを置き、リリースビルドのバイナリで取得した。出力をmarkdown-it-py 4.0.0（`commonmark`プリセット、スキームの検査は無効化）で解釈し、`href`が危険スキームで始まるリンクを数えた。
+
+| 入力 | 入力をそのまま解釈 | webgrabの出力を解釈（markdown・text・html・json・frontmatter） |
+|---|---|---|
+| 文字参照と`\:`を使った入力 | 11本中10本が危険リンク | 5形式すべてで0本 |
+| 先頭の空白類を使った入力 | 12本中8本が危険リンク | 5形式すべてで0本 |
+
+どちらの入力も、出力から`unsafe-`を取り除くと入力とバイト一致した。V1の`mutex.rs`（1396行）はcurlの取得結果とバイト一致のままで、`unsafe-`の挿入は0個だった。

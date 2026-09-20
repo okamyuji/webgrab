@@ -78,7 +78,7 @@ const DANGER_SCHEMES: &[&str] = &[
 ];
 
 /// リンクターゲットが始まる位置の区切り。戻り値は (区切りのバイト長, 直後の空白を読み飛ばすか)。
-/// オートリンク`<`で空白を読み飛ばさないのは、`< javascript:`がオートリンクではないため。
+/// 読み飛ばした空白の後ろへ`unsafe-`を入れるのは`](`と`]:`だけで、`<`では直後に入れる。
 fn link_delimiter_at(bytes: &[u8], i: usize) -> Option<(usize, bool)> {
     match bytes[i] {
         b'<' => Some((1, false)),
@@ -87,25 +87,83 @@ fn link_delimiter_at(bytes: &[u8], i: usize) -> Option<(usize, bool)> {
     }
 }
 
-/// 制御文字（Cc）を読み飛ばして`scheme`に前方一致するか。C0・DEL・C1は出力段の
-/// `output::strip_terminal_controls`が削除し、タブと改行はURLの解釈時に無視される。判定が
-/// これらで途切れると、`](\x01javascript:`が無害化をすり抜けたあと危険リンクへ戻る。
+/// 文字参照の最大長。HTML5で最長の`&CounterClockwiseContourIntegral;`に合わせる。
+const MAX_CHAR_REF_BYTES: usize = 33;
+
+/// `s`（空でない）の先頭を、CommonMarkがリンク先で復号する単位で1つ読む。戻り値は
+/// (復号後の文字, 消費したバイト長)。対象は`\`＋ASCII記号と文字参照。名前付き参照の表は
+/// 危険スキームの綴りに現れる記号と、URLの途中で無視されるタブと改行だけを持つ（英字に
+/// 名前付き参照はない）。表にない名前は空白として返す。`&nbsp;`のような空白類がURLの
+/// 先頭で取り除かれる場合を拾うためで、途中にあれば呼び出し側で不一致になる。
+fn decode_link_unit(s: &str) -> (char, usize) {
+    let b = s.as_bytes();
+    if b[0] == b'\\' && b.get(1).is_some_and(u8::is_ascii_punctuation) {
+        return (b[1] as char, 2);
+    }
+    let first = s.chars().next().unwrap();
+    if first != '&' {
+        return (first, first.len_utf8());
+    }
+    let semi = b.iter().take(MAX_CHAR_REF_BYTES).position(|&c| c == b';');
+    let decoded = semi.and_then(|end| match &s[1..end] {
+        "colon" => Some(':'),
+        "sol" => Some('/'),
+        "plus" => Some('+'),
+        "Tab" => Some('\t'),
+        "NewLine" => Some('\n'),
+        name => {
+            let Some(num) = name.strip_prefix('#') else {
+                let is_name = name.starts_with(|c: char| c.is_ascii_alphabetic())
+                    && name.bytes().all(|c| c.is_ascii_alphanumeric());
+                return is_name.then_some(' ');
+            };
+            let (digits, radix) = match num.strip_prefix(['x', 'X']) {
+                Some(hex) => (hex, 16),
+                None => (num, 10),
+            };
+            // from_str_radixは符号を受け付けるので、CommonMarkと同じく数字だけに限る。
+            if !digits.bytes().all(|c| c.is_ascii_alphanumeric()) {
+                return None;
+            }
+            u32::from_str_radix(digits, radix)
+                .ok()
+                .and_then(char::from_u32)
+        }
+    });
+    match (decoded, semi) {
+        (Some(c), Some(end)) => (c, end + 1),
+        _ => ('&', 1),
+    }
+}
+
+/// レンダラとブラウザがURLとして解釈する形に直したうえで`scheme`に前方一致するか。
+/// 判定が字面だけを見ると、無害化をすり抜けた文字列があとで危険リンクへ戻る。
+/// - 制御文字（Cc）はどこにあっても読み飛ばす。C0・DEL・C1は出力段の
+///   `output::strip_terminal_controls`が削除し、タブと改行はURLの解釈時に無視される。
+/// - 文字参照と`\:`は復号する。
+/// - 先頭の空白類とU+FEFFは読み飛ばす。レンダラがURLの前後から取り除く。
+///
 /// 最初の不一致で打ち切るため、走査量は入力全体で線形に収まる。
 fn matches_scheme_ignoring_controls(s: &str, scheme: &str) -> bool {
     let mut want = scheme.bytes().peekable();
-    for c in s.chars() {
-        let Some(&w) = want.peek() else {
-            return true;
-        };
-        if c.is_control() {
+    let mut rest = s;
+    let mut at_start = true;
+    while let Some(&w) = want.peek() {
+        if rest.is_empty() {
+            return false;
+        }
+        let (c, len) = decode_link_unit(rest);
+        rest = &rest[len..];
+        if c.is_control() || (at_start && (c.is_whitespace() || c == '\u{feff}')) {
             continue;
         }
         if !c.is_ascii() || (c as u8).to_ascii_lowercase() != w {
             return false;
         }
         want.next();
+        at_start = false;
     }
-    want.peek().is_none()
+    true
 }
 
 fn starts_with_danger_scheme(s: &str) -> bool {
@@ -354,6 +412,94 @@ mod tests {
         }
         // 制御文字だけで危険スキームにならないものは変えない。
         for s in ["[x](\u{1}https://ok.test/)", "<\u{1}T>", "[x](java\u{1}"] {
+            assert_eq!(sanitize_link_schemes(s), s, "input={s:?}");
+        }
+    }
+
+    #[test]
+    fn sanitize_link_schemes_sees_through_markdown_escapes() {
+        // CommonMarkはリンク先の文字参照と`\`＋ASCII記号を復号する。判定が字面だけを
+        // 見ると、`javascript&colon;`がレンダラの側で`javascript:`へ戻る。
+        for (input, want) in [
+            ("[x](javascript&colon;a)", "[x](unsafe-javascript&colon;a)"),
+            ("[x](javascript&#58;a)", "[x](unsafe-javascript&#58;a)"),
+            ("[x](javascript&#x3A;a)", "[x](unsafe-javascript&#x3A;a)"),
+            ("[x](&#106;avascript:a)", "[x](unsafe-&#106;avascript:a)"),
+            ("[x](&#X4a;avascript:a)", "[x](unsafe-&#X4a;avascript:a)"),
+            ("[x](javascript\\:a)", "[x](unsafe-javascript\\:a)"),
+            ("[x]: javascript&colon;a", "[x]: unsafe-javascript&colon;a"),
+            ("[x]: vbscript\\:a", "[x]: unsafe-vbscript\\:a"),
+            (
+                "[x](<javascript&colon;a>)",
+                "[x](<unsafe-javascript&colon;a>)",
+            ),
+            // 復号した結果が制御文字なら、生の制御文字と同じく読み飛ばす。
+            ("[x](java&Tab;script:a)", "[x](unsafe-java&Tab;script:a)"),
+            ("[x](java&#10;script:a)", "[x](unsafe-java&#10;script:a)"),
+            (
+                "[x](java&NewLine;script&#1;:a)",
+                "[x](unsafe-java&NewLine;script&#1;:a)",
+            ),
+            (
+                "[x](data&colon;text&sol;html,y)",
+                "[x](unsafe-data&colon;text&sol;html,y)",
+            ),
+            (
+                "[x](data:image&sol;svg&plus;xml,y)",
+                "[x](unsafe-data:image&sol;svg&plus;xml,y)",
+            ),
+            // レンダラはURLの前後の空白類を取り除く。復号後に先頭へ来る空白類は読み飛ばす。
+            ("[x](&#32;javascript:a)", "[x](unsafe-&#32;javascript:a)"),
+            ("[x](&#xA0;javascript:a)", "[x](unsafe-&#xA0;javascript:a)"),
+            ("[x](&nbsp;javascript:a)", "[x](unsafe-&nbsp;javascript:a)"),
+            (
+                "[x](&NonBreakingSpace;&emsp;javascript:a)",
+                "[x](unsafe-&NonBreakingSpace;&emsp;javascript:a)",
+            ),
+            (
+                "[x](&CounterClockwiseContourIntegral;javascript:a)",
+                "[x](unsafe-&CounterClockwiseContourIntegral;javascript:a)",
+            ),
+            ("[x](\u{a0}javascript:a)", "[x](unsafe-\u{a0}javascript:a)"),
+            (
+                "[x](\u{feff}javascript:a)",
+                "[x](unsafe-\u{feff}javascript:a)",
+            ),
+            ("[x](< javascript:a>)", "[x](<unsafe- javascript:a>)"),
+            (
+                "[x]: <\u{3000}javascript:a>",
+                "[x]: <unsafe-\u{3000}javascript:a>",
+            ),
+        ] {
+            assert_eq!(sanitize_link_schemes(input), want, "input={input:?}");
+        }
+        // 空白類が途中にあるURLは、レンダラもブラウザも危険スキームとして解釈しない。
+        for s in [
+            "[x](java&nbsp;script:a)",
+            "[x](java&#32;script:a)",
+            "[x](java\u{a0}script:a)",
+            "[x](&nbsp;https://ok.test/)",
+            "[x](&1abc;javascript:a)",
+        ] {
+            assert_eq!(sanitize_link_schemes(s), s, "input={s:?}");
+        }
+        // CommonMarkが復号しない形は危険スキームにならないので変えない。
+        for s in [
+            "[x](javascript&amp;colon;a)",
+            "[x](javascript&#58a)",
+            "[x](javascript&#+58;a)",
+            "[x](javascript&#;a)",
+            "[x](javascript&#x;a)",
+            "[x](javascript&#1114112;a)",
+            "[x](javascript&unknown;a)",
+            "[x](javascript&COLON;a)",
+            "[x](java\\script:a)",
+            "[x](https://ok.test/?a=1&b=2;c)",
+            "[x](&日本語;a)",
+            "[x](&",
+            "[x](\\",
+            "[x](javascript&",
+        ] {
             assert_eq!(sanitize_link_schemes(s), s, "input={s:?}");
         }
     }

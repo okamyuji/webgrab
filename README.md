@@ -73,7 +73,7 @@ Markdown Content:
 | 0 | 成功 |
 | 2 | 引数・URL形式エラー |
 | 3 | ネットワーク失敗（リトライ可） |
-| 4 | HTTPエラー・サイズ超過・非HTML（403は`hint=--render`付き） |
+| 4 | HTTPエラー・サイズ超過・未対応のContent-Type（403は`hint=--render`付き） |
 | 5 | robots.txtによる拒否 |
 | 6 | 本文が空 |
 | 7 | JSレンダリング失敗 |

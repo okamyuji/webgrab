@@ -50,7 +50,7 @@ webgrabの目的は、ページの内容を欠落なくLLMへ渡すことです�
 
 デコード後の本文に加わる変更は、次の3点だけです。
 
-1. `convert::sanitize_link_schemes`が、インラインリンク（`](javascript:`）、オートリンク（`<javascript:`）、参照定義（`]: javascript:`）の3形にある危険スキームを無害化します。インラインリンクと参照定義では、区切りの直後の空白を読み飛ばして判定します。該当するスキームの前に`unsafe-`を挿入するだけで、文字は削りません。
+1. `convert::sanitize_link_schemes`が、インラインリンク（`](javascript:`）、オートリンク（`<javascript:`）、参照定義（`]: javascript:`）の3形にある危険スキームを無害化します。インラインリンクと参照定義では、区切りの直後の空白を読み飛ばして判定します。判定は、レンダラとブラウザがURLとして解釈する形に直してから行います。具体的には制御文字を読み飛ばし、文字参照（`&colon;`、`&#58;`）と`\:`を復号します。復号後に先頭へ来る空白類（`&#32;`、`&nbsp;`、U+00A0）も判定から除きます。字面だけで判定すると、`javascript&colon;`や`&#32;javascript:`がレンダラの側で`javascript:`へ戻るためです。該当するスキームの前に`unsafe-`を挿入するだけで、文字は削りません。
 2. `output::render`による端末制御文字の除去
 3. `output::render`によるwebgrab制御マーカーの無害化（`[webgrab:`が`[quoted-webgrab:`になる）
 
@@ -140,7 +140,7 @@ render後URLは、サーバのリダイレクトや`location.replace`でオリ�
 - `fetch::is_plain_text`: `text/plain`、大文字混じり、`charset`付き、`text/html`、値なし
 - `decode::decode`: `text/plain`では本文中の`<meta charset="shift_jis">`を採用せず、HTMLでは従来どおり採用すること
 - `render::resolve_final_url`: http、https、値なし、`about:blank`、`chrome-error://`、`javascript:`、解釈できない文字列、改行を含む文字列、userinfoを含むURL（取り除かれる）、解釈後が8192バイトちょうど、8193バイト
-- `convert::sanitize_link_schemes`: インラインリンク、区切りの後に空白があるインラインリンク、オートリンク、参照定義、大文字混じりのスキーム。加えて、通常のURL、`Mutex<T>`、生のHTMLタグ（`<a href="javascript:x">`）が変わらないこと
+- `convert::sanitize_link_schemes`: インラインリンク、区切りの後に空白があるインラインリンク、オートリンク、参照定義、大文字混じりのスキーム。制御文字を挟んだスキーム、文字参照と`\:`で書いたスキーム、先頭に空白類を置いたスキームも無害化されること。加えて、通常のURL、`Mutex<T>`、生のHTMLタグ（`<a href="javascript:x">`）が変わらないこと
 - `pipeline::plain_stage`: 本文がそのまま入り、`title`が値なしで、`](javascript:`が無害化されること
 
 ### 統合（Chrome不要、`tests/integration.rs`）

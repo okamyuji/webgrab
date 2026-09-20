@@ -41,7 +41,7 @@ webgrab "https://example.com/article"
 
 - 0: 成功
 - 3: ネットワーク失敗（時間をおいてリトライ可）
-- 4: HTTPエラー・非HTML（URLを見直す）。403のときはstderr先頭行に`hint=--render`が付くので、`--render`で再試行する（認証やIP遮断による403は解消しない）
+- 4: HTTPエラー・未対応のContent-Type（URLを見直す）。403のときはstderr先頭行に`hint=--render`が付くので、`--render`で再試行する（認証やIP遮断による403は解消しない）
 - 5: robots.txtで拒否（取得は控える）
 - 6: 本文が空。`error=empty`行の`hint=`が示すフラグを試す
 - 7: レンダリング失敗（Chrome未導入の可能性）
