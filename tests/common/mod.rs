@@ -15,6 +15,8 @@ pub struct Route {
     pub content_type: &'static str,
     pub headers: Vec<(&'static str, String)>,
     pub delay_ms: u64,
+    /// ステータス行のステータス部（例: `302 Found`）。
+    pub status: &'static str,
 }
 
 impl Route {
@@ -25,6 +27,19 @@ impl Route {
             content_type: "text/html; charset=utf-8",
             headers: vec![],
             delay_ms: 0,
+            status: "200 OK",
+        }
+    }
+
+    /// `location`へ転送する空応答。
+    pub fn redirect(path: &'static str, status: &'static str, location: impl Into<String>) -> Self {
+        Route {
+            path,
+            body: Vec::new(),
+            content_type: "text/html; charset=utf-8",
+            headers: vec![("Location", location.into())],
+            delay_ms: 0,
+            status,
         }
     }
 }
@@ -91,7 +106,8 @@ fn serve_one(mut stream: TcpStream, routes: &[Route]) {
                 thread::sleep(Duration::from_millis(delay));
             }
             let mut head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                "HTTP/1.1 {}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                r.status,
                 body.len()
             );
             for (k, v) in headers {
@@ -209,6 +225,7 @@ pub fn csr_xhr() -> Vec<Route> {
         content_type: "text/html; charset=utf-8",
         headers: vec![],
         delay_ms: 1000,
+        status: "200 OK",
     };
     vec![page, api]
 }
@@ -241,6 +258,7 @@ pub fn big_gzip() -> Route {
         content_type: "text/html; charset=utf-8",
         headers: vec![("Content-Encoding", "gzip".to_string())],
         delay_ms: 0,
+        status: "200 OK",
     }
 }
 
@@ -251,6 +269,88 @@ pub fn dom_bomb() -> Route {
         format!(
             "<html><head><meta charset=\"utf-8\"><title>dom</title></head><body><div id=\"app\">{SENTINEL_DOM}</div>\
          <script>var s='<p>'+'y'.repeat(1048576)+'</p>';document.getElementById('app').innerHTML=s+s+s;</script></body></html>"
+        ),
+    )
+}
+
+pub const SENTINEL_DIR: &str = "SENTINEL-DIR-1c3e";
+pub const SENTINEL_PUSH: &str = "SENTINEL-PUSH-4d6a";
+pub const SENTINEL_NOGAIN: &str = "SENTINEL-NOGAIN-8b2f";
+
+fn page(title: &str, body: &str) -> String {
+    format!(
+        "<html><head><meta charset=\"utf-8\"><title>{title}</title></head><body>{body}</body></html>"
+    )
+}
+
+/// 転送・遷移の着地点。相対リンク`next.html`で基準URLの解決を確かめる。
+pub fn dir_page() -> Route {
+    let para = "これはリダイレクト先の本文です。抽出アルゴリズムが本文と認識できる十分な長さの日本語文章を用意しています。さらに文章を続けて厚みを持たせます。";
+    Route::html(
+        "/dir/page",
+        page(
+            "dir",
+            &format!(
+                "<article><h1>記事 {SENTINEL_DIR}</h1><p>{para}</p><p>{para}</p><p>{para}</p>\
+                 <p>続きは<a href=\"next.html\">next</a>にあります。</p></article>"
+            ),
+        ),
+    )
+}
+
+/// `/old` から `/dir/page` への302転送。
+pub fn redirect_old() -> Route {
+    Route::redirect("/old", "302 Found", "/dir/page")
+}
+
+/// 読み込み中に同期実行される`location.replace`で`/dir/page`へ移る短いページ。
+pub fn replace_page() -> Route {
+    Route::html(
+        "/replace",
+        page(
+            "replace",
+            "<p>読み込み中</p><script>location.replace('/dir/page');</script>",
+        ),
+    )
+}
+
+/// 同一オリジンのまま`history.pushState`でパスを変えるページ。
+pub fn push_page() -> Route {
+    let para = "これはpushStateでパスだけを変えるページの本文です。抽出アルゴリズムが本文と認識できる十分な長さの日本語文章を用意しています。さらに続けます。";
+    Route::html(
+        "/push",
+        page(
+            "push",
+            &format!(
+                "<article><h1>記事 {SENTINEL_PUSH}</h1><p>{para}</p><p>{para}</p><p>{para}</p></article>\
+                 <script>history.pushState({{}}, '', '/dir/pushed');</script>"
+            ),
+        ),
+    )
+}
+
+/// 別オリジン（別ポート）へ`location.replace`で移るページ。
+pub fn cross_replace(target: &str) -> Route {
+    Route::html(
+        "/cross",
+        page(
+            "cross",
+            &format!("<p>移動中</p><script>location.replace('{target}');</script>"),
+        ),
+    )
+}
+
+/// 静的本文が200文字未満で、JSが本文をさらに短くしつつ`history.pushState`でパスを変える。
+/// `short_static`は他のテストが参照するため、別fixtureにする。
+pub fn short_push() -> Route {
+    Route::html(
+        "/short_push",
+        page(
+            "short push",
+            &format!(
+                "<article id=\"a\"><p>これは百五十文字程度の短い本文です {SENTINEL_NOGAIN}。抽出器が本文として認識できる長さはありますが二百文字には届きません。no-gain判定の確認用の固定文です。末尾。</p></article>\
+                 <script>document.getElementById('a').innerHTML='<p>短い</p>';history.pushState({{}}, '', '/dir/pushed');</script>"
+            ),
         ),
     )
 }

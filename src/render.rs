@@ -37,6 +37,38 @@ pub struct RenderOptions {
 
 const NAV_WAIT_MAX: Duration = Duration::from_millis(1000);
 
+/// 採用するrender後URLの長さ上限（設計10 §4.2）。ヘッダと継続コマンドの肥大を防ぐ。
+const MAX_URL_BYTES: usize = 8192;
+
+/// render結果（設計10 §4.2）。
+#[derive(Debug)]
+pub struct Rendered {
+    pub html: String,
+    pub final_url: String,
+}
+
+/// Chromeが報告した`location.href`を検証し、採れなければ要求URLへ戻す（設計10 §4.2）。
+pub fn resolve_final_url(requested: &str, reported: Option<&str>) -> String {
+    adopt_reported_url(reported).unwrap_or_else(|| requested.to_string())
+}
+
+fn adopt_reported_url(reported: Option<&str>) -> Option<String> {
+    let reported = reported?;
+    // 評価式が`slice(0, 8193)`で切るため、上限超えは途中で切れた可能性がある。
+    if reported.len() > MAX_URL_BYTES {
+        return None;
+    }
+    let mut url = url::Url::parse(reported).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    // userinfoを残すと`https://accounts.example@evil.test/`のように権威部を偽装できる。
+    url.set_username("").ok()?;
+    url.set_password(None).ok()?;
+    let s = url.to_string();
+    (s.len() <= MAX_URL_BYTES).then_some(s)
+}
+
 /// Dropでabortするタスクガード。早期リターン・--timeoutキャンセルでもタスクを残置しない。
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 impl AbortOnDrop {
@@ -67,13 +99,13 @@ fn proxy_args(port: u16) -> [String; 2] {
 fn finalize(
     main_blocked: &AtomicBool,
     blocked_main: Option<&(String, Resolution)>,
-    result: Result<String>,
+    result: Result<Rendered>,
     blocked_intercept: u64,
     blocked_proxy: u64,
     proxy_exceeded: bool,
     proxy_bytes: u64,
     max_bytes_total: u64,
-) -> Result<String> {
+) -> Result<Rendered> {
     // 終了コード8の経路でも遮断件数は通知する（SSRF試行を無通知にしない）。
     for l in netguard_warn_lines(blocked_intercept, blocked_proxy) {
         eprintln!("{l}");
@@ -100,8 +132,8 @@ fn finalize(
     result
 }
 
-/// URLをChromeでレンダリングし、安定後のDOM HTMLを返す。
-pub async fn render(url_str: &str, opts: &RenderOptions) -> Result<String> {
+/// URLをChromeでレンダリングし、安定後のDOM HTMLとrender後URLを返す。
+pub async fn render(url_str: &str, opts: &RenderOptions) -> Result<Rendered> {
     let deadline = Instant::now() + opts.timeout;
     match tokio::time::timeout(opts.timeout, render_inner(url_str, opts, deadline)).await {
         Ok(r) => r,
@@ -112,7 +144,7 @@ pub async fn render(url_str: &str, opts: &RenderOptions) -> Result<String> {
     }
 }
 
-async fn render_inner(url_str: &str, opts: &RenderOptions, deadline: Instant) -> Result<String> {
+async fn render_inner(url_str: &str, opts: &RenderOptions, deadline: Instant) -> Result<Rendered> {
     // 一時user-data-dirを生成する。TempDirのDrop（RAII）でディレクトリが削除されるため、
     // --timeoutキャンセルやpanic時もプロファイルが残置されない（設計§4）。
     let user_data = tempfile::Builder::new()
@@ -189,7 +221,7 @@ async fn drive(
     cache: Arc<HostCache>,
     proxy_state: &ProxyState,
     main_blocked: Arc<AtomicBool>,
-) -> (Result<String>, u64, Option<(String, Resolution)>) {
+) -> (Result<Rendered>, u64, Option<(String, Resolution)>) {
     let shared_holder: Arc<Mutex<Option<Arc<Shared>>>> = Arc::new(Mutex::new(None));
     let r = drive_inner(
         browser,
@@ -221,7 +253,7 @@ async fn drive_inner(
     proxy_state: &ProxyState,
     main_blocked: Arc<AtomicBool>,
     shared_holder: Arc<Mutex<Option<Arc<Shared>>>>,
-) -> Result<String> {
+) -> Result<Rendered> {
     let render_err =
         |m: &'static str, e: String| WebgrabError::new(ExitCode::Render, m).with_detail(e);
     let page = browser
@@ -329,7 +361,7 @@ async fn drive_inner(
         cap.saturating_sub(t_goto.elapsed()),
     );
     // page.content()はメインワールド評価でgetter上書きに弱いため、分離ワールドで取得する。
-    let content = world
+    let (reported_url, content) = world
         .dom_html(limit)
         .await
         .ok_or_else(|| WebgrabError::new(ExitCode::Render, "content read failed or timed out"))?;
@@ -337,7 +369,10 @@ async fn drive_inner(
         return Err(netguard_err());
     }
     let _ = proxy_state; // 超過判定はrender_innerがfinalizeへ渡す（exceeded()/downloaded()を使用）
-    Ok(content)
+    Ok(Rendered {
+        html: content,
+        final_url: resolve_final_url(url_str, reported_url.as_deref()),
+    })
 }
 
 #[cfg(test)]
@@ -374,7 +409,10 @@ mod tests {
         let r2 = finalize(
             &blocked,
             None,
-            Ok("<html></html>".into()),
+            Ok(Rendered {
+                html: "<html></html>".into(),
+                final_url: "https://x.test/".into(),
+            }),
             0,
             0,
             false,
@@ -383,7 +421,22 @@ mod tests {
         );
         assert_eq!(r2.unwrap_err().code, ExitCode::Netguard);
         let clear = Arc::new(AtomicBool::new(false));
-        assert!(finalize(&clear, None, Ok("<html></html>".into()), 0, 0, false, 0, 0).is_ok());
+        assert!(
+            finalize(
+                &clear,
+                None,
+                Ok(Rendered {
+                    html: "<html></html>".into(),
+                    final_url: "https://x.test/".into()
+                }),
+                0,
+                0,
+                false,
+                0,
+                0
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -392,7 +445,10 @@ mod tests {
         let r = finalize(
             &clear,
             None,
-            Ok("<html></html>".into()),
+            Ok(Rendered {
+                html: "<html></html>".into(),
+                final_url: "https://x.test/".into(),
+            }),
             0,
             0,
             true,
@@ -414,7 +470,10 @@ mod tests {
         let r = finalize(
             &blocked,
             None,
-            Ok("<html></html>".into()),
+            Ok(Rendered {
+                html: "<html></html>".into(),
+                final_url: "https://x.test/".into(),
+            }),
             0,
             0,
             true,
@@ -422,6 +481,75 @@ mod tests {
             10_000,
         );
         assert_eq!(r.unwrap_err().code, ExitCode::Netguard);
+    }
+
+    #[test]
+    fn resolve_final_url_adopts_only_http_and_https() {
+        let req = "https://req.test/a";
+        assert_eq!(
+            resolve_final_url(req, Some("http://e.test/x")),
+            "http://e.test/x"
+        );
+        assert_eq!(
+            resolve_final_url(req, Some("https://e.test/x")),
+            "https://e.test/x"
+        );
+        assert_eq!(resolve_final_url(req, None), req);
+        assert_eq!(resolve_final_url(req, Some("about:blank")), req);
+        assert_eq!(
+            resolve_final_url(req, Some("chrome-error://chromewebdata/")),
+            req
+        );
+        assert_eq!(resolve_final_url(req, Some("javascript:1")), req);
+        assert_eq!(resolve_final_url(req, Some("not a url")), req);
+        assert_eq!(resolve_final_url(req, Some("")), req);
+    }
+
+    #[test]
+    fn resolve_final_url_strips_userinfo() {
+        assert_eq!(
+            resolve_final_url("https://req.test/", Some("https://user:pw@evil.test/p")),
+            "https://evil.test/p"
+        );
+        assert_eq!(
+            resolve_final_url("https://req.test/", Some("https://user@evil.test/p")),
+            "https://evil.test/p"
+        );
+    }
+
+    #[test]
+    fn resolve_final_url_drops_newlines_through_url_parse() {
+        assert_eq!(
+            resolve_final_url("https://req.test/", Some("https://e.test/a\nb")),
+            "https://e.test/ab"
+        );
+    }
+
+    #[test]
+    fn resolve_final_url_length_boundary() {
+        let req = "https://req.test/";
+        let base = "https://e.test/";
+        let exact = format!("{base}{}", "a".repeat(MAX_URL_BYTES - base.len()));
+        assert_eq!(exact.len(), MAX_URL_BYTES);
+        assert_eq!(resolve_final_url(req, Some(&exact)), exact);
+
+        let over = format!("{base}{}", "a".repeat(MAX_URL_BYTES + 1 - base.len()));
+        assert_eq!(over.len(), MAX_URL_BYTES + 1);
+        assert_eq!(resolve_final_url(req, Some(&over)), req);
+
+        // 入力は上限内でも、Url::parseの百分率符号化で上限を超える場合は採用しない。
+        let grows = format!("{base}{} x", "a".repeat(MAX_URL_BYTES - base.len() - 2));
+        assert_eq!(grows.len(), MAX_URL_BYTES);
+        assert_eq!(resolve_final_url(req, Some(&grows)), req);
+
+        // 入力が上限超えなら、userinfoを除いた結果が上限内でも採用しない（切り詰めの可能性）。
+        let with_user = "https://user@e.test/";
+        let shrinks = format!(
+            "{with_user}{}",
+            "a".repeat(MAX_URL_BYTES + 1 - with_user.len())
+        );
+        assert_eq!(shrinks.len(), MAX_URL_BYTES + 1);
+        assert_eq!(resolve_final_url(req, Some(&shrinks)), req);
     }
 
     #[tokio::test]

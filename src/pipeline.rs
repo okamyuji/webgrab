@@ -170,7 +170,7 @@ pub async fn run(cli: &Cli) -> Result<String> {
     let mut status = RenderStatus::Static;
     let mut static_chars: Option<usize> = None;
     let mut rendered_chars: Option<usize> = None;
-    let (html, final_url, consumed) = if cli.render {
+    let (html, mut final_url, consumed) = if cli.render {
         if !cli.no_robots {
             let fopts = FetchOptions {
                 user_agent: ua,
@@ -185,9 +185,9 @@ pub async fn run(cli: &Cli) -> Result<String> {
             }
         }
         warn_no_sandbox(cli);
-        let dom = render::render(&cli.url, &render_options(cli, timeout, cli.max_bytes)).await?;
+        let r = render::render(&cli.url, &render_options(cli, timeout, cli.max_bytes)).await?;
         status = RenderStatus::Rendered;
-        (dom, cli.url.clone(), 0u64)
+        (r.html, r.final_url, 0u64)
     } else {
         let fopts = FetchOptions {
             user_agent: ua,
@@ -229,12 +229,15 @@ pub async fn run(cli: &Cli) -> Result<String> {
                 );
                 warn_no_sandbox(cli);
                 match render::render(&final_url, &render_options(cli, rt, rb)).await {
-                    Ok(dom) => match build_stage(cli, &dom, &final_url) {
+                    // renderフェーズの抽出は常にrender後URLを基準にする。結果を捨てる場合は
+                    // 本文ごと捨てるため、URLの出どころと本文の出どころが食い違わない。
+                    Ok(r) => match build_stage(cli, &r.html, &r.final_url) {
                         Ok(rs) => {
                             rendered_chars = Some(rs.visible);
                             status = choose_result(stage.visible, rs.visible);
                             if status.is_rendered() {
                                 stage = rs;
+                                final_url = r.final_url;
                             } else {
                                 eprintln!("webgrab: warn=auto-render-no-gain reason=shorter");
                             }
