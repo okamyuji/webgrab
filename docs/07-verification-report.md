@@ -147,6 +147,7 @@ CIの`test`と`coverage`ジョブは`.github/workflows/ci.yml`で最初から`WE
 - `cargo test --lib --bins --test integration`はunit 189件とintegration 25件がすべてpassし終了コード0
 - `WEBGRAB_E2E=1 cargo test --test render_e2e -- --test-threads=1`は24件がすべてpass（設計10のE16〜E20を含む）
 - `cargo crap --lcov lcov.info --min 30`は、E2Eを含む`cargo llvm-cov`実行後の計測でCRAP値30以上の関数がゼロ件。分割前後の代表値は、`pipeline::run`が循環的複雑度33からCRAP 9.0（分割後の複雑度9）へ、`fetch::fetch`がCRAP 44.3から22.3へ、`fetch::robots_precheck`がCRAP 30.0から5.9へ低下した
+- PR #3のCI（run 35536578396、2026-09-21）では、`test`ジョブがunit 189件、integration 25件、E2E 24件のすべてに合格し、`coverage`ジョブは除外なしで行カバレッジ94.60%（閾値80）を達成した。`check`（fmt・clippy・doclint・SHAピン留め検証）と`security`（gitleaks）も合格
 
 ### ミューテーションテスト
 
