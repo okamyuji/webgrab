@@ -206,13 +206,13 @@ E2Eハーネスだけが読む環境変数を次に示す（バイナリ本体�
 
 ## 7. CI設計（`.github/workflows/ci.yml`）
 
-逸脱の記録: ユーザーのCI慣例は中央`okamyuji/reusable-workflows`の薄い呼び出しだが、中央にrust用workflowが無く、Chrome付きE2Eがこのリポジトリ固有のため、check / test / coverageはリポジトリ内に直接書く。security-scanは慣例どおり中央を呼ぶ。既定ブランチは`master`。runnerは`ubuntu-24.04`に固定し、26.04への移行は同梱Chromeとsandbox挙動を再確認してから行う。
+fmt、clippy、Chromeを使わないテストは中央`okamyuji/reusable-workflows`の`rust-ci.yml@v1`で実行し、security-scanも中央を呼ぶ。Chrome付きE2E（test）とカバレッジ（coverage）、actionのSHA固定を検査するcheckは、このリポジトリ固有のジョブとして直接書く。`rust-ci.yml`は`ubuntu-latest`で動くため、Chromeを使わないテストだけを`test-command`で渡す。既定ブランチは`main`。固有ジョブのrunnerは`ubuntu-24.04`に固定し、26.04への移行は同梱Chromeとsandbox挙動を再確認してから行う。
 
 ```yaml
 name: CI
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
 permissions:
   contents: read
@@ -220,6 +220,10 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
+  ci:
+    uses: okamyuji/reusable-workflows/.github/workflows/rust-ci.yml@v1
+    with:
+      test-command: cargo test --lib --bins --test integration
   check:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -227,15 +231,9 @@ jobs:
       - uses: actions/checkout@<40桁SHA> # v7（実装時に解決）
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@<40桁SHA> # stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@<40桁SHA> # v2
       - run: '! grep -nE "uses: .*@(v[0-9]|stable|cargo-llvm-cov)" .github/workflows/ci.yml | grep -v reusable-workflows'
       - run: |
           test "$(grep -c 'persist-credentials: false' .github/workflows/ci.yml)" -eq "$(grep -c 'uses: actions/checkout@' .github/workflows/ci.yml)"
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
       - run: python3 tools/doclint.py docs/
   test:
     runs-on: ubuntu-24.04
@@ -250,7 +248,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@<40桁SHA> # stable
       - uses: Swatinem/rust-cache@<40桁SHA> # v2
       - run: google-chrome --version
-      - run: cargo test --lib --bins --test integration
       - run: cargo test --test render_e2e -- --test-threads=1
   coverage:
     runs-on: ubuntu-24.04
@@ -276,7 +273,7 @@ jobs:
     uses: okamyuji/reusable-workflows/.github/workflows/security-scan.yml@v1
 ```
 
-`<40桁SHA>`は実装時に各actionの該当タグのコミットSHAへ置換する（YAML内のコメントに元タグを残す。sandbox無効のChromeを走らせるためサプライチェーン面を狭める）。`security-scan.yml@v1`は中央リポジトリの運用方針（タグ張り替えで追随）に従い例外とし、checkジョブのgrepからも除外する。testとcoverageでE2Eを二重実行するのは許容する（coverageは計装ビルドで、testは素のビルドの挙動を見る）。sandboxはCIでは最初から無効化する（使い捨てVMで対象がローカルfixtureのみ。Ubuntu 24.04のuser namespace制限で起動しない事例があるため）。初回CI実行でsandbox有効のまま動くことが観測できれば`WEBGRAB_E2E_NO_SANDBOX`を外し、結果を07-verification-report.mdに記録する。coverageが80を割った場合は`--ignore-filename-regex 'render\.rs'`を戻し、差分をバックログに記録する。
+`<40桁SHA>`は実装時に各actionの該当タグのコミットSHAへ置換する（YAML内のコメントに元タグを残す。sandbox無効のChromeを走らせるためサプライチェーン面を狭める）。`rust-ci.yml@v1`と`security-scan.yml@v1`は中央リポジトリの運用方針（タグ張り替えで追随）に従い例外とし、checkジョブのgrepからも除外する。testとcoverageでE2Eを二重実行するのは許容する（coverageは計装ビルドで、testは素のビルドの挙動を見る）。sandboxはCIでは最初から無効化する（使い捨てVMで対象がローカルfixtureのみ。Ubuntu 24.04のuser namespace制限で起動しない事例があるため）。初回CI実行でsandbox有効のまま動くことが観測できれば`WEBGRAB_E2E_NO_SANDBOX`を外し、結果を07-verification-report.mdに記録する。coverageが80を割った場合は`--ignore-filename-regex 'render\.rs'`を戻し、差分をバックログに記録する。
 
 ## 8. ブラウザ実動作検証（PR作成前）
 
@@ -293,7 +290,7 @@ jobs:
 5. `cargo llvm-cov ... --fail-under-lines 80`が終了コード0。除外なし（§7のコマンドそのまま）で達成するか、`--ignore-filename-regex 'render\.rs'`を戻して達成し差分をバックログに記録するかの二択で、どちらを採ったかを07-verification-report.mdに記録する
 6. §4.2・§4.3で追加する各機構に対応する単体テストまたはE2Eが存在する（`InFlight`・`should_stop`・`is_main_navigation`・`remaining_budget`・`choose_result`・`fallback_reason`・`hint_for`・`visible_text_len`は単体、skip契約は統合テスト、他はE1〜E12）
 7. §8の突合結果（Chromeコールドスタートの実測Lを含み、skip閾値5秒が「L + 2000ms + 1000ms」以上であることを確認。早期終了したか上限到達だったかも記録）が07-verification-report.mdに記録されている
-9. `.github/workflows/ci.yml`の全`uses:`が40桁のコミットSHAで、`actions/checkout`に`persist-credentials: false`がある（checkジョブの`grep`で機械検証）
+9. `.github/workflows/ci.yml`の`uses:`が、中央`okamyuji/reusable-workflows`の参照を除いてすべて40桁のコミットSHAで、`actions/checkout`に`persist-credentials: false`がある（checkジョブの`grep`で機械検証）
 8. PRのCIがすべて緑（CodeRabbitの指摘への対応は人手の完了条件として別途扱う）
 
 ## 10. やらないこと（再掲）
