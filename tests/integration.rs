@@ -6,6 +6,8 @@ use std::net::{TcpListener, TcpStream};
 use std::process::Command;
 use std::thread;
 
+mod common;
+
 /// 最小HTTPサーバ。1リクエストに1レスポンスを返し、指定回数で終了する。
 /// `responder`はパスを受け取り、生のHTTPレスポンス文字列（ヘッダ+ボディ）を返す。
 fn spawn_server<F>(count: usize, responder: F) -> u16
@@ -483,17 +485,21 @@ fn i8_plain_text_body_is_identical_across_raw_and_formats() {
 /// リクエスト全文から`Accept`ヘッダの値を取り出す（大小無視でヘッダ名照合）。
 /// 複数行あれば` || `で連結して返す。既定の`*/*`が置換されず2値送られた場合に、
 /// 期待値との比較が失敗する。
-fn accept_header_value(req: &str) -> Option<String> {
+fn header_value(req: &str, header: &str) -> Option<String> {
     let values: Vec<&str> = req
         .lines()
         .filter_map(|l| {
             let (name, value) = l.split_once(':')?;
             name.trim()
-                .eq_ignore_ascii_case("accept")
+                .eq_ignore_ascii_case(header)
                 .then_some(value.trim())
         })
         .collect();
     (!values.is_empty()).then(|| values.join(" || "))
+}
+
+fn accept_header_value(req: &str) -> Option<String> {
+    header_value(req, "accept")
 }
 
 const G3_ACCEPT: &str = "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8";
@@ -639,4 +645,63 @@ fn plain_text_markdown_escapes_cannot_hide_dangerous_link() {
         body_of(&stdout, false),
         "a [x](unsafe-javascript&colon;alert(1)) b\nc [y](unsafe-&#32;javascript:alert(3)) d\n\n[r]: unsafe-javascript\\:alert(2)\n"
     );
+}
+
+const SENTINEL_BR: &str = "SENTINEL_BR_4d1e";
+
+fn br_article() -> common::Route {
+    common::Route {
+        path: "/br",
+        body: include_bytes!("fixtures/article.html.br").to_vec(),
+        content_type: "text/html; charset=utf-8",
+        headers: vec![("Content-Encoding", "br".to_string())],
+        delay_ms: 0,
+        status: "200 OK",
+    }
+}
+
+#[test]
+fn body_fetch_offers_gzip_but_not_brotli() {
+    use std::sync::{Arc, Mutex};
+
+    let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let seen_srv = Arc::clone(&seen);
+    let port = spawn_server_req(1, move |req, _path| {
+        *seen_srv.lock().unwrap() = header_value(req, "accept-encoding");
+        http_response(ARTICLE, "text/html; charset=utf-8")
+    });
+    let url = format!("http://127.0.0.1:{port}/a");
+    let (code, _stdout, stderr) = run_webgrab(&[&url, "--allow-private", "--no-robots"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+
+    let ae = seen.lock().unwrap().clone().unwrap_or_default();
+    assert!(ae.contains("gzip"), "accept-encoding={ae}");
+    assert!(!ae.contains("br"), "accept-encoding={ae}");
+}
+
+#[test]
+fn brotli_encoded_response_is_rejected_with_exit_4() {
+    let s = common::start(vec![br_article()]);
+    let (code, stdout, stderr) = run_webgrab(&[&s.url("/br"), "--allow-private", "--no-robots"]);
+    assert_eq!(code, 4, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stderr.contains("unsupported content-encoding: br"),
+        "stderr={stderr}"
+    );
+    assert!(!stdout.contains(SENTINEL_BR), "stdout={stdout}");
+}
+
+#[test]
+fn gzip_encoded_response_is_still_decoded() {
+    // 圧縮後は約2.1KiB。展開後の約2MiBで--max-bytesに掛かれば、gzipが展開されている。
+    let s = common::start(vec![common::big_gzip()]);
+    let (code, _stdout, stderr) = run_webgrab(&[
+        &s.url("/big_gzip"),
+        "--allow-private",
+        "--no-robots",
+        "--max-bytes",
+        "1048576",
+    ]);
+    assert_eq!(code, 4, "stderr={stderr}");
+    assert!(stderr.contains("exceeds --max-bytes"), "stderr={stderr}");
 }

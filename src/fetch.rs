@@ -242,6 +242,25 @@ fn check_media_type(content_type: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// reqwestが展開しなかった符号化（br等）が残っていれば`ExitCode::Http`で拒否する。
+/// reqwestは展開したgzip/deflateのContent-Encodingを外すため、残る値は未展開を意味する。
+/// Brotli展開はCVE-2026-111497と同型の欠陥がRust移植版に未修正で残るため無効化している。
+fn check_content_encoding(content_encoding: Option<&[u8]>) -> Result<()> {
+    let Some(enc) = content_encoding.map(<[u8]>::trim_ascii) else {
+        return Ok(());
+    };
+    if !enc.is_empty() && !enc.eq_ignore_ascii_case(b"identity") {
+        return Err(WebgrabError::new(
+            ExitCode::Http,
+            format!(
+                "unsupported content-encoding: {}",
+                String::from_utf8_lossy(enc)
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// 静的取得を手動リダイレクト追従で行う（各ホップでnetguard再適用）。
 pub async fn fetch(url_str: &str, opts: &FetchOptions) -> Result<Fetched> {
     let mut current = Url::parse(url_str).map_err(|e| {
@@ -305,6 +324,11 @@ pub async fn fetch(url_str: &str, opts: &FetchOptions) -> Result<Fetched> {
             .map(|s| s.to_string());
 
         check_media_type(content_type.as_deref())?;
+        check_content_encoding(
+            resp.headers()
+                .get(reqwest::header::CONTENT_ENCODING)
+                .map(|v| v.as_bytes()),
+        )?;
 
         // ストリーミング読み込みで max_bytes を展開後サイズに適用
         let body = read_capped(resp, opts.max_bytes).await?;
@@ -382,6 +406,26 @@ mod tests {
         let e = check_media_type(Some("application/pdf; q=1")).unwrap_err();
         assert_eq!(e.code, ExitCode::Http);
         assert_eq!(e.message, "unsupported content-type: application/pdf");
+    }
+
+    #[test]
+    fn check_content_encoding_rejects_undecoded_encodings_with_exit_4() {
+        assert!(check_content_encoding(None).is_ok());
+        assert!(check_content_encoding(Some(b"identity")).is_ok());
+        assert!(check_content_encoding(Some(b" Identity ")).is_ok());
+        assert!(check_content_encoding(Some(b"")).is_ok()); // RFC 9110の空リスト
+        assert!(check_content_encoding(Some(b"  ")).is_ok());
+        for (enc, shown) in [
+            (&b"br"[..], "br"),
+            (b"BR", "BR"),
+            (b" gzip, br ", "gzip, br"),
+            (b"zstd", "zstd"),
+            (b"identit\xff", "identit\u{fffd}"),
+        ] {
+            let e = check_content_encoding(Some(enc)).unwrap_err();
+            assert_eq!(e.code, ExitCode::Http, "enc={shown}");
+            assert_eq!(e.message, format!("unsupported content-encoding: {shown}"));
+        }
     }
 
     #[test]
