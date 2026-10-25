@@ -468,6 +468,19 @@ mod tests {
         assert_eq!(e.message, "unsupported scheme: ftp");
     }
 
+    // fetchは各ホップのaddrをresolve_urlからしか得ないため、これがリダイレクト先の内部アドレス拒否を担う。
+    #[tokio::test]
+    async fn resolve_url_rejects_internal_address_without_allow_private() {
+        let url = Url::parse("http://169.254.169.254/latest/meta-data/").unwrap();
+        let e = resolve_url(&url, &opts()).await.unwrap_err();
+        assert_eq!(e.code, ExitCode::Netguard);
+        assert!(
+            e.detail
+                .unwrap_or_default()
+                .contains("resolved=169.254.169.254"),
+        );
+    }
+
     #[tokio::test]
     async fn robots_precheck_rejects_invalid_url_with_usage() {
         let e = robots_precheck("not a url", &opts()).await.unwrap_err();
