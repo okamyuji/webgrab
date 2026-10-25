@@ -251,10 +251,8 @@ fn check_media_type(content_type: Option<&str>) -> Result<()> {
 /// reqwestが展開しなかった符号化（br等）が残っていれば`ExitCode::Http`で拒否する。
 /// reqwestは展開したgzip/deflateのContent-Encodingを外すため、残る値は未展開を意味する。
 /// Brotli展開はCVE-2026-111497と同型の欠陥がRust移植版に未修正で残るため無効化している。
-fn check_content_encoding(content_encoding: Option<&[u8]>) -> Result<()> {
-    let Some(enc) = content_encoding.map(<[u8]>::trim_ascii) else {
-        return Ok(());
-    };
+fn check_content_encoding(content_encoding: &[u8]) -> Result<()> {
+    let enc = content_encoding.trim_ascii();
     if !enc.is_empty() && !enc.eq_ignore_ascii_case(b"identity") {
         return Err(WebgrabError::new(
             ExitCode::Http,
@@ -294,11 +292,10 @@ fn accept_response(resp: &reqwest::Response) -> Result<Option<String>> {
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
     check_media_type(content_type.as_deref())?;
-    check_content_encoding(
-        resp.headers()
-            .get(reqwest::header::CONTENT_ENCODING)
-            .map(|v| v.as_bytes()),
-    )?;
+    // getは同名ヘッダの先頭値しか返さないため、`identity`の後ろの`br`を見落とさないよう全値を検査する。
+    for enc in resp.headers().get_all(reqwest::header::CONTENT_ENCODING) {
+        check_content_encoding(enc.as_bytes())?;
+    }
     Ok(content_type)
 }
 
@@ -409,11 +406,10 @@ mod tests {
 
     #[test]
     fn check_content_encoding_rejects_undecoded_encodings_with_exit_4() {
-        assert!(check_content_encoding(None).is_ok());
-        assert!(check_content_encoding(Some(b"identity")).is_ok());
-        assert!(check_content_encoding(Some(b" Identity ")).is_ok());
-        assert!(check_content_encoding(Some(b"")).is_ok()); // RFC 9110の空リスト
-        assert!(check_content_encoding(Some(b"  ")).is_ok());
+        assert!(check_content_encoding(b"identity").is_ok());
+        assert!(check_content_encoding(b" Identity ").is_ok());
+        assert!(check_content_encoding(b"").is_ok()); // RFC 9110の空リスト
+        assert!(check_content_encoding(b"  ").is_ok());
         for (enc, shown) in [
             (&b"br"[..], "br"),
             (b"BR", "BR"),
@@ -421,7 +417,7 @@ mod tests {
             (b"zstd", "zstd"),
             (b"identit\xff", "identit\u{fffd}"),
         ] {
-            let e = check_content_encoding(Some(enc)).unwrap_err();
+            let e = check_content_encoding(enc).unwrap_err();
             assert_eq!(e.code, ExitCode::Http, "enc={shown}");
             assert_eq!(e.message, format!("unsupported content-encoding: {shown}"));
         }

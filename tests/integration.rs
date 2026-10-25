@@ -734,3 +734,19 @@ fn redirect_without_location_fails_with_network_error() {
         "stderr={stderr}"
     );
 }
+
+#[test]
+fn brotli_after_identity_in_repeated_headers_is_rejected_with_exit_4() {
+    let mut route = br_article();
+    route.headers = vec![
+        ("Content-Encoding", "identity".to_string()),
+        ("Content-Encoding", "br".to_string()),
+    ];
+    let s = common::start(vec![route]);
+    let (code, stdout, stderr) = run_webgrab(&[&s.url("/br"), "--allow-private", "--no-robots"]);
+    assert_eq!(code, 4, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stderr.contains("unsupported content-encoding: br"),
+        "stderr={stderr}"
+    );
+}
