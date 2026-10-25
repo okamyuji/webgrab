@@ -705,3 +705,32 @@ fn gzip_encoded_response_is_still_decoded() {
     assert_eq!(code, 4, "stderr={stderr}");
     assert!(stderr.contains("exceeds --max-bytes"), "stderr={stderr}");
 }
+
+#[test]
+fn redirect_with_unparsable_location_fails_with_network_error() {
+    let port = spawn_server(1, |_path| {
+        "HTTP/1.1 302 Found\r\nLocation: http://[bad\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            .into()
+    });
+    let url = format!("http://127.0.0.1:{port}/a");
+    let (code, _stdout, stderr) = run_webgrab(&[&url, "--allow-private", "--no-robots"]);
+    assert_eq!(code, 3, "stderr={stderr}");
+    assert!(
+        stderr.contains("invalid redirect location"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn redirect_without_location_fails_with_network_error() {
+    let port = spawn_server(1, |_path| {
+        "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+    });
+    let url = format!("http://127.0.0.1:{port}/a");
+    let (code, _stdout, stderr) = run_webgrab(&[&url, "--allow-private", "--no-robots"]);
+    assert_eq!(code, 3, "stderr={stderr}");
+    assert!(
+        stderr.contains("redirect without location"),
+        "stderr={stderr}"
+    );
+}

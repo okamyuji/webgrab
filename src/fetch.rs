@@ -192,6 +192,12 @@ pub async fn robots_precheck(url_str: &str, opts: &FetchOptions) -> Result<bool>
     let url = Url::parse(url_str).map_err(|e| {
         WebgrabError::new(ExitCode::Usage, "invalid URL").with_detail(e.to_string())
     })?;
+    let (_, addr) = resolve_url(&url, opts).await?;
+    robots_allowed(&url, addr, opts).await
+}
+
+/// URLのスキームを検査し、ホストを解決してnetguardを通したSocketAddrとホスト名を返す。
+async fn resolve_url(url: &Url, opts: &FetchOptions) -> Result<(String, SocketAddr)> {
     if !netguard::is_allowed_scheme(url.scheme()) {
         return Err(WebgrabError::new(
             ExitCode::Usage,
@@ -204,7 +210,7 @@ pub async fn robots_precheck(url_str: &str, opts: &FetchOptions) -> Result<bool>
         .to_string();
     let port = url.port_or_known_default().unwrap_or(80);
     let addr = resolve_checked(&host, port, opts.allow_private, opts.timeout).await?;
-    robots_allowed(&url, addr, opts).await
+    Ok((host, addr))
 }
 
 /// 本文取得用クライアントを構築する。`Accept`を§4.3の値に固定する（G3）。
@@ -261,25 +267,49 @@ fn check_content_encoding(content_encoding: Option<&[u8]>) -> Result<()> {
     Ok(())
 }
 
+/// 3xx応答のLocationを現在URL基準で解決する。
+fn redirect_target(resp: &reqwest::Response, current: &Url) -> Result<Url> {
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| WebgrabError::new(ExitCode::Network, "redirect without location"))?;
+    current.join(location).map_err(|e| {
+        WebgrabError::new(ExitCode::Network, "invalid redirect location").with_detail(e.to_string())
+    })
+}
+
+/// 非3xx応答を本文読み込みの前に検査し、Content-Typeを返す。
+fn accept_response(resp: &reqwest::Response) -> Result<Option<String>> {
+    let status = resp.status();
+    if status.is_client_error() || status.is_server_error() {
+        return Err(WebgrabError::new(
+            ExitCode::Http,
+            http_error_message(status.as_u16()),
+        ));
+    }
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    check_media_type(content_type.as_deref())?;
+    check_content_encoding(
+        resp.headers()
+            .get(reqwest::header::CONTENT_ENCODING)
+            .map(|v| v.as_bytes()),
+    )?;
+    Ok(content_type)
+}
+
 /// 静的取得を手動リダイレクト追従で行う（各ホップでnetguard再適用）。
 pub async fn fetch(url_str: &str, opts: &FetchOptions) -> Result<Fetched> {
     let mut current = Url::parse(url_str).map_err(|e| {
         WebgrabError::new(ExitCode::Usage, "invalid URL").with_detail(e.to_string())
     })?;
 
-    for hop in 0..MAX_HOPS {
-        if !netguard::is_allowed_scheme(current.scheme()) {
-            return Err(WebgrabError::new(
-                ExitCode::Usage,
-                format!("unsupported scheme: {}", current.scheme()),
-            ));
-        }
-        let host = current
-            .host_str()
-            .ok_or_else(|| WebgrabError::new(ExitCode::Usage, "URL has no host"))?
-            .to_string();
-        let port = current.port_or_known_default().unwrap_or(80);
-        let addr = resolve_checked(&host, port, opts.allow_private, opts.timeout).await?;
+    for _ in 0..MAX_HOPS {
+        let (host, addr) = resolve_url(&current, opts).await?;
 
         // robots確認（各ホップの着地ホストに対して、解決済みaddrを再利用）
         if opts.check_robots && !robots_allowed(&current, addr, opts).await? {
@@ -293,42 +323,11 @@ pub async fn fetch(url_str: &str, opts: &FetchOptions) -> Result<Fetched> {
             WebgrabError::new(ExitCode::Network, "request failed").with_detail(e.to_string())
         })?;
 
-        let status = resp.status();
-        if status.is_redirection() {
-            let location = resp
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| WebgrabError::new(ExitCode::Network, "redirect without location"))?;
-            current = current.join(location).map_err(|e| {
-                WebgrabError::new(ExitCode::Network, "invalid redirect location")
-                    .with_detail(e.to_string())
-            })?;
-            if hop == MAX_HOPS - 1 {
-                return Err(WebgrabError::new(ExitCode::Network, "too many redirects"));
-            }
+        if resp.status().is_redirection() {
+            current = redirect_target(&resp, &current)?;
             continue;
         }
-
-        if status.is_client_error() || status.is_server_error() {
-            return Err(WebgrabError::new(
-                ExitCode::Http,
-                http_error_message(status.as_u16()),
-            ));
-        }
-
-        let content_type = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        check_media_type(content_type.as_deref())?;
-        check_content_encoding(
-            resp.headers()
-                .get(reqwest::header::CONTENT_ENCODING)
-                .map(|v| v.as_bytes()),
-        )?;
+        let content_type = accept_response(&resp)?;
 
         // ストリーミング読み込みで max_bytes を展開後サイズに適用
         let body = read_capped(resp, opts.max_bytes).await?;
@@ -449,6 +448,31 @@ mod tests {
         assert_eq!(http_error_message(404), "HTTP 404 retryable=false");
         assert_eq!(http_error_message(429), "HTTP 429 retryable=true");
         assert_eq!(http_error_message(500), "HTTP 500 retryable=true");
+    }
+
+    fn opts() -> FetchOptions {
+        FetchOptions {
+            user_agent: "webgrab-test".into(),
+            timeout: Duration::from_secs(5),
+            max_bytes: 1024,
+            allow_private: false,
+            check_robots: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_url_rejects_unsupported_scheme_with_usage() {
+        let url = Url::parse("ftp://example.com/x").unwrap();
+        let e = resolve_url(&url, &opts()).await.unwrap_err();
+        assert_eq!(e.code, ExitCode::Usage);
+        assert_eq!(e.message, "unsupported scheme: ftp");
+    }
+
+    #[tokio::test]
+    async fn robots_precheck_rejects_invalid_url_with_usage() {
+        let e = robots_precheck("not a url", &opts()).await.unwrap_err();
+        assert_eq!(e.code, ExitCode::Usage);
+        assert_eq!(e.message, "invalid URL");
     }
 
     #[tokio::test]
