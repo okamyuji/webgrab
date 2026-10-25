@@ -11,7 +11,7 @@ dom_smoothie = "0.18.0"
 encoding_rs = "0.8.35"
 futures = "0.3.32"
 htmd = "0.5.4"
-reqwest = { version = "0.13.4", features = ["gzip", "brotli", "deflate"] }
+reqwest = { version = "0.13.4", features = ["gzip", "deflate"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tempfile = "3.27.0"
