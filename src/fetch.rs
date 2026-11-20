@@ -249,7 +249,7 @@ fn check_media_type(content_type: Option<&str>) -> Result<()> {
 }
 
 /// reqwestが展開しなかった符号化（compress等）が残っていれば`ExitCode::Http`で拒否する。
-/// reqwestは展開したgzip/deflate/br/zstdのContent-Encodingを外すため、残る値は未展開を意味する。
+/// reqwestは展開したgzip/deflate/brのContent-Encodingを外すため、残る値は未展開を意味する。
 fn check_content_encoding(content_encoding: &[u8]) -> Result<()> {
     let enc = content_encoding.trim_ascii();
     if !enc.is_empty() && !enc.eq_ignore_ascii_case(b"identity") {
@@ -414,6 +414,7 @@ mod tests {
             (b"COMPRESS", "COMPRESS"),
             (b" gzip, compress ", "gzip, compress"),
             (b"x-unknown", "x-unknown"),
+            (b"zstd", "zstd"),
             (b"identit\xff", "identit\u{fffd}"),
         ] {
             let e = check_content_encoding(enc).unwrap_err();

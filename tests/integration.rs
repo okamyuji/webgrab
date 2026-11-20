@@ -670,7 +670,7 @@ fn zstd_article() -> common::Route {
 }
 
 #[test]
-fn body_fetch_offers_gzip_brotli_and_zstd() {
+fn body_fetch_offers_gzip_and_brotli_but_not_zstd() {
     use std::sync::{Arc, Mutex};
 
     let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -684,9 +684,10 @@ fn body_fetch_offers_gzip_brotli_and_zstd() {
     assert_eq!(code, 0, "stderr={stderr}");
 
     let ae = seen.lock().unwrap().clone().unwrap_or_default();
-    for enc in ["gzip", "br", "zstd"] {
+    for enc in ["gzip", "br"] {
         assert!(ae.contains(enc), "accept-encoding={ae}");
     }
+    assert!(!ae.contains("zstd"), "accept-encoding={ae}");
 }
 
 #[test]
@@ -698,11 +699,16 @@ fn brotli_encoded_response_is_decoded() {
 }
 
 #[test]
-fn zstd_encoded_response_is_decoded() {
+fn zstd_encoded_response_is_rejected_with_exit_4() {
+    // zstdの展開はCのlibzstdに依存するため有効にしていない。
     let s = common::start(vec![zstd_article()]);
     let (code, stdout, stderr) = run_webgrab(&[&s.url("/zstd"), "--allow-private", "--no-robots"]);
-    assert_eq!(code, 0, "stderr={stderr} stdout={stdout}");
-    assert!(stdout.contains(SENTINEL_ZSTD), "stdout={stdout}");
+    assert_eq!(code, 4, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stderr.contains("unsupported content-encoding: zstd"),
+        "stderr={stderr}"
+    );
+    assert!(!stdout.contains(SENTINEL_ZSTD), "stdout={stdout}");
 }
 
 #[test]
@@ -721,30 +727,22 @@ fn gzip_encoded_response_is_still_decoded() {
 }
 
 #[test]
-fn max_bytes_applies_to_decoded_size_for_brotli_and_zstd() {
+fn max_bytes_applies_to_decoded_size_for_brotli() {
     // 圧縮後は200バイト未満。展開後の約2MiBで--max-bytesに掛かれば、展開後の大きさで判定している。
-    let s = common::start(vec![
-        encoded("/big_br", include_bytes!("fixtures/big_br.html.br"), "br"),
-        encoded(
-            "/big_zstd",
-            include_bytes!("fixtures/big_zstd.html.zst"),
-            "zstd",
-        ),
+    let s = common::start(vec![encoded(
+        "/big_br",
+        include_bytes!("fixtures/big_br.html.br"),
+        "br",
+    )]);
+    let (code, _stdout, stderr) = run_webgrab(&[
+        &s.url("/big_br"),
+        "--allow-private",
+        "--no-robots",
+        "--max-bytes",
+        "1048576",
     ]);
-    for path in ["/big_br", "/big_zstd"] {
-        let (code, _stdout, stderr) = run_webgrab(&[
-            &s.url(path),
-            "--allow-private",
-            "--no-robots",
-            "--max-bytes",
-            "1048576",
-        ]);
-        assert_eq!(code, 4, "path={path} stderr={stderr}");
-        assert!(
-            stderr.contains("exceeds --max-bytes"),
-            "path={path} stderr={stderr}"
-        );
-    }
+    assert_eq!(code, 4, "stderr={stderr}");
+    assert!(stderr.contains("exceeds --max-bytes"), "stderr={stderr}");
 }
 
 fn br_robots(body: &[u8]) -> common::Route {
