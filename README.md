@@ -109,7 +109,7 @@ scripts/security-verify/run.sh
 
 ## 設計と品質
 
-設計書・調査・レビュー記録は [docs/](docs/) にあります。設計は敵対的レビュー3ラウンドを経てv1.2でsealされ、その後の実装敵対的レビューでSSRF・出力インジェクション・DoSの修正とOWASP対応（A10/A03）を追加しています（記録は [docs/_quality/IMPROVEMENT_BACKLOG.md](docs/_quality/IMPROVEMENT_BACKLOG.md)）。ユニット・統合あわせて111件のテストが通ります（`cargo test`）。
+設計書と調査記録は [docs/](docs/) にあります。テストは `cargo test` で実行します。
 
 ## ライセンス
 
