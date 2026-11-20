@@ -440,6 +440,33 @@ fn spawn_plain_server(count: usize, body: &str, content_type: &str) -> u16 {
     })
 }
 
+#[test]
+fn raw_conversion_of_too_deep_nesting_exits_4_instead_of_aborting() {
+    let n = 20_000;
+    let html = format!(
+        "<html><body>{}x{}</body></html>",
+        "<div>".repeat(n),
+        "</div>".repeat(n)
+    );
+    let port = spawn_plain_server(2, &html, "text/html; charset=utf-8");
+    let url = format!("http://127.0.0.1:{port}/deep");
+    for format in ["markdown", "text"] {
+        let (code, _stdout, stderr) = run_webgrab(&[
+            &url,
+            "--allow-private",
+            "--no-robots",
+            "--raw",
+            "--format",
+            format,
+        ]);
+        assert_eq!(code, 4, "format={format} stderr={stderr}");
+        assert!(
+            stderr.contains("too deeply nested for conversion"),
+            "format={format} stderr={stderr}"
+        );
+    }
+}
+
 /// stdoutからwebgrabが付けた部分（ヘッダと出力末尾の改行）を除いた本文を取り出す。
 fn body_of(stdout: &str, markdown: bool) -> String {
     let s = stdout.strip_suffix('\n').unwrap_or(stdout);

@@ -5,7 +5,7 @@ use crate::error::{ExitCode, Result, WebgrabError};
 /// 要素ネスト深さの上限。dom_smoothieのスコアリングはネスト深さに対し
 /// ほぼ3乗で増大し、数千段で実質ハングする。実ページはまず数百段を超えないため、
 /// この上限を超える入力は抽出前に打ち切りDoSを防ぐ。
-const MAX_NESTING_DEPTH: usize = 1000;
+pub(crate) const MAX_NESTING_DEPTH: usize = 1000;
 
 /// 抽出結果。
 #[derive(Debug, Default)]
@@ -18,53 +18,76 @@ pub struct Extracted {
 
 /// HTMLのタグ開閉を線形走査し、要素ネストの最大深さが `limit` を超えるかを返す。
 /// void要素・自己終了タグ・コメント/doctype/処理命令は深さに数えない。
-fn exceeds_nesting_depth(html: &str, limit: usize) -> bool {
+pub(crate) fn exceeds_nesting_depth(html: &str, limit: usize) -> bool {
+    let bytes = html.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        let Some((step, end)) = scan_tag(html, i) else {
+            i += 1;
+            continue;
+        };
+        match step {
+            DepthStep::Close => depth = depth.saturating_sub(1),
+            DepthStep::Open => {
+                depth += 1;
+                if depth > limit {
+                    return true;
+                }
+            }
+            DepthStep::Neutral => {}
+        }
+        i = end;
+    }
+    false
+}
+
+/// タグが深さに与える影響。
+enum DepthStep {
+    Open,
+    Close,
+    Neutral,
+}
+
+/// `i`がタグの開始`<`なら、深さへの影響と次の走査位置（タグを閉じる`>`の直後）を返す。
+/// コメント/doctype/処理命令と、`<`の後がタグ名でないリテラルの`<`は`None`。
+fn scan_tag(html: &str, i: usize) -> Option<(DepthStep, usize)> {
     const VOID: &[&str] = &[
         "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
         "source", "track", "wbr",
     ];
     let bytes = html.as_bytes();
-    let mut depth = 0usize;
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'<' {
-            i += 1;
-            continue;
-        }
-        // コメント/doctype/処理命令はスキップ
-        if bytes.get(i + 1) == Some(&b'!') || bytes.get(i + 1) == Some(&b'?') {
-            i += 1;
-            continue;
-        }
-        let closing = bytes.get(i + 1) == Some(&b'/');
-        let name_start = if closing { i + 2 } else { i + 1 };
-        // タグ名を取得
-        let mut j = name_start;
-        while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'-') {
-            j += 1;
-        }
-        if j == name_start {
-            i += 1; // '<' の後がタグ名でない（`<` リテラル等）
-            continue;
-        }
-        let name = html[name_start..j].to_ascii_lowercase();
-        // タグ終端 '>' を探し、自己終了 '/>' か判定
-        let mut k = j;
-        while k < bytes.len() && bytes[k] != b'>' {
-            k += 1;
-        }
-        let self_closing = k > 0 && bytes.get(k.wrapping_sub(1)) == Some(&b'/');
-        if closing {
-            depth = depth.saturating_sub(1);
-        } else if !self_closing && !VOID.contains(&name.as_str()) {
-            depth += 1;
-            if depth > limit {
-                return true;
-            }
-        }
-        i = if k < bytes.len() { k + 1 } else { k };
+    if bytes[i] != b'<' || matches!(bytes.get(i + 1), Some(b'!' | b'?')) {
+        return None;
     }
-    false
+    let closing = bytes.get(i + 1) == Some(&b'/');
+    let name_start = if closing { i + 2 } else { i + 1 };
+    let name_len = bytes[name_start.min(bytes.len())..]
+        .iter()
+        .take_while(|b| b.is_ascii_alphanumeric() || **b == b'-')
+        .count();
+    if name_len == 0 {
+        return None;
+    }
+    let j = name_start + name_len;
+    let k = bytes[j..]
+        .iter()
+        .position(|&b| b == b'>')
+        .map_or(bytes.len(), |p| j + p);
+    // `>`の直後から再開するので、各バイトは1度しか走査せず線形に収まる。
+    // `>`が無いときkは末尾で、k + 1は走査を終える位置になる。
+    let end = k + 1;
+    if closing {
+        return Some((DepthStep::Close, end));
+    }
+    let self_closing = bytes.get(k.wrapping_sub(1)) == Some(&b'/');
+    let name = html[name_start..j].to_ascii_lowercase();
+    let step = if self_closing || VOID.contains(&name.as_str()) {
+        DepthStep::Neutral
+    } else {
+        DepthStep::Open
+    };
+    Some((step, end))
 }
 
 /// HTMLから本文・title・公開日時を抽出する。
@@ -113,6 +136,44 @@ pub fn extract(html: &str, base_url: &str) -> Result<Extracted> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nesting_depth_ignores_text_comments_and_literal_lt() {
+        assert!(!exceeds_nesting_depth("abc", 0));
+        assert!(!exceeds_nesting_depth("<!DOCTYPE html><?xml?>a < b", 0));
+    }
+
+    #[test]
+    fn nesting_depth_balances_open_and_close_tags() {
+        assert!(!exceeds_nesting_depth("<p></p><p></p>", 1));
+        assert!(!exceeds_nesting_depth(
+            r#"<p class="a"></p><p id="b"></p>"#,
+            1
+        ));
+        assert!(exceeds_nesting_depth("x<p><p>", 1));
+        assert!(exceeds_nesting_depth(r#"x<p class="a"><div id="b">"#, 1));
+    }
+
+    #[test]
+    fn nesting_depth_skips_void_and_self_closing_tags() {
+        assert!(!exceeds_nesting_depth(
+            r#"<p/><br><BR><img src="a"><hr/>"#,
+            0
+        ));
+        assert!(exceeds_nesting_depth("<my-el>", 0));
+    }
+
+    #[test]
+    fn nesting_depth_skips_tags_inside_attribute_values() {
+        assert!(!exceeds_nesting_depth(r#"<p title="<b x">"#, 1));
+        assert!(!exceeds_nesting_depth(r#"<p a="x"/>"#, 0));
+    }
+
+    #[test]
+    fn nesting_depth_counts_unterminated_last_tag() {
+        assert!(exceeds_nesting_depth("x<p><div", 1));
+        assert!(!exceeds_nesting_depth("x<p", 1));
+    }
 
     #[test]
     fn deeply_nested_html_is_rejected_fast() {
