@@ -234,7 +234,7 @@ JSONエンベロープとfrontmatterに`render_status`（`static`/`rendered`/`fa
 
 ## 10. やらないこと（再掲）
 
-検索統合、クローリング、キャッシュ、並列複数URL、crates.io公開。非HTML形式はtext/plain（素通し）のみ対応し、PDF等それ以外の形式は対象外のままとする。これらは必要が生じた時点で別バージョンとして起案する。
+検索統合、クローリング、キャッシュ、並列複数URL、crates.io公開。非HTML形式はtext/plain（素通し）のみ対応し、PDF等それ以外の形式は対象外のままとする（PDFを見送った理由は[ADR-0001](adr/0001-pdf-support-deferred.md)）。これらは必要が生じた時点で別バージョンとして起案する。
 
 ## 11. 非信頼データに関する注記
 
