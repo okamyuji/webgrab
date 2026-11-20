@@ -248,9 +248,8 @@ fn check_media_type(content_type: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// reqwestが展開しなかった符号化（br等）が残っていれば`ExitCode::Http`で拒否する。
-/// reqwestは展開したgzip/deflateのContent-Encodingを外すため、残る値は未展開を意味する。
-/// Brotli展開はCVE-2026-111497と同型の欠陥がRust移植版に未修正で残るため無効化している。
+/// reqwestが展開しなかった符号化（compress等）が残っていれば`ExitCode::Http`で拒否する。
+/// reqwestは展開したgzip/deflate/br/zstdのContent-Encodingを外すため、残る値は未展開を意味する。
 fn check_content_encoding(content_encoding: &[u8]) -> Result<()> {
     let enc = content_encoding.trim_ascii();
     if !enc.is_empty() && !enc.eq_ignore_ascii_case(b"identity") {
@@ -411,10 +410,10 @@ mod tests {
         assert!(check_content_encoding(b"").is_ok()); // RFC 9110の空リスト
         assert!(check_content_encoding(b"  ").is_ok());
         for (enc, shown) in [
-            (&b"br"[..], "br"),
-            (b"BR", "BR"),
-            (b" gzip, br ", "gzip, br"),
-            (b"zstd", "zstd"),
+            (&b"compress"[..], "compress"),
+            (b"COMPRESS", "COMPRESS"),
+            (b" gzip, compress ", "gzip, compress"),
+            (b"x-unknown", "x-unknown"),
             (b"identit\xff", "identit\u{fffd}"),
         ] {
             let e = check_content_encoding(enc).unwrap_err();
