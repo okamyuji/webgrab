@@ -3,3 +3,4 @@
 .code-review-graph/
 /lcov.info
 mutants.out*/
+/.claude/worktrees/
