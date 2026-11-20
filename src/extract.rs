@@ -16,78 +16,28 @@ pub struct Extracted {
     pub content_html: String,
 }
 
-/// HTMLのタグ開閉を線形走査し、要素ネストの最大深さが `limit` を超えるかを返す。
-/// void要素・自己終了タグ・コメント/doctype/処理命令は深さに数えない。
+/// HTML5パーサーが作る要素の木で、入れ子の最大深さが`limit`を超えるかを返す。
+/// 字句で数えると`<div/>`や対応の無い閉じタグのように開いたまま残る形を取り逃がすため、
+/// 変換や抽出と同じ解釈の木を数える。木は再帰せずスタックでたどる。
 pub(crate) fn exceeds_nesting_depth(html: &str, limit: usize) -> bool {
-    let bytes = html.as_bytes();
-    let mut depth = 0usize;
-    let mut i = 0;
-    while i < bytes.len() {
-        let Some((step, end)) = scan_tag(html, i) else {
-            i += 1;
-            continue;
-        };
-        match step {
-            DepthStep::Close => depth = depth.saturating_sub(1),
-            DepthStep::Open => {
-                depth += 1;
-                if depth > limit {
-                    return true;
-                }
-            }
-            DepthStep::Neutral => {}
+    let doc = dom_query::Document::from(html);
+    let mut stack: Vec<_> = doc
+        .root()
+        .element_children()
+        .into_iter()
+        .map(|n| (n, 1))
+        .collect();
+    while let Some((node, depth)) = stack.pop() {
+        if depth > limit {
+            return true;
         }
-        i = end;
+        let mut child = node.first_element_child();
+        while let Some(c) = child {
+            child = c.next_element_sibling();
+            stack.push((c, depth + 1));
+        }
     }
     false
-}
-
-/// タグが深さに与える影響。
-enum DepthStep {
-    Open,
-    Close,
-    Neutral,
-}
-
-/// `i`がタグの開始`<`なら、深さへの影響と次の走査位置（タグを閉じる`>`の直後）を返す。
-/// コメント/doctype/処理命令と、`<`の後がタグ名でないリテラルの`<`は`None`。
-fn scan_tag(html: &str, i: usize) -> Option<(DepthStep, usize)> {
-    const VOID: &[&str] = &[
-        "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
-        "source", "track", "wbr",
-    ];
-    let bytes = html.as_bytes();
-    if bytes[i] != b'<' || matches!(bytes.get(i + 1), Some(b'!' | b'?')) {
-        return None;
-    }
-    let closing = bytes.get(i + 1) == Some(&b'/');
-    let name_start = if closing { i + 2 } else { i + 1 };
-    let name_len = bytes[name_start.min(bytes.len())..]
-        .iter()
-        .take_while(|b| b.is_ascii_alphanumeric() || **b == b'-')
-        .count();
-    if name_len == 0 {
-        return None;
-    }
-    let j = name_start + name_len;
-    let k = bytes[j..]
-        .iter()
-        .position(|&b| b == b'>')
-        .map_or(bytes.len(), |p| j + p);
-    // `>`の直後から再開するので、各バイトは1度しか走査せず線形に収まる。
-    // `>`が無いときkは末尾で、k + 1は走査を終える位置になる。
-    let end = k + 1;
-    if closing {
-        return Some((DepthStep::Close, end));
-    }
-    let self_closing = bytes.get(k.wrapping_sub(1)) == Some(&b'/');
-    let name = html[name_start..j].to_ascii_lowercase();
-    let step = if self_closing || VOID.contains(&name.as_str()) {
-        DepthStep::Neutral
-    } else {
-        DepthStep::Open
-    };
-    Some((step, end))
 }
 
 /// HTMLから本文・title・公開日時を抽出する。
@@ -137,48 +87,50 @@ pub fn extract(html: &str, base_url: &str) -> Result<Extracted> {
 mod tests {
     use super::*;
 
+    // 深さはパーサーが作る木で数える。文書には常にhtmlとbodyがあり、それだけで深さ2になる。
     #[test]
-    fn nesting_depth_ignores_text_comments_and_literal_lt() {
-        assert!(!exceeds_nesting_depth("abc", 0));
-        assert!(!exceeds_nesting_depth("<!DOCTYPE html><?xml?>a < b", 0));
+    fn nesting_depth_counts_html_and_body() {
+        assert!(!exceeds_nesting_depth("abc", 2));
+        assert!(exceeds_nesting_depth("abc", 1));
+        assert!(!exceeds_nesting_depth("<!DOCTYPE html><?xml?>a < b <1", 2));
     }
 
     #[test]
-    fn nesting_depth_balances_open_and_close_tags() {
-        assert!(!exceeds_nesting_depth("<p></p><p></p>", 1));
+    fn nesting_depth_follows_open_and_close_tags() {
         assert!(!exceeds_nesting_depth(
             r#"<p class="a"></p><p id="b"></p>"#,
-            1
+            3
         ));
-        assert!(exceeds_nesting_depth("x<p><p>", 1));
-        assert!(exceeds_nesting_depth(r#"x<p class="a"><div id="b">"#, 1));
+        assert!(exceeds_nesting_depth("<div><div></div></div>", 3));
+        assert!(!exceeds_nesting_depth("<div><div></div></div>", 4));
     }
 
     #[test]
-    fn nesting_depth_skips_void_and_self_closing_tags() {
+    fn nesting_depth_does_not_count_void_elements() {
         assert!(!exceeds_nesting_depth(
-            r#"<p/><br><BR><img src="a"><hr/>"#,
-            0
+            &r#"<br><BR><img src="a"><hr/>"#.repeat(50),
+            3
         ));
-        assert!(exceeds_nesting_depth("<my-el>", 0));
     }
 
     #[test]
-    fn nesting_depth_skips_tags_inside_attribute_values() {
-        assert!(!exceeds_nesting_depth(r#"<p title="<b x">"#, 1));
-        assert!(!exceeds_nesting_depth(r#"<p a="x"/>"#, 0));
+    fn nesting_depth_does_not_count_implicitly_closed_list_items() {
+        let list = format!("<ul>{}</ul>", "<li>item".repeat(2000));
+        assert!(!exceeds_nesting_depth(&list, 4));
     }
 
     #[test]
-    fn nesting_depth_counts_unterminated_last_tag() {
-        assert!(exceeds_nesting_depth("x<p><div", 1));
-        assert!(!exceeds_nesting_depth("x<p", 1));
+    fn nesting_depth_counts_forms_the_parser_keeps_open() {
+        // HTML5では非void要素の`/>`、対応の無い閉じタグ、引用符内の`/>`は要素を閉じない。
+        for unit in ["<div/>", "<span/>", "<div></i>", r#"<div a="/>">"#] {
+            assert!(exceeds_nesting_depth(&unit.repeat(50), 40), "{unit}");
+        }
     }
 
     #[test]
     fn deeply_nested_html_is_rejected_fast() {
         // 深いネストはdom_smoothieのスコアリングが3乗的に膨張しハングする。
-        // 抽出前に線形の深さガードで打ち切り、DoSを防ぐ（回帰ガード）。
+        // 抽出前に深さの判定で打ち切り、DoSを防ぐ（回帰ガード）。
         let deep = format!("{}x{}", "<div>".repeat(5000), "</div>".repeat(5000));
         let e = extract(&deep, "https://example.com");
         assert!(e.is_err(), "深いネストが拒否されずに通過した");

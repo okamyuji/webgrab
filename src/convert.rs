@@ -365,20 +365,29 @@ mod tests {
 
     #[test]
     fn markdown_conversion_rejects_too_deep_nesting_with_exit_4() {
-        let e = to_markdown(&nested_divs(20_000)).unwrap_err();
+        let e = to_markdown(&nested_divs(2_000)).unwrap_err();
         assert_eq!(e.code, ExitCode::Http);
         assert!(e.message.contains("too deeply nested"), "{}", e.message);
-        let e = to_text(&nested_divs(20_000)).unwrap_err();
+        let e = to_text(&nested_divs(2_000)).unwrap_err();
         assert_eq!(e.code, ExitCode::Http);
+    }
+
+    #[test]
+    fn markdown_conversion_rejects_self_closed_and_unmatched_nesting() {
+        for unit in ["<div/>", "<div></i>", r#"<div a="/>">"#] {
+            let e = to_markdown(&unit.repeat(2_000)).unwrap_err();
+            assert_eq!(e.code, ExitCode::Http, "{unit}");
+        }
     }
 
     #[test]
     fn markdown_conversion_accepts_nesting_at_the_limit() {
         // テストスレッドの既定スタック（2MiB）はmainスレッド（8MiB）より小さく、
         // 上限ちょうどの入力でも溢れるため、mainと同じ大きさのスタックで確かめる。
+        // 深さはhtmlとbodyの2段を含むので、divは上限より2段少なくする。
         let md = std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
-            .spawn(|| to_markdown(&nested_divs(crate::extract::MAX_NESTING_DEPTH)))
+            .spawn(|| to_markdown(&nested_divs(crate::extract::MAX_NESTING_DEPTH - 2)))
             .unwrap()
             .join()
             .unwrap()

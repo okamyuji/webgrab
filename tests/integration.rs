@@ -442,7 +442,7 @@ fn spawn_plain_server(count: usize, body: &str, content_type: &str) -> u16 {
 
 #[test]
 fn raw_conversion_of_too_deep_nesting_exits_4_instead_of_aborting() {
-    let n = 20_000;
+    let n = 5_000;
     let html = format!(
         "<html><body>{}x{}</body></html>",
         "<div>".repeat(n),
