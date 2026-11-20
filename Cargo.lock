@@ -2645,6 +2645,7 @@ dependencies = [
  "chardetng",
  "chromiumoxide",
  "clap",
+ "dom_query",
  "dom_smoothie",
  "encoding_rs",
  "futures",

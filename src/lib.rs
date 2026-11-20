@@ -7,6 +7,7 @@ pub mod decode;
 pub mod error;
 pub mod extract;
 pub mod fetch;
+pub mod links;
 pub mod netguard;
 pub mod output;
 pub mod pipeline;

@@ -5,7 +5,7 @@ use crate::error::{ExitCode, Result, WebgrabError};
 use crate::fetch::{self, FetchOptions};
 use crate::output::{self, Format, Meta, RenderStatus};
 use crate::render::{self, RenderOptions};
-use crate::{budget, cli, convert, decode, extract, tokens};
+use crate::{budget, cli, convert, decode, extract, links, tokens};
 use std::time::{Duration, Instant};
 
 const SHORT_CONTENT_CHARS: usize = 200;
@@ -96,6 +96,7 @@ fn to_format(f: FormatArg) -> Format {
         FormatArg::Json => Format::Json,
         FormatArg::Text => Format::Text,
         FormatArg::Html => Format::Html,
+        FormatArg::Links => Format::Links,
     }
 }
 
@@ -105,6 +106,8 @@ enum Route {
     Extracted,
     Raw,
     Plain,
+    /// `--format links`の抽出・--raw経路。リンクが0件でも空本文として正常終了する。
+    Links,
 }
 
 /// 抽出・変換済みの中間結果。
@@ -126,6 +129,7 @@ fn build_stage(cli: &Cli, html: &str, final_url: &str) -> Result<Stage> {
     let body = match to_format(cli.format) {
         Format::Html => body_html.clone(),
         Format::Text => convert::to_text(&body_html)?,
+        Format::Links => links::extract_links(&body_html, final_url),
         _ => convert::to_markdown(&body_html)?,
     };
     let visible = convert::visible_text_len(&body_html);
@@ -134,22 +138,29 @@ fn build_stage(cli: &Cli, html: &str, final_url: &str) -> Result<Stage> {
         published,
         body,
         visible,
-        route: if cli.raw {
-            Route::Raw
-        } else {
-            Route::Extracted
+        route: match (cli.format, cli.raw) {
+            (FormatArg::Links, _) => Route::Links,
+            (_, true) => Route::Raw,
+            (_, false) => Route::Extracted,
         },
     })
 }
 
 /// text/plainの素通し（設計10 §4.1）。抽出もMarkdown変換も行わず、危険リンクスキームの
 /// 無害化だけを掛ける。抽出HTMLが無いため`visible`は本文そのものの文字数になる。
-fn plain_stage(text: &str) -> Stage {
-    let body = convert::sanitize_link_schemes(text);
+fn plain_stage(text: &str, format: FormatArg) -> Stage {
+    let sanitized = convert::sanitize_link_schemes(text);
+    let visible = sanitized.chars().count();
+    let body = if format == FormatArg::Links {
+        eprintln!("webgrab: warn=links-unsupported reason=text-plain");
+        String::new()
+    } else {
+        sanitized
+    };
     Stage {
         title: None,
         published: None,
-        visible: body.chars().count(),
+        visible,
         body,
         route: Route::Plain,
     }
@@ -222,7 +233,7 @@ async fn static_phase(cli: &Cli, ua: String, timeout: Duration) -> Result<Acquir
         eprintln!("webgrab: warn=decode-replacement enc={enc}");
     }
     let stage = if plain {
-        plain_stage(&text)
+        plain_stage(&text, cli.format)
     } else {
         build_stage(cli, &text, &fetched.final_url)?
     };
@@ -430,15 +441,69 @@ mod tests {
 
     #[test]
     fn plain_stage_passes_text_through() {
-        let s = plain_stage("行1\nMutex<T>\n[x](javascript:a)\n");
+        let s = plain_stage("行1\nMutex<T>\n[x](javascript:a)\n", FormatArg::Markdown);
         assert_eq!(s.body, "行1\nMutex<T>\n[x](unsafe-javascript:a)\n");
         assert_eq!(s.visible, s.body.chars().count());
         assert!(s.title.is_none());
         assert!(s.published.is_none());
         assert_eq!(s.route, Route::Plain);
-        let empty = plain_stage("");
+        let empty = plain_stage("", FormatArg::Markdown);
         assert_eq!(empty.body, "");
         assert_eq!(empty.visible, 0);
+    }
+
+    #[test]
+    fn plain_stage_with_links_format_has_empty_body_but_keeps_visible() {
+        let s = plain_stage("see https://a.test/x", FormatArg::Links);
+        assert_eq!(s.body, "");
+        assert_eq!(s.visible, "see https://a.test/x".chars().count());
+        assert_eq!(s.route, Route::Plain);
+    }
+
+    fn cli_for(args: &[&str]) -> Cli {
+        use clap::Parser;
+        Cli::try_parse_from(["webgrab", "https://x.test"].iter().chain(args)).unwrap()
+    }
+
+    #[test]
+    fn build_stage_links_raw_resolves_against_final_url_and_counts_visible_text() {
+        let cli = cli_for(&["--format", "links", "--raw"]);
+        let html = r#"<nav><a href="/n">nav</a></nav><p>abc</p>"#;
+        let s = build_stage(&cli, html, "https://h.test/a/b").unwrap();
+        assert_eq!(s.body, "https://h.test/n");
+        assert_eq!(s.route, Route::Links);
+        assert_eq!(s.visible, convert::visible_text_len(html));
+        assert!(s.title.is_none());
+    }
+
+    #[test]
+    fn build_stage_links_extracted_keeps_only_article_links() {
+        let cli = cli_for(&["--format", "links"]);
+        let p = "本文として十分な長さのある日本語の段落です。".repeat(8);
+        let html = format!(
+            r#"<html><head><title>T</title></head><body><nav><a href="/nav">n</a></nav><article><h1>T</h1><p>{p}</p><p>{p}<a href="rel">r</a></p></article></body></html>"#
+        );
+        let s = build_stage(&cli, &html, "https://h.test/d/").unwrap();
+        assert_eq!(s.body, "https://h.test/d/rel");
+        assert_eq!(s.route, Route::Links);
+    }
+
+    #[test]
+    fn build_stage_non_links_formats_keep_their_routes() {
+        let html = "<p>abc</p>";
+        let raw = build_stage(&cli_for(&["--raw"]), html, "https://h.test/").unwrap();
+        assert_eq!(raw.route, Route::Raw);
+        let text = build_stage(
+            &cli_for(&["--format", "text", "--raw"]),
+            html,
+            "https://h.test/",
+        );
+        assert_eq!(text.unwrap().route, Route::Raw);
+    }
+
+    #[test]
+    fn links_route_is_exempt_from_short_content_notice() {
+        assert!(!is_short_content(Route::Links, 1, 199));
     }
 
     #[test]

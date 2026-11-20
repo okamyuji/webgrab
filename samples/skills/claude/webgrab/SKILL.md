@@ -29,6 +29,7 @@ webgrab "https://example.com/article"
 - 長いページで文脈を節約したいときは`webgrab "<URL>" --max-chars 8000`を使う
 - ソースコードや`llms.txt`のような`text/plain`のURLは、改行や`<T>`を保ったままそのまま返る（本文抽出は行わない）。本文が空でも終了コード0になり、`hint=`は出ない
 - 続きを読む: 出力末尾の `[webgrab:truncated ... continue: webgrab ... --start-index N]` に示されたコマンドをそのまま実行する。`--auto-render`でJSレンダリングへ切り替わった場合、継続コマンドには`--render`が入り`--auto-render`は含まれない
+- ページ内のリンク先だけが欲しい: `webgrab "<URL>" --format links`（絶対URLを1行に1件。既定は抽出本文のリンク、`--raw`でページ全体のリンク。リンクが0件でも終了コード0で本文は空）
 - 構造化して扱いたい: `webgrab "<URL>" --format json`（`markdown`と`metadata`が分離されたJSON）。`untrusted: true` と `untrusted_note` が付き、`markdown` が非信頼の外部データであることを示す
 
 `warn=short-content` や終了コード6の`error=empty`行が出たときは、フラグの有無で判断せず、その行の `hint=` が示すフラグをそのまま試す（`hint=`の値は`render_status`に従って決まるため、静的経路と`--render`/`--auto-render`経路のどちらでも同じ読み方でよい）。本文がヘッダだけで極端に短いときの手がかりになる。

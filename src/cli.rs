@@ -11,6 +11,7 @@ pub enum FormatArg {
     Json,
     Text,
     Html,
+    Links,
 }
 
 /// webgrab — LLM向けWeb情報取得ツール。ページ本文を切り捨てずにMarkdownで返す。
@@ -110,52 +111,69 @@ pub fn default_user_agent() -> String {
     )
 }
 
+/// `--format`に渡す名前。clapの値名をそのまま使い、形式を足してもここは変わらない。
+fn format_name(f: FormatArg) -> String {
+    f.to_possible_value()
+        .map(|v| v.get_name().to_string())
+        .unwrap_or_default()
+}
+
 /// 継続コマンド再現用に、非デフォルトフラグを再構成する（--start-indexと-oは除外、設計§4.3 6）。
 /// - `status`が`Rendered`なら`--auto-render`を`--render`に置換し、render系フラグも再現する
 /// - それ以外なら`--auto-render`とrender系（--wait-ms/--no-sandbox/--chrome-path）を省略する
 pub fn extra_flags(cli: &Cli, status: crate::output::RenderStatus) -> Vec<String> {
-    use crate::budget::shell_quote;
+    let render_path = cli.render || (cli.auto_render && status.is_rendered());
+    let mut v = content_flags(cli, render_path);
+    if render_path {
+        v.extend(render_only_flags(cli));
+    }
+    v.extend(fetch_flags(cli));
+    v
+}
+
+/// 本文の切り出し方と出力形式を決めるフラグ。
+fn content_flags(cli: &Cli, render_path: bool) -> Vec<String> {
     let mut v = Vec::new();
     if cli.format != FormatArg::Markdown {
-        let f = match cli.format {
-            FormatArg::Markdown => "markdown",
-            FormatArg::Frontmatter => "frontmatter",
-            FormatArg::Json => "json",
-            FormatArg::Text => "text",
-            FormatArg::Html => "html",
-        };
-        v.push(format!("--format {f}"));
+        v.push(format!("--format {}", format_name(cli.format)));
     }
     if cli.max_chars != 24000 {
         v.push(format!("--max-chars {}", cli.max_chars));
     }
-    let render_path = cli.render || (cli.auto_render && status.is_rendered());
     if render_path {
         v.push("--render".into());
     }
-    if cli.raw {
-        v.push("--raw".into());
-    }
-    if cli.no_tokens {
-        v.push("--no-tokens".into());
-    }
-    if cli.fence {
-        v.push("--fence".into());
-    }
-    if cli.allow_private {
-        v.push("--allow-private".into());
-    }
-    if render_path {
-        if let Some(w) = cli.wait_ms {
-            v.push(format!("--wait-ms {w}"));
-        }
-        if cli.no_sandbox {
-            v.push("--no-sandbox".into());
-        }
-        if let Some(cp) = &cli.chrome_path {
-            v.push(format!("--chrome-path {}", shell_quote(cp)));
+    for (on, flag) in [
+        (cli.raw, "--raw"),
+        (cli.no_tokens, "--no-tokens"),
+        (cli.fence, "--fence"),
+        (cli.allow_private, "--allow-private"),
+    ] {
+        if on {
+            v.push(flag.into());
         }
     }
+    v
+}
+
+/// render経路でだけ意味を持つフラグ。
+fn render_only_flags(cli: &Cli) -> Vec<String> {
+    let mut v = Vec::new();
+    if let Some(w) = cli.wait_ms {
+        v.push(format!("--wait-ms {w}"));
+    }
+    if cli.no_sandbox {
+        v.push("--no-sandbox".into());
+    }
+    if let Some(cp) = &cli.chrome_path {
+        v.push(format!("--chrome-path {}", crate::budget::shell_quote(cp)));
+    }
+    v
+}
+
+/// 取得の制限と識別に関わるフラグ。
+fn fetch_flags(cli: &Cli) -> Vec<String> {
+    let mut v = Vec::new();
     if cli.timeout != 30 {
         v.push(format!("--timeout {}", cli.timeout));
     }
@@ -166,7 +184,7 @@ pub fn extra_flags(cli: &Cli, status: crate::output::RenderStatus) -> Vec<String
         v.push(format!("--max-bytes {}", cli.max_bytes));
     }
     if let Some(ua) = &cli.user_agent {
-        v.push(format!("--user-agent {}", shell_quote(ua)));
+        v.push(format!("--user-agent {}", crate::budget::shell_quote(ua)));
     }
     v
 }
@@ -286,6 +304,27 @@ mod tests {
     #[test]
     fn default_ua_has_product_token() {
         assert!(default_user_agent().starts_with("webgrab/"));
+    }
+
+    #[test]
+    fn format_name_matches_the_flag_value_for_every_format() {
+        for (f, want) in [
+            (FormatArg::Markdown, "markdown"),
+            (FormatArg::Frontmatter, "frontmatter"),
+            (FormatArg::Json, "json"),
+            (FormatArg::Text, "text"),
+            (FormatArg::Html, "html"),
+            (FormatArg::Links, "links"),
+        ] {
+            assert_eq!(format_name(f), want);
+        }
+    }
+
+    #[test]
+    fn extra_flags_reproduces_links_format() {
+        let cli = Cli::try_parse_from(["webgrab", "https://x.test", "--format", "links"]).unwrap();
+        let f = extra_flags(&cli, RenderStatus::Static);
+        assert!(f.contains(&"--format links".to_string()), "{f:?}");
     }
 
     #[test]
