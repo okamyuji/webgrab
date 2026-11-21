@@ -177,6 +177,23 @@ impl Decoder {
         r.map_err(|e| self.classify(e))
     }
 
+    /// 展開済みのバイト数。gzipとbrotliの展開器は出力を内部に貯めるので、先に吐き出させてから数える。
+    pub fn decoded_len(&mut self) -> u64 {
+        let sink = match &mut self.inner {
+            Inner::Identity(s) => &*s,
+            Inner::Gzip(d) => {
+                let _ = d.flush();
+                d.get_ref()
+            }
+            Inner::Deflate(d) => &d.out,
+            Inner::Br(d) => {
+                let _ = d.flush();
+                d.get_ref()
+            }
+        };
+        sink.buf.len() as u64
+    }
+
     /// 末尾まで展開し、展開後の本文を返す。途中で切れた圧縮データは`Corrupt`になる。
     /// 1バイトも届かなかった本文は、符号化の指定があっても空の本文として返す。
     pub fn finish(self) -> Result<Vec<u8>, DecodeError> {
@@ -310,6 +327,24 @@ mod tests {
         // 本文の無い応答にもContent-Encodingを付けるサーバーがある。
         for c in [Coding::Gzip, Coding::Deflate, Coding::Br] {
             assert_eq!(decode(c, b"", 1 << 20), Ok(Vec::new()), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn decoded_len_counts_output_still_buffered_inside_the_decompressor() {
+        let text = b"<p>truncated</p>".repeat(500);
+        for c in [Coding::Identity, Coding::Gzip, Coding::Deflate] {
+            let full = compress(c, &text);
+            // gzipとzlibの末尾の検査値だけを欠かせるので、本文はすべて展開できる。
+            let cut = &full[..full.len() - 4];
+            let mut d = Decoder::new(c, 1 << 20);
+            d.push(cut).unwrap();
+            let expected = if c == Coding::Identity {
+                cut.len()
+            } else {
+                text.len()
+            };
+            assert_eq!(d.decoded_len(), expected as u64, "{c:?}");
         }
     }
 
