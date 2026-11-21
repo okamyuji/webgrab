@@ -66,7 +66,7 @@ fn remove_element(html: &str, tag: &str) -> String {
 /// htmdは要素の入れ子を再帰でたどり、数千段でスタックを溢れさせてabortするため、
 /// 抽出と同じ深さ上限を変換前にも掛ける（--rawは抽出を通らない）。
 pub fn to_markdown(html: &str) -> Result<String> {
-    use crate::extract::{MAX_NESTING_DEPTH, exceeds_nesting_depth};
+    use crate::nesting::{MAX_NESTING_DEPTH, exceeds_nesting_depth};
     if exceeds_nesting_depth(html, MAX_NESTING_DEPTH) {
         return Err(
             WebgrabError::new(ExitCode::Http, "html too deeply nested for conversion").with_detail(
@@ -387,7 +387,7 @@ mod tests {
         // 深さはhtmlとbodyの2段を含むので、divは上限より2段少なくする。
         let md = std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
-            .spawn(|| to_markdown(&nested_divs(crate::extract::MAX_NESTING_DEPTH - 2)))
+            .spawn(|| to_markdown(&nested_divs(crate::nesting::MAX_NESTING_DEPTH - 2)))
             .unwrap()
             .join()
             .unwrap()
