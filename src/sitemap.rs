@@ -41,7 +41,8 @@ pub async fn collect(
             continue;
         }
         fetched += 1;
-        match budget.get(&url, base, base.check_robots).await {
+        let same_origin = url.origin() == start.origin();
+        match budget.get(&url, base, base.check_robots, same_origin).await {
             Ok(xml) => match classify(&url, &xml, nested) {
                 Found::Children(c) => queue.extend(c.into_iter().map(|u| (u, true))),
                 Found::Urls(u) => urls.extend(u),
@@ -57,7 +58,7 @@ pub async fn collect(
 async fn initial_sitemaps(start: &Url, budget: &mut Budget, base: &FetchOptions) -> Vec<Url> {
     let mut declared = Vec::new();
     if let Ok(robots_url) = start.join("/robots.txt")
-        && let Ok(text) = budget.get(&robots_url, base, false).await
+        && let Ok(text) = budget.get(&robots_url, base, false, true).await
     {
         declared = robots_sitemaps(&text)
             .iter()
@@ -115,17 +116,20 @@ impl Budget {
     }
 
     /// 残りの期限とバイト数の範囲で`url`を取得し、UTF-8として読む（sitemapの規約はUTF-8）。
+    /// `--allow-private`は利用者が起点に与えたものなので、起点と別オリジンの取得には渡さない。
+    /// robots.txtやsitemap indexが内部アドレスを指しても、そこへは要求を出さない。
     async fn get(
         &mut self,
         url: &Url,
         base: &FetchOptions,
         check_robots: bool,
+        same_origin: bool,
     ) -> Result<String, WebgrabError> {
         let opts = FetchOptions {
             user_agent: base.user_agent.clone(),
             timeout: self.deadline.saturating_duration_since(Instant::now()),
             max_bytes: self.bytes_left,
-            allow_private: base.allow_private,
+            allow_private: base.allow_private && same_origin,
             check_robots,
             allow_xml: true,
         };
@@ -222,13 +226,57 @@ fn loc_value(raw: &str) -> Option<String> {
     (!v.is_empty()).then_some(v)
 }
 
-/// XMLの定義済み実体参照5つを戻す。`&amp;`を最後に戻し、`&amp;lt;`を`<`にしない。
+/// `;`を探す範囲（`&`と`;`を含む）。最長の参照`&#x10FFFF;`の長さ。区切らないと`&`だけが
+/// 大量に並ぶ入力で`;`探しが末尾まで繰り返され、二乗時間になる。
+const MAX_REF_LEN: usize = 10;
+
+/// XMLの定義済み実体参照5つと文字参照（`&#38;`、`&#x26;`）を前から1回で戻す。戻した文字は
+/// 再び解釈しない（`&amp;lt;`は`&lt;`になる）。解釈できない参照はそのまま残す。
 fn unescape(s: &str) -> String {
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        let window = &tail.as_bytes()[..tail.len().min(MAX_REF_LEN)];
+        let decoded = window
+            .iter()
+            .position(|&b| b == b';')
+            .and_then(|end| Some((reference(&tail[1..end])?, end)));
+        match decoded {
+            Some((c, end)) => {
+                out.push(c);
+                rest = &tail[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `&`と`;`の間の参照名を文字にする（XML 1.0 §4.1。16進は小文字の`x`だけ）。
+fn reference(name: &str) -> Option<char> {
+    let (digits, radix) = match name {
+        "lt" => return Some('<'),
+        "gt" => return Some('>'),
+        "quot" => return Some('"'),
+        "apos" => return Some('\''),
+        "amp" => return Some('&'),
+        _ => match name.strip_prefix("#x") {
+            Some(hex) => (hex, 16),
+            None => (name.strip_prefix('#')?, 10),
+        },
+    };
+    // from_str_radixは先頭の`+`を受けるため、桁だけで出来ているかを先に見る。
+    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+        return None;
+    }
+    let c = char::from_u32(u32::from_str_radix(digits, radix).ok()?)?;
+    (c != '\0').then_some(c)
 }
 
 /// 候補URLのうち`start`と同じホストのhttp/httpsだけを、fragment除去・重複除去して1行1件に並べる。
@@ -304,12 +352,28 @@ mod tests {
     }
 
     #[test]
+    fn unescape_reads_references_up_to_the_longest_code_point_only() {
+        assert_eq!(unescape("&#x10FFFF;"), "\u{10FFFF}");
+        assert_eq!(unescape("&#x110000;&#x010FFFF;"), "&#x110000;&#x010FFFF;");
+        assert_eq!(unescape("&&;&#;&#x;&#+1;&amp"), "&&;&#;&#x;&#+1;&amp");
+    }
+
+    #[test]
     fn parse_unescapes_the_five_xml_entities() {
         let xml =
             "<urlset><url><loc>https://x.test/?a=1&amp;b=&lt;&gt;&quot;&apos;</loc></url></urlset>";
         assert_eq!(
             parse(xml).1,
             vec!["https://x.test/?a=1&b=<>\"'".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_unescapes_numeric_character_references() {
+        let xml = "<urlset><loc>https://x.test/?a=1&#38;b=2&#x26;c=&#X3C;&#0;&#xZZ;&#99999999;</loc></urlset>";
+        assert_eq!(
+            parse(xml).1,
+            vec!["https://x.test/?a=1&b=2&c=&#X3C;&#0;&#xZZ;&#99999999;".to_string()]
         );
     }
 

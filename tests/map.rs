@@ -121,6 +121,23 @@ fn map_keeps_links_outside_the_extracted_article() {
 }
 
 #[test]
+fn map_does_not_carry_allow_private_to_a_sitemap_on_another_origin() {
+    let other = common::start(vec![
+        ok_robots(),
+        xml("/internal.xml", urlset(&["/leak".into()])),
+    ]);
+    let declared = format!("User-agent: *\nSitemap: {}\n", other.url("/internal.xml"));
+    let s = common::start(vec![robots(declared), Route::html("/", PAGE)]);
+    let (code, stdout, stderr) = run(&[&s.url("/"), "--allow-private", "--map"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(lines(&stdout), vec![s.url("/nav"), s.url("/a")]);
+    assert!(
+        stderr.contains("webgrab: warn=sitemap-failed\n"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
 fn map_with_zero_urls_exits_0_with_empty_body() {
     let s = common::start(vec![
         ok_robots(),
