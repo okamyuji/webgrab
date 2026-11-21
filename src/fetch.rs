@@ -77,7 +77,12 @@ async fn resolve_checked(
     allow_private: bool,
     timeout: Duration,
 ) -> Result<SocketAddr> {
-    let host_owned = host.to_string();
+    // `Url::host_str`はIPv6を`[::1]`と角括弧付きで返すが、`to_socket_addrs`は角括弧を解さない。
+    let host_owned = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+        .to_string();
     let resolve = tokio::task::spawn_blocking(move || {
         (host_owned.as_str(), port)
             .to_socket_addrs()
@@ -447,6 +452,18 @@ mod tests {
         let e = check_media_type(Some("application/pdf; q=1"), false).unwrap_err();
         assert_eq!(e.code, ExitCode::Http);
         assert_eq!(e.message, "unsupported content-type: application/pdf");
+    }
+
+    #[tokio::test]
+    async fn resolve_checked_accepts_a_bracketed_ipv6_literal() {
+        let addr = resolve_checked("[::1]", 8080, true, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(addr, "[::1]:8080".parse::<SocketAddr>().unwrap());
+        let e = resolve_checked("[::1]", 8080, false, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, ExitCode::Netguard);
     }
 
     #[test]
