@@ -123,7 +123,7 @@ webgrab <URL> [OPTIONS]
 | --wait-ms | Option\<u64\>（未指定時は5000） | 5000 | `--render`/`--auto-render`のrender時、`goto`開始からDOM取得までの上限ミリ秒（ナビゲーション時間を含む）。ネットワーク静止・DOM安定・可視テキスト200文字以上を満たせば上限前に終了する。`--auto-render`時は残余`--timeout`に丸める。`--render`と`--auto-render`のどちらも指定されていない場合は無視しstderrに`warn=flag-ignored flag=--wait-ms`を出す |
 | --no-sandbox | フラグ | off | Chromeのsandboxを無効化する。起動直前にstderrへ`warn=no-sandbox`を1行出す（エスカレーションしない実行やskipされた実行では出さない）。継続コマンドにも再現する（用途はsandboxが起動しないCI環境に限り、通常利用では指定しない。「セキュリティと信頼モデル」参照） |
 | --raw | フラグ | off | 本文抽出をスキップしページ全体をMarkdown化。--renderとの併用可 |
-| --timeout | u64（秒） | 30 | 全体予算。静的経路は接続+読み取り、--render経路はChrome起動〜DOM取得までを含み、取得後の本文抽出と変換もこの予算の残りで打ち切る |
+| --timeout | u64（秒） | 30 | 全体予算。静的経路は名前解決・robots確認・転送・接続・読み取りの合計、--render経路はrobots事前確認とChrome起動〜DOM取得までを含み、取得後の本文抽出と変換もこの予算の残りで打ち切る。期限で打ち切った名前解決の終了は待たずにプロセスを終える |
 | --no-robots | フラグ | off | robots.txt確認をスキップ |
 | --allow-private | フラグ | off | netguardの内部アドレス拒否を解除 |
 | --no-tokens | フラグ | off | Tokensヘッダの計測・出力を省略 |

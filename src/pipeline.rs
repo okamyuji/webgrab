@@ -346,15 +346,21 @@ async fn render_phase(
     timeout: Duration,
     deadline: Instant,
 ) -> Result<Acquired> {
+    let left = || deadline.saturating_duration_since(Instant::now());
     if !cli.no_robots {
         let fopts = fetch_options(cli, ua, timeout, true);
-        if !fetch::robots_precheck(&cli.url, &fopts).await? {
+        let precheck = tokio::time::timeout(left(), fetch::robots_precheck(&cli.url, &fopts));
+        let allowed = precheck.await.map_err(|_| {
+            WebgrabError::new(ExitCode::Network, "request timed out")
+                .with_detail(format!("url={} timeout={timeout:?}", cli.url))
+        })??;
+        if !allowed {
             return Err(WebgrabError::new(ExitCode::Robots, "blocked by robots.txt")
                 .with_detail(format!("url={}", cli.url)));
         }
     }
     warn_no_sandbox(cli);
-    let r = render::render(&cli.url, &render_options(cli, timeout, cli.max_bytes)).await?;
+    let r = render::render(&cli.url, &render_options(cli, left(), cli.max_bytes)).await?;
     let stage = build_stage_until(cli, r.html, r.final_url.clone(), deadline).await?;
     Ok(Acquired {
         stage,

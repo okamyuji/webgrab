@@ -7,8 +7,26 @@ use webgrab::error::ExitCode;
 use webgrab::netguard;
 use webgrab::pipeline;
 
-#[tokio::main]
-async fn main() -> ProcExit {
+fn main() -> ProcExit {
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("webgrab: error=internal runtime start failed");
+            eprintln!("{e}");
+            return ProcExit::from(ExitCode::Internal as u8);
+        }
+    };
+    let code = rt.block_on(run());
+    // 期限で打ち切った名前解決（getaddrinfo）はblockingスレッドで動き続け、止める手段が無い。
+    // ランタイムを普通に落とすとその終了を待ち、--timeoutを超えてプロセスが残る。
+    rt.shutdown_background();
+    code
+}
+
+async fn run() -> ProcExit {
     let cli = Cli::parse();
 
     // URLスキームの早期検証（clap通過後）

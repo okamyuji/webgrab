@@ -1043,12 +1043,13 @@ fn unknown_encoding_after_identity_in_repeated_headers_is_rejected_with_exit_4()
 
 #[test]
 fn timeout_bounds_the_whole_redirect_chain_not_each_hop() {
-    let slow = |r: common::Route| common::Route { delay_ms: 700, ..r };
+    let slow = |r: common::Route| common::Route { delay_ms: 400, ..r };
     let s = common::start(vec![
         slow(common::Route::redirect("/a", "302 Found", "/b")),
         slow(common::Route::redirect("/b", "302 Found", "/c")),
+        slow(common::Route::redirect("/c", "302 Found", "/d")),
         slow(common::Route::html(
-            "/c",
+            "/d",
             "<html><body><p>end</p></body></html>",
         )),
     ]);
@@ -1059,7 +1060,22 @@ fn timeout_bounds_the_whole_redirect_chain_not_each_hop() {
         "--timeout",
         "1",
     ]);
-    // 各ホップは1s未満で返るので、段ごとの期限だけでは打ち切られない。
+    // 各ホップは400msで返るので、段ごとの期限だけでは打ち切られない（合計1.6s）。
+    assert_eq!(code, 3, "stderr={stderr}");
+    assert!(stderr.contains("request timed out"), "stderr={stderr}");
+}
+
+#[test]
+fn render_counts_the_robots_precheck_against_the_timeout() {
+    let robots = common::Route {
+        content_type: "text/plain",
+        delay_ms: 3000,
+        ..common::Route::html("/robots.txt", "User-agent: *\nAllow: /\n")
+    };
+    let s = common::start(vec![robots, common::Route::html("/", "<p>x</p>")]);
+    let (code, _stdout, stderr) =
+        run_webgrab(&[&s.url("/"), "--allow-private", "--render", "--timeout", "1"]);
+    // robots確認だけで期限を使い切るので、Chromeを起動せずに終わる。
     assert_eq!(code, 3, "stderr={stderr}");
     assert!(stderr.contains("request timed out"), "stderr={stderr}");
 }
