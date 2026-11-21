@@ -15,7 +15,7 @@ pub enum FormatArg {
 }
 
 /// webgrab — LLM向けWeb情報取得ツール。ページ本文を切り捨てずにMarkdownで返す。
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(name = "webgrab", version, about, long_about = None)]
 #[command(after_help = EXIT_CODE_HELP)]
 pub struct Cli {
@@ -97,7 +97,8 @@ EXIT CODES:
   1  internal error (incl. output file write failure)
   2  usage / invalid URL
   3  network failure (DNS/connect/timeout/TLS/redirect loop; retryable)
-  4  HTTP error (4xx/5xx), size over, non-HTML
+  4  HTTP error (4xx/5xx), size over, non-HTML, processing past --timeout
+     (--auto-render falls back to the static result instead)
   5  blocked by robots.txt
   6  empty body (0 chars extracted; see hint= on stderr)
   7  JS render failure (Chrome missing/launch/CDP/timeout)

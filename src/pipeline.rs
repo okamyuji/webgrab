@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 const SHORT_CONTENT_CHARS: usize = 200;
 const SKIP_TIMEOUT_MIN: Duration = Duration::from_secs(5);
 const SKIP_BYTES_MIN: u64 = 256 * 1024;
+/// 抽出と変換を行うスレッドのスタック。htmdは入れ子を再帰でたどるため、入れ子の上限の深さを
+/// 変換できるmainスレッドと同じ大きさにする（tokioのblockingスレッドは2MiBで足りない）。
+const WORKER_STACK_BYTES: usize = 8 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -146,6 +149,49 @@ fn build_stage(cli: &Cli, html: &str, final_url: &str) -> Result<Stage> {
     })
 }
 
+/// `f`を専用スレッドで実行し、`deadline`までに終わらなければ打ち切る。
+/// `--timeout`は通信だけでなく、取得後の解析と変換も含めた全体の上限である。
+/// 打ち切ったスレッドは止められないが、プロセスの終了とともに消える。
+async fn run_until<T: Send + 'static>(
+    deadline: Instant,
+    f: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("webgrab-worker".into())
+        .stack_size(WORKER_STACK_BYTES)
+        .spawn(move || {
+            let _ = tx.send(f());
+        })
+        .map_err(|e| {
+            WebgrabError::new(ExitCode::Internal, "worker thread spawn failed")
+                .with_detail(e.to_string())
+        })?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match tokio::time::timeout(remaining, rx).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(_)) => Err(WebgrabError::new(
+            ExitCode::Internal,
+            "worker thread failed",
+        )),
+        Err(_) => Err(WebgrabError::new(
+            ExitCode::Http,
+            "html processing exceeded --timeout",
+        )),
+    }
+}
+
+/// `build_stage`を全体の期限の内側で実行する。
+async fn build_stage_until(
+    cli: &Cli,
+    html: String,
+    final_url: String,
+    deadline: Instant,
+) -> Result<Stage> {
+    let cli = cli.clone();
+    run_until(deadline, move || build_stage(&cli, &html, &final_url)).await
+}
+
 /// text/plainの素通し（設計10 §4.1）。抽出もMarkdown変換も行わず、危険リンクスキームの
 /// 無害化だけを掛ける。抽出HTMLが無いため`visible`は本文そのものの文字数になる。
 fn plain_stage(text: &str, format: FormatArg) -> Stage {
@@ -223,7 +269,12 @@ fn fetch_options(cli: &Cli, ua: String, timeout: Duration, check_robots: bool) -
 }
 
 /// 1. 静的フェーズ。Content-Typeが`text/plain`なら素通し経路に入る（設計10 §4.1）。
-async fn static_phase(cli: &Cli, ua: String, timeout: Duration) -> Result<Acquired> {
+async fn static_phase(
+    cli: &Cli,
+    ua: String,
+    timeout: Duration,
+    deadline: Instant,
+) -> Result<Acquired> {
     let fopts = fetch_options(cli, ua, timeout, !cli.no_robots);
     let fetched = fetch::fetch(&cli.url, &fopts).await?;
     let ct = fetched.content_type.as_deref();
@@ -235,7 +286,7 @@ async fn static_phase(cli: &Cli, ua: String, timeout: Duration) -> Result<Acquir
     let stage = if plain {
         plain_stage(&text, cli.format)
     } else {
-        build_stage(cli, &text, &fetched.final_url)?
+        build_stage_until(cli, text, fetched.final_url.clone(), deadline).await?
     };
     Ok(Acquired {
         stage,
@@ -245,7 +296,12 @@ async fn static_phase(cli: &Cli, ua: String, timeout: Duration) -> Result<Acquir
 }
 
 /// 1'. `--render`明示のフェーズ。静的取得は行わないため消費バイトは0。
-async fn render_phase(cli: &Cli, ua: String, timeout: Duration) -> Result<Acquired> {
+async fn render_phase(
+    cli: &Cli,
+    ua: String,
+    timeout: Duration,
+    deadline: Instant,
+) -> Result<Acquired> {
     if !cli.no_robots {
         let fopts = fetch_options(cli, ua, timeout, true);
         if !fetch::robots_precheck(&cli.url, &fopts).await? {
@@ -255,7 +311,7 @@ async fn render_phase(cli: &Cli, ua: String, timeout: Duration) -> Result<Acquir
     }
     warn_no_sandbox(cli);
     let r = render::render(&cli.url, &render_options(cli, timeout, cli.max_bytes)).await?;
-    let stage = build_stage(cli, &r.html, &r.final_url)?;
+    let stage = build_stage_until(cli, r.html, r.final_url.clone(), deadline).await?;
     Ok(Acquired {
         stage,
         final_url: r.final_url,
@@ -284,6 +340,7 @@ async fn escalate(
     acq: &mut Acquired,
     timeout: Duration,
     elapsed: Duration,
+    deadline: Instant,
     reason: &'static str,
 ) -> Result<Escalation> {
     let (rt, rb) = match remaining_budget(timeout, elapsed, cli.max_bytes, acq.consumed) {
@@ -307,7 +364,8 @@ async fn escalate(
     };
     // renderフェーズの抽出は常にrender後URLを基準にする。結果を捨てる場合は本文ごと捨てる
     // ため、URLの出どころと本文の出どころが食い違わない。
-    let rs = match build_stage(cli, &rendered.html, &rendered.final_url) {
+    let rs = match build_stage_until(cli, rendered.html, rendered.final_url.clone(), deadline).await
+    {
         Ok(s) => s,
         Err(e) => return escalation_failed(Phase::Extract, e),
     };
@@ -403,17 +461,18 @@ pub async fn run(cli: &Cli) -> Result<String> {
         .clone()
         .unwrap_or_else(cli::default_user_agent);
     let timeout = Duration::from_secs(cli.timeout);
+    let deadline = start + timeout;
     warn_ignored_flags(cli);
 
     let (mut acq, mut status, mut chars) = if cli.render {
-        let acq = render_phase(cli, ua, timeout).await?;
+        let acq = render_phase(cli, ua, timeout, deadline).await?;
         let chars = CharCounts {
             static_chars: None,
             rendered_chars: Some(acq.stage.visible),
         };
         (acq, RenderStatus::Rendered, chars)
     } else {
-        let acq = static_phase(cli, ua, timeout).await?;
+        let acq = static_phase(cli, ua, timeout, deadline).await?;
         let chars = CharCounts {
             static_chars: Some(acq.stage.visible),
             rendered_chars: None,
@@ -427,7 +486,7 @@ pub async fn run(cli: &Cli) -> Result<String> {
         && acq.stage.route != Route::Plain
         && let Some(reason) = escalation_reason(acq.stage.visible)
     {
-        let e = escalate(cli, &mut acq, timeout, start.elapsed(), reason).await?;
+        let e = escalate(cli, &mut acq, timeout, start.elapsed(), deadline, reason).await?;
         status = e.status;
         chars.rendered_chars = e.rendered_chars;
     }
@@ -438,6 +497,52 @@ pub async fn run(cli: &Cli) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn work_past_the_deadline_is_cut_off_with_exit_4() {
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let start = Instant::now();
+        let e = run_until(deadline, || {
+            std::thread::sleep(Duration::from_secs(3));
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(e.code, ExitCode::Http);
+        assert!(e.message.contains("--timeout"), "{}", e.message);
+    }
+
+    #[tokio::test]
+    async fn work_within_the_deadline_returns_its_result() {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        assert_eq!(run_until(deadline, || Ok(7)).await.unwrap(), 7);
+        let e = run_until::<()>(deadline, || Err(WebgrabError::new(ExitCode::Empty, "x")))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, ExitCode::Empty);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_worker_becomes_an_internal_error() {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let e = run_until::<()>(deadline, || panic!("boom"))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, ExitCode::Internal);
+    }
+
+    #[tokio::test]
+    async fn worker_stack_converts_nesting_at_the_limit() {
+        // tokioのblockingスレッド（2MiB）では、上限ちょうどの入れ子の変換でスタックが溢れる。
+        let n = crate::nesting::MAX_NESTING_DEPTH - 2;
+        let html = format!("{}x{}", "<div>".repeat(n), "</div>".repeat(n));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let md = run_until(deadline, move || convert::to_markdown(&html))
+            .await
+            .unwrap();
+        assert_eq!(md.trim(), "x");
+    }
 
     #[test]
     fn plain_stage_passes_text_through() {

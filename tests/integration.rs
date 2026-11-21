@@ -440,6 +440,55 @@ fn spawn_plain_server(count: usize, body: &str, content_type: &str) -> u16 {
     })
 }
 
+#[test]
+fn processing_after_the_fetch_is_bounded_by_timeout() {
+    // 入れ子の上限は下回るが、深い位置に要素が多く、抽出に長い時間がかかるページ。
+    let html = format!(
+        "<html><body>{}{}</body></html>",
+        "<div>".repeat(980),
+        "<b>x</b>".repeat(20_000)
+    );
+    let port = spawn_plain_server(2, &html, "text/html; charset=utf-8");
+    let url = format!("http://127.0.0.1:{port}/slow");
+    let start = std::time::Instant::now();
+    let (code, _stdout, stderr) =
+        run_webgrab(&[&url, "--allow-private", "--no-robots", "--timeout", "2"]);
+    let elapsed = start.elapsed();
+    assert_eq!(code, 4, "stderr={stderr}");
+    assert!(
+        stderr.contains("html processing exceeded --timeout"),
+        "stderr={stderr}"
+    );
+    assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
+}
+
+#[test]
+fn raw_conversion_of_too_deep_nesting_exits_4_instead_of_aborting() {
+    let n = 5_000;
+    let html = format!(
+        "<html><body>{}x{}</body></html>",
+        "<div>".repeat(n),
+        "</div>".repeat(n)
+    );
+    let port = spawn_plain_server(2, &html, "text/html; charset=utf-8");
+    let url = format!("http://127.0.0.1:{port}/deep");
+    for format in ["markdown", "text"] {
+        let (code, _stdout, stderr) = run_webgrab(&[
+            &url,
+            "--allow-private",
+            "--no-robots",
+            "--raw",
+            "--format",
+            format,
+        ]);
+        assert_eq!(code, 4, "format={format} stderr={stderr}");
+        assert!(
+            stderr.contains("too deeply nested for conversion"),
+            "format={format} stderr={stderr}"
+        );
+    }
+}
+
 /// stdoutからwebgrabが付けた部分（ヘッダと出力末尾の改行）を除いた本文を取り出す。
 fn body_of(stdout: &str, markdown: bool) -> String {
     let s = stdout.strip_suffix('\n').unwrap_or(stdout);

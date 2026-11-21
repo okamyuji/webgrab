@@ -15,6 +15,7 @@ encoding_rs = "0.8.35"
 flate2 = "1.1"
 futures = "0.3.32"
 htmd = "0.5.4"
+html5ever = "0.40.1"
 reqwest = "0.13.4"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -26,6 +27,7 @@ tokio = { version = "1.53.0", features = [
     "macros",
     "net",
     "rt-multi-thread",
+    "sync",
     "time",
 ] }
 url = "2.5.8"

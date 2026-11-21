@@ -123,7 +123,7 @@ webgrab <URL> [OPTIONS]
 | --wait-ms | Option\<u64\>（未指定時は5000） | 5000 | `--render`/`--auto-render`のrender時、`goto`開始からDOM取得までの上限ミリ秒（ナビゲーション時間を含む）。ネットワーク静止・DOM安定・可視テキスト200文字以上を満たせば上限前に終了する。`--auto-render`時は残余`--timeout`に丸める。`--render`と`--auto-render`のどちらも指定されていない場合は無視しstderrに`warn=flag-ignored flag=--wait-ms`を出す |
 | --no-sandbox | フラグ | off | Chromeのsandboxを無効化する。起動直前にstderrへ`warn=no-sandbox`を1行出す（エスカレーションしない実行やskipされた実行では出さない）。継続コマンドにも再現する（用途はsandboxが起動しないCI環境に限り、通常利用では指定しない。「セキュリティと信頼モデル」参照） |
 | --raw | フラグ | off | 本文抽出をスキップしページ全体をMarkdown化。--renderとの併用可 |
-| --timeout | u64（秒） | 30 | 全体予算。静的経路は接続+読み取り、--render経路はChrome起動〜DOM取得までを含む上限 |
+| --timeout | u64（秒） | 30 | 全体予算。静的経路は接続+読み取り、--render経路はChrome起動〜DOM取得までを含み、取得後の本文抽出と変換もこの予算の残りで打ち切る |
 | --no-robots | フラグ | off | robots.txt確認をスキップ |
 | --allow-private | フラグ | off | netguardの内部アドレス拒否を解除 |
 | --no-tokens | フラグ | off | Tokensヘッダの計測・出力を省略 |
@@ -208,11 +208,13 @@ JSONエンベロープとfrontmatterに`render_status`（`static`/`rendered`/`fa
 
 | 事象 | 挙動 |
 |---|---|
+| 取得後の本文抽出と変換が--timeoutの残りを超えた | 終了コード4（`--auto-render`の描画後の抽出が超えた場合は、静的取得の結果へ戻して終了コード0）、stderrに`html processing exceeded --timeout`。抽出と変換はmainスレッドと同じ8MiBのスタックを持つ専用スレッドで行い、期限で待つのをやめる |
 | DNS失敗・接続拒否・タイムアウト・TLS証明書エラー・リダイレクトループ | stderrに機械可読1行、終了コード3。名前解決(getaddrinfo)自体も--timeoutで打ち切り、無応答DNSでのハングを防ぐ |
 | HTTP 4xx/5xx | stderrにステータスと1行説明（5xx/429は`retryable=true`）、終了コード4。403はメッセージ末尾に`hint=--render`を付ける（先頭行の書式と終了コード4は不変。自動エスカレーションはしない） |
 | Content-Typeが text/html・application/xhtml+xml・text/plain 以外 | 終了コード4（メディアタイプは大文字小文字を無視して判定）。text/plainは抽出とMarkdown変換を通さず素通しする。変更点は、危険リンクスキーム（インラインリンク・オートリンク・参照定義の3形）の無害化、端末制御文字の除去、webgrab制御マーカーの無害化に限り、生のHTMLタグは変更しない |
 | Content-Encodingの値が`gzip`・`deflate`・`br`のどれか1つではない（未知の値、または同名ヘッダの複数行を含む2つ以上の値） | 本文を読む前に終了コード4。`identity`と空の値は無視する。展開は自前で行い、`--max-bytes`は展開後のバイト数に掛ける |
-| 本文HTMLの要素ネストが深すぎる（抽出処理が計算量爆発する水準） | 抽出前に線形の深さ判定で打ち切り、終了コード4（stderrに--raw提案） |
+| 本文HTMLの要素ネストが深すぎる（抽出処理が計算量爆発する水準） | 抽出前に深さを判定して打ち切り、終了コード4（stderrに--raw提案）。深さは抽出・変換と同じHTML5パーサー（html5ever）の木で数え、htmlとbodyの2段を含めて1000段までを許す。木の構築は深さに対して二乗時間なので、入力を8KiBずつ解析器へ渡し、渡すたびに最後に作った要素の深さを調べて、上限を超えた時点で解析を打ち切る。最後まで解析した入力は、完成した木の深さを再帰せずに数える。上限より浅いまま要素の開閉を大量に繰り返す入力は、正当なページと区別できず、html5everの走査に入力の大きさに比例した時間がかかる。この時間は--timeoutで打ち切る |
+| `--raw`でMarkdownまたはtextへ変換するHTMLの要素ネストが深すぎる（変換の再帰がスタックを溢れさせる水準） | 変換前に同じ深さ判定で打ち切り、終了コード4（stderrに`--format html`提案） |
 | --max-bytes超過（展開後バイト数、ストリーミング判定） | ダウンロード中断、終了コード4 |
 | 文字コード判定失敗 | chardetng推定で強制デコード（置換文字許容）、stderrに警告、継続 |
 | 本文抽出0文字 | stderrに`hint=`トークン付き提案（`render_status`が`static`/`skipped`なら`--render/--raw`、`rendered`/`failed`/`no-gain`なら`--raw`）、終了コード6。`--raw`とtext/plainは抽出自体を行わないため対象外で、空本文でも終了コード0 |

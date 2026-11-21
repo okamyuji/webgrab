@@ -1,0 +1,3 @@
+# html5ever 0.40はInsertionPoint::BeforeSiblingを照合するだけで値として作らないため、
+# TreeSink::append_before_sibling は呼ばれず、その委譲の変異は試験で区別できない。
+exclude_re = ["<impl TreeSink for DepthProbe>::append_before_sibling"]

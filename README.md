@@ -74,7 +74,7 @@ Markdown Content:
 | 0 | 成功 |
 | 2 | 引数・URL形式エラー |
 | 3 | ネットワーク失敗（リトライ可） |
-| 4 | HTTPエラー・サイズ超過・未対応のContent-Type（403は`hint=--render`付き） |
+| 4 | HTTPエラー・サイズ超過・未対応のContent-Type・取得後の処理が`--timeout`を超過（403は`hint=--render`付き。`--auto-render`の描画後の処理が超過した場合は静的取得の結果を返す） |
 | 5 | robots.txtによる拒否 |
 | 6 | 本文が空 |
 | 7 | JSレンダリング失敗 |

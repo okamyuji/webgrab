@@ -63,7 +63,17 @@ fn remove_element(html: &str, tag: &str) -> String {
 }
 
 /// HTMLをMarkdownへ変換する。危険なリンクスキームは無害化する。
+/// htmdは要素の入れ子を再帰でたどり、数千段でスタックを溢れさせてabortするため、
+/// 抽出と同じ深さ上限を変換前にも掛ける（--rawは抽出を通らない）。
 pub fn to_markdown(html: &str) -> Result<String> {
+    use crate::nesting::{MAX_NESTING_DEPTH, exceeds_nesting_depth};
+    if exceeds_nesting_depth(html, MAX_NESTING_DEPTH) {
+        return Err(
+            WebgrabError::new(ExitCode::Http, "html too deeply nested for conversion").with_detail(
+                format!("nesting depth exceeds {MAX_NESTING_DEPTH}; retry with --format html"),
+            ),
+        );
+    }
     let md = htmd::convert(html).map_err(|e| {
         WebgrabError::new(ExitCode::Internal, "markdown convert failed").with_detail(e.to_string())
     })?;
@@ -348,6 +358,42 @@ pub fn visible_text_len(html: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn nested_divs(depth: usize) -> String {
+        format!("{}x{}", "<div>".repeat(depth), "</div>".repeat(depth))
+    }
+
+    #[test]
+    fn markdown_conversion_rejects_too_deep_nesting_with_exit_4() {
+        let e = to_markdown(&nested_divs(2_000)).unwrap_err();
+        assert_eq!(e.code, ExitCode::Http);
+        assert!(e.message.contains("too deeply nested"), "{}", e.message);
+        let e = to_text(&nested_divs(2_000)).unwrap_err();
+        assert_eq!(e.code, ExitCode::Http);
+    }
+
+    #[test]
+    fn markdown_conversion_rejects_self_closed_and_unmatched_nesting() {
+        for unit in ["<div/>", "<div></i>", r#"<div a="/>">"#] {
+            let e = to_markdown(&unit.repeat(2_000)).unwrap_err();
+            assert_eq!(e.code, ExitCode::Http, "{unit}");
+        }
+    }
+
+    #[test]
+    fn markdown_conversion_accepts_nesting_at_the_limit() {
+        // テストスレッドの既定スタック（2MiB）はmainスレッド（8MiB）より小さく、
+        // 上限ちょうどの入力でも溢れるため、mainと同じ大きさのスタックで確かめる。
+        // 深さはhtmlとbodyの2段を含むので、divは上限より2段少なくする。
+        let md = std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| to_markdown(&nested_divs(crate::nesting::MAX_NESTING_DEPTH - 2)))
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(md.trim(), "x");
+    }
 
     #[test]
     fn converts_headings_links_code() {
