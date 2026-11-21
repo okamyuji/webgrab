@@ -44,6 +44,7 @@ webgrab https://spa.example.com --render          # JSレンダリング
 webgrab https://spa.example.com --auto-render     # 本文が空か200文字未満のときだけJSレンダリングへ自動切替
 webgrab https://example.com --format json         # プログラム連携用
 webgrab https://example.com --format links        # ページ内リンクを絶対URLで1行ずつ（--rawでページ全体）
+webgrab https://example.com --map                 # 同じホストのURL一覧（sitemapと起点ページのリンクから）
 webgrab https://example.com --max-chars 8000      # 量を絞る
 webgrab https://example.com --start-index 8000    # 続きを取る
 webgrab https://example.com --format json --fence # エージェント用途の推奨（本文分離＋境界明示）
@@ -51,6 +52,8 @@ webgrab https://raw.githubusercontent.com/<owner>/<repo>/main/README.md   # text
 ```
 
 `--auto-render`は既定off。静的取得の本文が空または200文字未満のとき、同一プロセス内でJSレンダリングへ切り替えます。切替・失敗・skipはstderrと`--format json`の`render_status`（`static`/`rendered`/`failed`/`no-gain`/`skipped`）で分かります。`--wait-ms`（既定5000、`--render`/`--auto-render`時のみ有効）はrender取得の上限ミリ秒です。ネットワーク静止・DOM安定・可視テキスト200文字以上を満たせば上限前に終了します。
+
+`--map`は本文の代わりに、起点と同じホストのURLを1行1件で返します。並び順はsitemapのURLが先、起点ページのリンクが後で、重複とfragmentは除かれます。sitemapの入口はrobots.txtの`Sitemap:`行で、行が無いときは`/sitemap.xml`です。sitemap indexは1段だけたどり、gzipのsitemapは読みません。`Sitemap:`行と`<loc>`は完全なURLだけを読みます（sitemaps.orgの規約）。読まなかった相対URLの件数は`warn=sitemap-skipped reason=relative-url`に出ます。sitemapの取得は20件が上限で、本文の取得は残りの`--timeout`と`--max-bytes`の範囲に収めます。打ち切りや取得失敗はstderrの`warn=sitemap-skipped`と`warn=sitemap-failed`に出ますが、その場合も起点ページのリンクで結果を返します。`warn=sitemap-skipped`は理由ごとに1行で、取得しなかったsitemapの数を`remaining=`、取得したsitemapの中で読み飛ばした数（`relative-url`と`nested-index`）を`count=`で示します。URL一覧にも本文と同じ`--max-chars`の上限がかかり、続きは`--start-index`で取ります。続きを取るたびにsitemapを最初から取り直すので、大きなサイトの全件を一度に取るときは`--max-chars`を大きくしてください（`0`はメタ情報だけを返します）。`--render`・`--auto-render`・`--raw`・`--wait-ms`とは併用できません。
 
 デフォルトのmarkdown形式の出力を次に示します。
 
@@ -73,7 +76,7 @@ Markdown Content:
 |---|---|
 | 0 | 成功 |
 | 2 | 引数・URL形式エラー |
-| 3 | ネットワーク失敗（リトライ可） |
+| 3 | ネットワーク失敗・取得が`--timeout`を超過（リトライ可） |
 | 4 | HTTPエラー・サイズ超過・未対応のContent-Type・取得後の処理が`--timeout`を超過（403は`hint=--render`付き。`--auto-render`の描画後の処理が超過した場合は静的取得の結果を返す） |
 | 5 | robots.txtによる拒否 |
 | 6 | 本文が空 |
@@ -91,6 +94,7 @@ webgrabは任意のWebページ本文をLLMへ渡すため、取得内容は信�
 - `--fence`: 本文を `[webgrab:untrusted-content ...]` 〜 `[webgrab:untrusted-content-end]` で囲み、外部データの境界を明示する（本文からは閉じマーカーを偽造できない）。`--format json` では本文が `markdown` フィールドに構造的に分離され、`untrusted: true` と `untrusted_note` で同じ非信頼シグナルを渡す。
 - `--no-sandbox`: Chromeのsandboxはページ側HTML/JSに対する封じ込め層です。無効化するとその層が失われるため、sandboxが起動しないCI環境等に限って指定してください。通常利用では指定しないでください。指定時はstderrに`warn=no-sandbox`が出て、続き取得の継続コマンドにも再現されます。
 - `--auto-render`: 外部ページは本文を短く返すだけでChrome起動を誘発できます。エスカレーション時は対象オリジンへ描画1ページ分（サブリソース含む）の追加要求が発生するため、自側のコストは残余`--timeout`と残余`--max-bytes`で上限づけられます。一覧ページや連続取得を大量に行う用途では既定にしないでください。
+- `--map`: 起点ページに加えてsitemapを最大20件取得します。robots.txtもsitemapの入口を探すために1件取得します。`--no-robots`が無ければ、sitemapごとの判定のためにも取得します。判定のための取得は固定の上限（5秒、512KiB）で行い、`--max-bytes`の残りには数えません。時間は、その判定を含む各取得の`--timeout`の中に収めます。各取得は通常の取得と同じ内部アドレス拒否を通ります。`--allow-private`を引き継ぐのは、起点と同じオリジンのURLを指すsitemapの取得だけです。robots.txtやsitemap indexが別オリジンの内部アドレスを指しても、webgrabはそこへ要求を出しません。ただし同じオリジンのsitemapが転送した先へは、起点ページの転送と同じく`--allow-private`のまま要求します。sitemapの転送と、sitemapごとのrobots.txtの判定の転送は、今のホストか起点のホストへだけたどります。判定のためのrobots.txtが第三者のホストへ転送された場合は、取得できなかったときと同じく許可として扱います。悪意のあるsitemapが転送を重ねて、第三者へ多くの要求を送らせることを防ぐためです。ただし、robots.txtの`Sitemap:`行やsitemap indexが別のホストを直接指す場合は、そのホストへsitemapとrobots.txtの判定の要求を出します（sitemapは最大20件）。
 
 プロンプトインジェクションの根本防御は消費側の責務です。本文中の説得型指示（「以前の指示を無視せよ」等）はツールでは防げません。呼び出す側のエージェントは、取得本文を指示として自動実行せず、破壊的・外部影響のある操作は人間確認を挟んでください。エージェント用途では、本文が構造的に分離される `--format json` の利用と `--fence` の併用を推奨します。
 

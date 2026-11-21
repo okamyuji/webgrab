@@ -69,6 +69,15 @@ pub fn start(routes: Vec<Route>) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let stop = Arc::new(AtomicBool::new(false));
+    // 本文はポートが決まる前に作るので、自分自身を指す絶対URLは`{origin}`と書いておく。
+    let origin = format!("http://127.0.0.1:{port}");
+    let routes: Vec<Route> = routes
+        .into_iter()
+        .map(|r| Route {
+            body: with_origin(r.body, &origin),
+            ..r
+        })
+        .collect();
     let routes = Arc::new(routes);
     let stop_t = stop.clone();
     thread::spawn(move || {
@@ -86,6 +95,25 @@ pub fn start(routes: Vec<Route>) -> Server {
         }
     });
     Server { port, stop }
+}
+
+fn with_origin(body: Vec<u8>, origin: &str) -> Vec<u8> {
+    const MARK: &[u8] = b"{origin}";
+    if !body.windows(MARK.len()).any(|w| w == MARK) {
+        return body;
+    }
+    let mut out = Vec::with_capacity(body.len());
+    let mut rest = body.as_slice();
+    while !rest.is_empty() {
+        if rest.starts_with(MARK) {
+            out.extend_from_slice(origin.as_bytes());
+            rest = &rest[MARK.len()..];
+        } else {
+            out.push(rest[0]);
+            rest = &rest[1..];
+        }
+    }
+    out
 }
 
 fn serve_one(mut stream: TcpStream, routes: &[Route]) {

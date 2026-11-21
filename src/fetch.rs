@@ -59,6 +59,13 @@ pub struct FetchOptions {
     pub max_bytes: u64,
     pub allow_private: bool,
     pub check_robots: bool,
+    /// `application/xml`と`text/xml`も受ける（`--map`のsitemap取得だけで使う）。
+    pub allow_xml: bool,
+    /// `Some(home)`なら、転送は今のホストか`home`へだけたどる（`--map`のsitemap取得で
+    /// 起点のホストを渡す）。悪意あるsitemapが第三者へ転送すると、sitemapの件数×転送の段数×
+    /// robots確認の分だけ第三者へ要求が届く。起点のホストは利用者が選んだ相手なので許す
+    /// （`example.com`のsitemapを`www.example.com`へ転送するサイトがある）。
+    pub redirect_home: Option<String>,
 }
 
 /// ホスト名を解決し、netguardを通した検証済みSocketAddrを返す。
@@ -154,6 +161,11 @@ async fn robots_allowed(url: &Url, addr: SocketAddr, opts: &FetchOptions) -> Res
             let Some(next) = robots_redirect_target(&resp, &target) else {
                 return Ok(true);
             };
+            // 本文の転送と同じ制限を掛ける。たどれない転送は取得失敗と同じく許可扱い。
+            let from = Url::parse(&target).ok();
+            if from.is_none_or(|f| !redirect_allowed(opts.redirect_home.as_deref(), &f, &next)) {
+                return Ok(true);
+            }
             let host = next.host_str().unwrap_or_default().to_string();
             let port = next.port_or_known_default().unwrap_or(80);
             // 追従先を再解決・再検証（内部アドレスなら拒否）
@@ -258,12 +270,14 @@ fn coding_of_response(resp: &reqwest::Response) -> Result<Coding> {
 }
 
 /// メディアタイプが対応外なら`ExitCode::Http`で拒否する（メディアタイプは大小無視: RFC 9110 §8.3.1）。
-fn check_media_type(content_type: Option<&str>) -> Result<()> {
+fn check_media_type(content_type: Option<&str>, allow_xml: bool) -> Result<()> {
     let Some(ct) = content_type else {
         return Ok(());
     };
     let main = ct.split(';').next().unwrap_or("").trim();
-    if !is_supported_media_type(main) {
+    let xml = allow_xml
+        && (main.eq_ignore_ascii_case("application/xml") || main.eq_ignore_ascii_case("text/xml"));
+    if !xml && !is_supported_media_type(main) {
         return Err(WebgrabError::new(
             ExitCode::Http,
             format!("unsupported content-type: {main}"),
@@ -285,7 +299,7 @@ fn redirect_target(resp: &reqwest::Response, current: &Url) -> Result<Url> {
 }
 
 /// 非3xx応答を本文読み込みの前に検査し、Content-Typeと展開方式を返す。
-fn accept_response(resp: &reqwest::Response) -> Result<(Option<String>, Coding)> {
+fn accept_response(resp: &reqwest::Response, allow_xml: bool) -> Result<(Option<String>, Coding)> {
     let status = resp.status();
     if status.is_client_error() || status.is_server_error() {
         return Err(WebgrabError::new(
@@ -298,12 +312,27 @@ fn accept_response(resp: &reqwest::Response) -> Result<(Option<String>, Coding)>
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    check_media_type(content_type.as_deref())?;
+    check_media_type(content_type.as_deref(), allow_xml)?;
     Ok((content_type, coding_of_response(resp)?))
 }
 
-/// 静的取得を手動リダイレクト追従で行う（各ホップでnetguard再適用）。
+fn redirect_allowed(home: Option<&str>, current: &Url, next: &Url) -> bool {
+    home.is_none_or(|h| next.host_str() == current.host_str() || next.host_str() == Some(h))
+}
+
+/// 静的取得を手動リダイレクト追従で行う（各ホップでnetguard再適用）。`opts.timeout`は
+/// 名前解決・robots確認・転送・本文読み込みの全体に掛ける。各段に渡すだけでは段ごとに
+/// 同じ時間を使えてしまい、転送が続くと合計が`--timeout`を超える。
 pub async fn fetch(url_str: &str, opts: &FetchOptions) -> Result<Fetched> {
+    tokio::time::timeout(opts.timeout, fetch_hops(url_str, opts))
+        .await
+        .unwrap_or_else(|_| {
+            Err(WebgrabError::new(ExitCode::Network, "request timed out")
+                .with_detail(format!("url={url_str} timeout={:?}", opts.timeout)))
+        })
+}
+
+async fn fetch_hops(url_str: &str, opts: &FetchOptions) -> Result<Fetched> {
     let mut current = Url::parse(url_str).map_err(|e| {
         WebgrabError::new(ExitCode::Usage, "invalid URL").with_detail(e.to_string())
     })?;
@@ -324,10 +353,18 @@ pub async fn fetch(url_str: &str, opts: &FetchOptions) -> Result<Fetched> {
         })?;
 
         if resp.status().is_redirection() {
-            current = redirect_target(&resp, &current)?;
+            let next = redirect_target(&resp, &current)?;
+            if !redirect_allowed(opts.redirect_home.as_deref(), &current, &next) {
+                return Err(WebgrabError::new(
+                    ExitCode::Network,
+                    "redirect to another host refused",
+                )
+                .with_detail(format!("from={current} to={next}")));
+            }
+            current = next;
             continue;
         }
-        let (content_type, coding) = accept_response(&resp)?;
+        let (content_type, coding) = accept_response(&resp, opts.allow_xml)?;
 
         // ストリーミング読み込みで max_bytes を展開後サイズに適用
         let body = read_capped(resp, coding, opts.max_bytes).await?;
@@ -404,12 +441,47 @@ mod tests {
 
     #[test]
     fn check_media_type_rejects_unsupported_with_exit_4() {
-        assert!(check_media_type(None).is_ok());
-        assert!(check_media_type(Some("text/html; charset=utf-8")).is_ok());
-        assert!(check_media_type(Some("text/plain")).is_ok());
-        let e = check_media_type(Some("application/pdf; q=1")).unwrap_err();
+        assert!(check_media_type(None, false).is_ok());
+        assert!(check_media_type(Some("text/html; charset=utf-8"), false).is_ok());
+        assert!(check_media_type(Some("text/plain"), false).is_ok());
+        let e = check_media_type(Some("application/pdf; q=1"), false).unwrap_err();
         assert_eq!(e.code, ExitCode::Http);
         assert_eq!(e.message, "unsupported content-type: application/pdf");
+    }
+
+    #[test]
+    fn redirect_allowed_keeps_sitemaps_on_the_current_or_home_host() {
+        let u = |s: &str| Url::parse(s).unwrap();
+        let cur = u("https://example.com/sitemap.xml");
+        assert!(redirect_allowed(None, &cur, &u("https://third.test/x")));
+        let home = Some("www.example.com");
+        assert!(redirect_allowed(
+            home,
+            &cur,
+            &u("http://example.com:8080/s.xml")
+        ));
+        assert!(redirect_allowed(
+            home,
+            &cur,
+            &u("https://www.example.com/sitemap.xml")
+        ));
+        assert!(!redirect_allowed(home, &cur, &u("https://third.test/x")));
+        assert!(!redirect_allowed(
+            home,
+            &cur,
+            &u("https://sub.www.example.com/x")
+        ));
+    }
+
+    #[test]
+    fn check_media_type_accepts_xml_only_when_allowed() {
+        for ct in ["application/xml", "Text/XML; charset=utf-8"] {
+            assert!(check_media_type(Some(ct), true).is_ok(), "{ct}");
+            assert!(check_media_type(Some(ct), false).is_err(), "{ct}");
+        }
+        assert!(check_media_type(Some("text/html"), true).is_ok());
+        assert!(check_media_type(Some("application/pdf"), true).is_err());
+        assert!(check_media_type(Some("application/rss+xml"), true).is_err());
     }
 
     #[test]
@@ -442,6 +514,8 @@ mod tests {
             max_bytes: 1024,
             allow_private: false,
             check_robots: true,
+            allow_xml: false,
+            redirect_home: None,
         }
     }
 

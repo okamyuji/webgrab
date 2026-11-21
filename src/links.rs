@@ -24,7 +24,7 @@ pub fn extract_links(html: &str, base: &str) -> String {
 
 /// 解決でき、http/httpsで、fragmentを除いたURL文字列。`#top`のようなページ内アンカーは
 /// fragment除去後に現在のページ自身を指すだけなので捨てる。
-fn resolve(base: Option<&Url>, href: &str) -> Option<String> {
+pub(crate) fn resolve(base: Option<&Url>, href: &str) -> Option<String> {
     if href.trim_start().starts_with('#') {
         return None;
     }
