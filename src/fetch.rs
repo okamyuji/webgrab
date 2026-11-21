@@ -1,6 +1,7 @@
 //! HTTP取得（設計§3.1, §4 fetch）。
 //! IPピン留め・手動リダイレクト追従・netguard/robotsの結線を担う。
 
+use crate::content_encoding::{self, Coding, DecodeError, Decoder};
 use crate::error::{ExitCode, Result, WebgrabError};
 use crate::{netguard, robots::Robots};
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -134,6 +135,7 @@ async fn robots_allowed(url: &Url, addr: SocketAddr, opts: &FetchOptions) -> Res
     for attempt in 0..2 {
         let client = reqwest::Client::builder()
             .user_agent(&opts.user_agent)
+            .default_headers(accept_encoding_header())
             .timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
             .resolve(&pinned_host, pinned_addr)
@@ -149,19 +151,9 @@ async fn robots_allowed(url: &Url, addr: SocketAddr, opts: &FetchOptions) -> Res
         };
         let status = resp.status();
         if status.is_redirection() && attempt == 0 {
-            let Some(loc) = resp
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-            else {
+            let Some(next) = robots_redirect_target(&resp, &target) else {
                 return Ok(true);
             };
-            let Ok(next) = Url::parse(&target).and_then(|b| b.join(loc)) else {
-                return Ok(true);
-            };
-            if !netguard::is_allowed_scheme(next.scheme()) {
-                return Ok(true);
-            }
             let host = next.host_str().unwrap_or_default().to_string();
             let port = next.port_or_known_default().unwrap_or(80);
             // 追従先を再解決・再検証（内部アドレスなら拒否）
@@ -184,6 +176,17 @@ async fn robots_allowed(url: &Url, addr: SocketAddr, opts: &FetchOptions) -> Res
         return Ok(rules.allowed(&path));
     }
     Ok(true)
+}
+
+/// robots.txtの3xx応答からリダイレクト先を求める。追従できない応答は`None`（許可扱い）。
+fn robots_redirect_target(resp: &reqwest::Response, target: &str) -> Option<Url> {
+    let loc = resp
+        .headers()
+        .get(reqwest::header::LOCATION)?
+        .to_str()
+        .ok()?;
+    let next = Url::parse(target).and_then(|b| b.join(loc)).ok()?;
+    netguard::is_allowed_scheme(next.scheme()).then_some(next)
 }
 
 /// 対象URL単体のrobots.txt許可判定（render経路用）。静的経路と同じ範囲＝トップURLのみを
@@ -216,7 +219,7 @@ async fn resolve_url(url: &Url, opts: &FetchOptions) -> Result<(String, SocketAd
 /// 本文取得用クライアントを構築する。`Accept`を§4.3の値に固定する（G3）。
 /// `default_headers`は`insert`で既定の`Accept: */*`を置き換えるため、送るAcceptは1値だけになる。
 fn build_body_client(opts: &FetchOptions, host: &str, addr: SocketAddr) -> Result<reqwest::Client> {
-    let mut headers = reqwest::header::HeaderMap::with_capacity(1);
+    let mut headers = accept_encoding_header();
     headers.insert(
         reqwest::header::ACCEPT,
         reqwest::header::HeaderValue::from_static(BODY_ACCEPT),
@@ -231,6 +234,27 @@ fn build_body_client(opts: &FetchOptions, host: &str, addr: SocketAddr) -> Resul
         .map_err(|e| {
             WebgrabError::new(ExitCode::Internal, "client build failed").with_detail(e.to_string())
         })
+}
+
+/// 自前で展開する方式だけを提示する（reqwestの自動展開は使わない）。
+fn accept_encoding_header() -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::with_capacity(2);
+    headers.insert(
+        reqwest::header::ACCEPT_ENCODING,
+        reqwest::header::HeaderValue::from_static(content_encoding::ACCEPT_ENCODING),
+    );
+    headers
+}
+
+/// Content-Encodingの全行・全値から展開方式を決める。展開できなければ`ExitCode::Http`で拒否する。
+fn coding_of_response(resp: &reqwest::Response) -> Result<Coding> {
+    let values = resp.headers().get_all(reqwest::header::CONTENT_ENCODING);
+    content_encoding::coding_of(values.iter().map(|v| v.as_bytes())).map_err(|enc| {
+        WebgrabError::new(
+            ExitCode::Http,
+            format!("unsupported content-encoding: {enc}"),
+        )
+    })
 }
 
 /// メディアタイプが対応外なら`ExitCode::Http`で拒否する（メディアタイプは大小無視: RFC 9110 §8.3.1）。
@@ -248,23 +272,6 @@ fn check_media_type(content_type: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// reqwestが展開しなかった符号化（br等）が残っていれば`ExitCode::Http`で拒否する。
-/// reqwestは展開したgzip/deflateのContent-Encodingを外すため、残る値は未展開を意味する。
-/// Brotli展開はCVE-2026-111497と同型の欠陥がRust移植版に未修正で残るため無効化している。
-fn check_content_encoding(content_encoding: &[u8]) -> Result<()> {
-    let enc = content_encoding.trim_ascii();
-    if !enc.is_empty() && !enc.eq_ignore_ascii_case(b"identity") {
-        return Err(WebgrabError::new(
-            ExitCode::Http,
-            format!(
-                "unsupported content-encoding: {}",
-                String::from_utf8_lossy(enc)
-            ),
-        ));
-    }
-    Ok(())
-}
-
 /// 3xx応答のLocationを現在URL基準で解決する。
 fn redirect_target(resp: &reqwest::Response, current: &Url) -> Result<Url> {
     let location = resp
@@ -277,8 +284,8 @@ fn redirect_target(resp: &reqwest::Response, current: &Url) -> Result<Url> {
     })
 }
 
-/// 非3xx応答を本文読み込みの前に検査し、Content-Typeを返す。
-fn accept_response(resp: &reqwest::Response) -> Result<Option<String>> {
+/// 非3xx応答を本文読み込みの前に検査し、Content-Typeと展開方式を返す。
+fn accept_response(resp: &reqwest::Response) -> Result<(Option<String>, Coding)> {
     let status = resp.status();
     if status.is_client_error() || status.is_server_error() {
         return Err(WebgrabError::new(
@@ -292,11 +299,7 @@ fn accept_response(resp: &reqwest::Response) -> Result<Option<String>> {
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
     check_media_type(content_type.as_deref())?;
-    // getは同名ヘッダの先頭値しか返さないため、`identity`の後ろの`br`を見落とさないよう全値を検査する。
-    for enc in resp.headers().get_all(reqwest::header::CONTENT_ENCODING) {
-        check_content_encoding(enc.as_bytes())?;
-    }
-    Ok(content_type)
+    Ok((content_type, coding_of_response(resp)?))
 }
 
 /// 静的取得を手動リダイレクト追従で行う（各ホップでnetguard再適用）。
@@ -324,10 +327,10 @@ pub async fn fetch(url_str: &str, opts: &FetchOptions) -> Result<Fetched> {
             current = redirect_target(&resp, &current)?;
             continue;
         }
-        let content_type = accept_response(&resp)?;
+        let (content_type, coding) = accept_response(&resp)?;
 
         // ストリーミング読み込みで max_bytes を展開後サイズに適用
-        let body = read_capped(resp, opts.max_bytes).await?;
+        let body = read_capped(resp, coding, opts.max_bytes).await?;
         return Ok(Fetched {
             final_url: current.to_string(),
             content_type,
@@ -340,32 +343,37 @@ pub async fn fetch(url_str: &str, opts: &FetchOptions) -> Result<Fetched> {
 
 /// robots.txt をチャンク単位で読み、上限超過・読み取り失敗時は None を返す。
 /// 上限超過は「大きすぎる robots は許可扱い」というポリシーに合わせて呼び出し側で処理する。
+/// 展開できない符号化も、読み取り失敗・展開失敗と同じく`None`（許可扱い）にする。
 async fn read_capped_robots(mut resp: reqwest::Response, max_bytes: usize) -> Option<Vec<u8>> {
-    let mut buf: Vec<u8> = Vec::new();
+    let coding = coding_of_response(&resp).ok()?;
+    let mut decoder = Decoder::new(coding, max_bytes as u64);
     while let Some(chunk) = resp.chunk().await.ok()? {
-        if buf.len() + chunk.len() > max_bytes {
-            return None; // 上限超過
-        }
-        buf.extend_from_slice(&chunk);
+        decoder.push(&chunk).ok()?;
     }
-    Some(buf)
+    decoder.finish().ok()
 }
 
-async fn read_capped(mut resp: reqwest::Response, max_bytes: u64) -> Result<Vec<u8>> {
-    // chunk()は逐次読み込みで、展開後（gzip等デコード後）のバイト列を返す。
-    let mut buf: Vec<u8> = Vec::new();
+async fn read_capped(
+    mut resp: reqwest::Response,
+    coding: Coding,
+    max_bytes: u64,
+) -> Result<Vec<u8>> {
+    let decode_err = |e: DecodeError| match e {
+        DecodeError::OverCap => WebgrabError::new(
+            ExitCode::Http,
+            format!("response exceeds --max-bytes ({max_bytes})"),
+        ),
+        DecodeError::Corrupt(d) => {
+            WebgrabError::new(ExitCode::Network, "stream read failed").with_detail(d)
+        }
+    };
+    let mut decoder = Decoder::new(coding, max_bytes);
     while let Some(chunk) = resp.chunk().await.map_err(|e| {
         WebgrabError::new(ExitCode::Network, "stream read failed").with_detail(e.to_string())
     })? {
-        if buf.len() as u64 + chunk.len() as u64 > max_bytes {
-            return Err(WebgrabError::new(
-                ExitCode::Http,
-                format!("response exceeds --max-bytes ({max_bytes})"),
-            ));
-        }
-        buf.extend_from_slice(&chunk);
+        decoder.push(&chunk).map_err(decode_err)?;
     }
-    Ok(buf)
+    decoder.finish().map_err(decode_err)
 }
 
 #[cfg(test)]
@@ -402,25 +410,6 @@ mod tests {
         let e = check_media_type(Some("application/pdf; q=1")).unwrap_err();
         assert_eq!(e.code, ExitCode::Http);
         assert_eq!(e.message, "unsupported content-type: application/pdf");
-    }
-
-    #[test]
-    fn check_content_encoding_rejects_undecoded_encodings_with_exit_4() {
-        assert!(check_content_encoding(b"identity").is_ok());
-        assert!(check_content_encoding(b" Identity ").is_ok());
-        assert!(check_content_encoding(b"").is_ok()); // RFC 9110の空リスト
-        assert!(check_content_encoding(b"  ").is_ok());
-        for (enc, shown) in [
-            (&b"br"[..], "br"),
-            (b"BR", "BR"),
-            (b" gzip, br ", "gzip, br"),
-            (b"zstd", "zstd"),
-            (b"identit\xff", "identit\u{fffd}"),
-        ] {
-            let e = check_content_encoding(enc).unwrap_err();
-            assert_eq!(e.code, ExitCode::Http, "enc={shown}");
-            assert_eq!(e.message, format!("unsupported content-encoding: {shown}"));
-        }
     }
 
     #[test]

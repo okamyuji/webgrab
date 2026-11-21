@@ -211,6 +211,7 @@ JSONエンベロープとfrontmatterに`render_status`（`static`/`rendered`/`fa
 | DNS失敗・接続拒否・タイムアウト・TLS証明書エラー・リダイレクトループ | stderrに機械可読1行、終了コード3。名前解決(getaddrinfo)自体も--timeoutで打ち切り、無応答DNSでのハングを防ぐ |
 | HTTP 4xx/5xx | stderrにステータスと1行説明（5xx/429は`retryable=true`）、終了コード4。403はメッセージ末尾に`hint=--render`を付ける（先頭行の書式と終了コード4は不変。自動エスカレーションはしない） |
 | Content-Typeが text/html・application/xhtml+xml・text/plain 以外 | 終了コード4（メディアタイプは大文字小文字を無視して判定）。text/plainは抽出とMarkdown変換を通さず素通しする。変更点は、危険リンクスキーム（インラインリンク・オートリンク・参照定義の3形）の無害化、端末制御文字の除去、webgrab制御マーカーの無害化に限り、生のHTMLタグは変更しない |
+| Content-Encodingの値が`gzip`・`deflate`・`br`のどれか1つではない（未知の値、または同名ヘッダの複数行を含む2つ以上の値） | 本文を読む前に終了コード4。`identity`と空の値は無視する。展開は自前で行い、`--max-bytes`は展開後のバイト数に掛ける |
 | 本文HTMLの要素ネストが深すぎる（抽出処理が計算量爆発する水準） | 抽出前に線形の深さ判定で打ち切り、終了コード4（stderrに--raw提案） |
 | --max-bytes超過（展開後バイト数、ストリーミング判定） | ダウンロード中断、終了コード4 |
 | 文字コード判定失敗 | chardetng推定で強制デコード（置換文字許容）、stderrに警告、継続 |

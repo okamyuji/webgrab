@@ -765,21 +765,30 @@ fn plain_text_markdown_escapes_cannot_hide_dangerous_link() {
     );
 }
 
-const SENTINEL_BR: &str = "SENTINEL_BR_4d1e";
+const SENTINEL_BR: &str = "SENTINEL-BR-4d1e";
+const SENTINEL_ZSTD: &str = "SENTINEL-ZSTD-7b2a";
 
-fn br_article() -> common::Route {
+fn encoded(path: &'static str, body: &[u8], encoding: &str) -> common::Route {
     common::Route {
-        path: "/br",
-        body: include_bytes!("fixtures/article.html.br").to_vec(),
+        path,
+        body: body.to_vec(),
         content_type: "text/html; charset=utf-8",
-        headers: vec![("Content-Encoding", "br".to_string())],
+        headers: vec![("Content-Encoding", encoding.to_string())],
         delay_ms: 0,
         status: "200 OK",
     }
 }
 
+fn br_article() -> common::Route {
+    encoded("/br", include_bytes!("fixtures/article.html.br"), "br")
+}
+
+fn zstd_article() -> common::Route {
+    encoded("/zstd", include_bytes!("fixtures/article.html.zst"), "zstd")
+}
+
 #[test]
-fn body_fetch_offers_gzip_but_not_brotli() {
+fn body_fetch_offers_gzip_and_brotli_but_not_zstd() {
     use std::sync::{Arc, Mutex};
 
     let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -793,20 +802,67 @@ fn body_fetch_offers_gzip_but_not_brotli() {
     assert_eq!(code, 0, "stderr={stderr}");
 
     let ae = seen.lock().unwrap().clone().unwrap_or_default();
-    assert!(ae.contains("gzip"), "accept-encoding={ae}");
-    assert!(!ae.contains("br"), "accept-encoding={ae}");
+    for enc in ["gzip", "deflate", "br"] {
+        assert!(ae.contains(enc), "accept-encoding={ae}");
+    }
+    assert!(!ae.contains("zstd"), "accept-encoding={ae}");
 }
 
 #[test]
-fn brotli_encoded_response_is_rejected_with_exit_4() {
+fn deflate_encoded_response_is_decoded() {
+    use std::io::Write;
+    let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    z.write_all(ARTICLE.as_bytes()).unwrap();
+    let s = common::start(vec![encoded("/deflate", &z.finish().unwrap(), "deflate")]);
+    let (code, stdout, stderr) =
+        run_webgrab(&[&s.url("/deflate"), "--allow-private", "--no-robots"]);
+    assert_eq!(code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(stdout.contains("統合テスト記事"), "stdout={stdout}");
+}
+
+#[test]
+fn supported_encoding_followed_by_another_header_line_is_rejected_with_exit_4() {
+    // 展開できる値が1行目にあっても、2行目の値を捨てて展開してはならない。
+    use std::io::Write;
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(ARTICLE.as_bytes()).unwrap();
+    let gz = gz.finish().unwrap();
+    for (first, body) in [
+        ("br", &include_bytes!("fixtures/article.html.br")[..]),
+        ("gzip", &gz[..]),
+    ] {
+        let mut route = encoded("/stacked", body, first);
+        route.headers.push(("Content-Encoding", "zstd".to_string()));
+        let s = common::start(vec![route]);
+        let (code, stdout, stderr) =
+            run_webgrab(&[&s.url("/stacked"), "--allow-private", "--no-robots"]);
+        assert_eq!(code, 4, "first={first} stderr={stderr} stdout={stdout}");
+        assert!(
+            stderr.contains(&format!("unsupported content-encoding: {first}, zstd")),
+            "first={first} stderr={stderr}"
+        );
+    }
+}
+
+#[test]
+fn brotli_encoded_response_is_decoded() {
     let s = common::start(vec![br_article()]);
     let (code, stdout, stderr) = run_webgrab(&[&s.url("/br"), "--allow-private", "--no-robots"]);
+    assert_eq!(code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(stdout.contains(SENTINEL_BR), "stdout={stdout}");
+}
+
+#[test]
+fn zstd_encoded_response_is_rejected_with_exit_4() {
+    // zstdの展開はCのlibzstdに依存するため有効にしていない。
+    let s = common::start(vec![zstd_article()]);
+    let (code, stdout, stderr) = run_webgrab(&[&s.url("/zstd"), "--allow-private", "--no-robots"]);
     assert_eq!(code, 4, "stderr={stderr} stdout={stdout}");
     assert!(
-        stderr.contains("unsupported content-encoding: br"),
+        stderr.contains("unsupported content-encoding: zstd"),
         "stderr={stderr}"
     );
-    assert!(!stdout.contains(SENTINEL_BR), "stdout={stdout}");
+    assert!(!stdout.contains(SENTINEL_ZSTD), "stdout={stdout}");
 }
 
 #[test]
@@ -822,6 +878,69 @@ fn gzip_encoded_response_is_still_decoded() {
     ]);
     assert_eq!(code, 4, "stderr={stderr}");
     assert!(stderr.contains("exceeds --max-bytes"), "stderr={stderr}");
+}
+
+#[test]
+fn max_bytes_applies_to_decoded_size_for_brotli() {
+    // 圧縮後は200バイト未満。展開後の約2MiBで--max-bytesに掛かれば、展開後の大きさで判定している。
+    let s = common::start(vec![encoded(
+        "/big_br",
+        include_bytes!("fixtures/big_br.html.br"),
+        "br",
+    )]);
+    let (code, _stdout, stderr) = run_webgrab(&[
+        &s.url("/big_br"),
+        "--allow-private",
+        "--no-robots",
+        "--max-bytes",
+        "1048576",
+    ]);
+    assert_eq!(code, 4, "stderr={stderr}");
+    assert!(stderr.contains("exceeds --max-bytes"), "stderr={stderr}");
+}
+
+fn br_robots(body: &[u8]) -> common::Route {
+    let mut r = encoded("/robots.txt", body, "br");
+    r.content_type = "text/plain";
+    r
+}
+
+#[test]
+fn brotli_encoded_robots_is_decoded_before_parsing() {
+    let s = common::start(vec![
+        br_robots(include_bytes!("fixtures/robots_disallow.txt.br")),
+        common::Route::html("/a", ARTICLE),
+    ]);
+    let (code, _stdout, stderr) = run_webgrab(&[&s.url("/a"), "--allow-private"]);
+    assert_eq!(code, 5, "stderr={stderr}");
+}
+
+#[test]
+fn robots_size_cap_applies_to_decoded_size() {
+    // 圧縮後は50バイト未満。展開後は512KiBを超えるので許可扱いになり、Disallowは効かない。
+    let s = common::start(vec![
+        br_robots(include_bytes!("fixtures/robots_over_cap.txt.br")),
+        common::Route::html("/a", ARTICLE),
+    ]);
+    let (code, _stdout, stderr) = run_webgrab(&[&s.url("/a"), "--allow-private"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+}
+
+#[test]
+fn unknown_encoding_is_rejected_with_exit_4() {
+    let s = common::start(vec![encoded(
+        "/compress",
+        include_bytes!("fixtures/article.html.br"),
+        "compress",
+    )]);
+    let (code, stdout, stderr) =
+        run_webgrab(&[&s.url("/compress"), "--allow-private", "--no-robots"]);
+    assert_eq!(code, 4, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stderr.contains("unsupported content-encoding: compress"),
+        "stderr={stderr}"
+    );
+    assert!(!stdout.contains(SENTINEL_BR), "stdout={stdout}");
 }
 
 #[test]
@@ -854,17 +973,21 @@ fn redirect_without_location_fails_with_network_error() {
 }
 
 #[test]
-fn brotli_after_identity_in_repeated_headers_is_rejected_with_exit_4() {
-    let mut route = br_article();
-    route.headers = vec![
-        ("Content-Encoding", "identity".to_string()),
-        ("Content-Encoding", "br".to_string()),
-    ];
+fn unknown_encoding_after_identity_in_repeated_headers_is_rejected_with_exit_4() {
+    let mut route = encoded(
+        "/compress",
+        include_bytes!("fixtures/article.html.br"),
+        "identity",
+    );
+    route
+        .headers
+        .push(("Content-Encoding", "compress".to_string()));
     let s = common::start(vec![route]);
-    let (code, stdout, stderr) = run_webgrab(&[&s.url("/br"), "--allow-private", "--no-robots"]);
+    let (code, stdout, stderr) =
+        run_webgrab(&[&s.url("/compress"), "--allow-private", "--no-robots"]);
     assert_eq!(code, 4, "stderr={stderr} stdout={stdout}");
     assert!(
-        stderr.contains("unsupported content-encoding: br"),
+        stderr.contains("unsupported content-encoding: compress"),
         "stderr={stderr}"
     );
 }
