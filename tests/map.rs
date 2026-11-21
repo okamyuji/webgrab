@@ -174,15 +174,21 @@ fn map_ignores_and_counts_relative_sitemap_urls() {
         xml("/declared.xml", urlset(&["/from-relative".into()])),
         xml(
             "/sitemap.xml",
-            "<urlset><url><loc>{origin}/from-default</loc></url><url><loc>rel</loc></url></urlset>",
+            "<urlset><url><loc>{origin}/from-default</loc></url><url><loc>rel</loc></url><url><loc>http://</loc></url></urlset>",
         ),
     ]);
     let (code, stdout, stderr) = run(&[&s.url("/"), "--allow-private", "--map"]);
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(lines(&stdout), vec![s.url("/from-default")]);
     // robots.txtの相対行1件と<loc>の相対値1件を、黙って捨てずに数で知らせる。
+    // `http://`は相対ではなく不正な絶対URLなので数えない。
     assert!(
-        stderr.contains("webgrab: warn=sitemap-skipped reason=relative-url remaining=2\n"),
+        stderr.contains("webgrab: warn=sitemap-skipped reason=relative-url count=2\n"),
+        "stderr={stderr}"
+    );
+    assert_eq!(
+        stderr.matches("reason=relative-url").count(),
+        1,
         "stderr={stderr}"
     );
 }
@@ -206,9 +212,18 @@ fn map_skips_gzip_sitemaps_and_nested_indexes() {
         Route::html("/", "<html><body>x</body></html>"),
         xml(
             "/top.xml",
-            index(&["/inner.xml".into(), "/c.xml.gz".into(), "/leaf.xml".into()]),
+            index(&[
+                "/inner.xml".into(),
+                "/c.xml.gz".into(),
+                "/inner2.xml".into(),
+                "/leaf.xml".into(),
+            ]),
         ),
-        xml("/inner.xml", index(&["/deep.xml".into()])),
+        xml(
+            "/inner.xml",
+            index(&["/deep.xml".into(), "rel-in-nested".into()]),
+        ),
+        xml("/inner2.xml", index(&["/deep.xml".into()])),
         xml("/deep.xml", urlset(&["/deep-page".into()])),
         xml("/leaf.xml", urlset(&["/leaf-page".into()])),
     ]);
@@ -221,7 +236,37 @@ fn map_skips_gzip_sitemaps_and_nested_indexes() {
     );
     assert_eq!(stderr.matches("reason=gzip").count(), 1, "stderr={stderr}");
     assert!(
-        stderr.contains("webgrab: warn=sitemap-skipped reason=nested-index\n"),
+        stderr.contains("webgrab: warn=sitemap-skipped reason=nested-index count=2\n"),
+        "stderr={stderr}"
+    );
+    assert_eq!(
+        stderr.matches("reason=nested-index").count(),
+        1,
+        "stderr={stderr}"
+    );
+    // たどらなかったindexの中身は読まないので、その中の相対URLも数えない。
+    assert!(!stderr.contains("relative-url"), "stderr={stderr}");
+}
+
+#[test]
+fn map_follows_sitemap_redirects_only_within_the_same_host() {
+    let other = common::start(vec![
+        ok_robots(),
+        xml("/moved.xml", urlset(&["/moved-page".into()])),
+    ]);
+    let away = format!("http://localhost:{}/moved.xml", other.port);
+    let s = common::start(vec![
+        robots("Sitemap: {origin}/near.xml\nSitemap: {origin}/far.xml\n"),
+        Route::html("/", "<html><body>x</body></html>"),
+        Route::redirect("/near.xml", "301 Moved Permanently", "/real.xml"),
+        xml("/real.xml", urlset(&["/near-page".into()])),
+        Route::redirect("/far.xml", "302 Found", away),
+    ]);
+    let (code, stdout, stderr) = run(&[&s.url("/"), "--allow-private", "--map"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(lines(&stdout), vec![s.url("/near-page")]);
+    assert!(
+        stderr.contains("redirect to another host refused"),
         "stderr={stderr}"
     );
 }

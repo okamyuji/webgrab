@@ -25,6 +25,7 @@ pub async fn collect(
     let mut budget = Budget {
         deadline,
         bytes_left,
+        home: start.host_str().map(str::to_string),
     };
     let relative = Cell::new(0);
     let mut pending = Pending::default();
@@ -32,18 +33,21 @@ pub async fn collect(
         pending.offer(url, false, 0);
     }
     let mut fetched = 0;
+    let mut nested_indexes = 0;
     let mut stopped = false;
     while let Some((url, nested)) = pending.queue.pop_front() {
         if let Some(reason) = budget.stop_reason() {
-            warn_skipped(reason, pending.remaining() + 1);
+            warn_skipped(reason, "remaining", pending.remaining() + 1);
             stopped = true;
             break;
         }
         fetched += 1;
         let same_origin = url.origin() == start.origin();
         match budget.get(&url, base, base.check_robots, same_origin).await {
+            // indexの子がまたindexならたどらない（1段だけ）。中身も読まない。
+            Ok(xml) if nested && kind(&xml) == Kind::Index => nested_indexes += 1,
             Ok(xml) => {
-                for child in classify(&xml, nested, list, &relative) {
+                for child in classify(&xml, list, &relative) {
                     pending.offer(child, true, fetched);
                 }
             }
@@ -51,13 +55,16 @@ pub async fn collect(
         }
     }
     if !stopped && pending.dropped > 0 {
-        warn_skipped("limit", pending.dropped);
+        warn_skipped("limit", "remaining", pending.dropped);
     }
     if pending.gzip > 0 {
-        warn_skipped("gzip", pending.gzip);
+        warn_skipped("gzip", "remaining", pending.gzip);
+    }
+    if nested_indexes > 0 {
+        warn_skipped("nested-index", "count", nested_indexes);
     }
     if relative.get() > 0 {
-        warn_skipped("relative-url", relative.get());
+        warn_skipped("relative-url", "count", relative.get());
     }
 }
 
@@ -74,8 +81,10 @@ fn absolute(value: &str, relative: &Cell<usize>) -> Option<Url> {
     }
 }
 
-fn warn_skipped(reason: &str, remaining: usize) {
-    eprintln!("webgrab: warn=sitemap-skipped reason={reason} remaining={remaining}");
+/// 理由ごとに1行だけ出す。`remaining`は取得しなかったsitemapの数、`count`は取得した
+/// sitemapの中で読み飛ばしたものの数。
+fn warn_skipped(reason: &str, key: &str, n: usize) {
+    eprintln!("webgrab: warn=sitemap-skipped reason={reason} {key}={n}");
 }
 
 /// 取得を待つsitemap。件数の上限に入りきらない分と読まないgzipは数だけ持つ（巨大なindexの子を
@@ -127,22 +136,16 @@ async fn initial_sitemaps(
     declared
 }
 
-/// sitemapの本文を読む。urlsetのURLは`list`へ入れ、indexなら子sitemapを返す。indexの子が
-/// またindexならたどらない（1段だけ）。`<loc>`は完全なURLだけを読む（sitemaps.orgの規約）。
-/// 相対URLを解決すると、長いsitemapのURLを基準に短い`<loc>`が何倍にも膨らみ、
-/// `--max-bytes`に収まる入力から際限なくメモリを使わせられる。
+/// sitemapの本文を読む。urlsetのURLは`list`へ入れ、indexなら子sitemapを返す。`<loc>`は
+/// 完全なURLだけを読む（sitemaps.orgの規約）。相対URLを解決すると、長いsitemapのURLを
+/// 基準に短い`<loc>`が何倍にも膨らみ、`--max-bytes`に収まる入力から際限なくメモリを使わせられる。
 fn classify<'a>(
     xml: &'a str,
-    nested: bool,
     list: &mut UrlList,
     relative: &'a Cell<usize>,
 ) -> impl Iterator<Item = Url> + 'a {
     let resolved = locs(xml).filter_map(|l| absolute(&l, relative));
     let children = match kind(xml) {
-        Kind::Index if nested => {
-            eprintln!("webgrab: warn=sitemap-skipped reason=nested-index");
-            None
-        }
         Kind::Index => Some(resolved),
         Kind::UrlSet => {
             for u in resolved {
@@ -158,6 +161,8 @@ fn classify<'a>(
 struct Budget {
     deadline: Instant,
     bytes_left: u64,
+    /// 起点のホスト。sitemapの転送はここか今のホストへだけたどる。
+    home: Option<String>,
 }
 
 impl Budget {
@@ -189,6 +194,7 @@ impl Budget {
             allow_private: base.allow_private && same_origin,
             check_robots,
             allow_xml: true,
+            redirect_home: self.home.clone(),
         };
         match fetch::fetch(url.as_str(), &opts).await {
             Ok(f) => {
@@ -519,21 +525,13 @@ mod tests {
         let mut list = UrlList::new("https://x.test/");
         let idx = "<sitemapindex><sitemap><loc>c1.xml</loc></sitemap><sitemap><loc>https://x.test/maps/c2.xml</loc></sitemap></sitemapindex>";
         assert_eq!(
-            classify(idx, false, &mut list, &Cell::new(0)).collect::<Vec<_>>(),
+            classify(idx, &mut list, &Cell::new(0)).collect::<Vec<_>>(),
             vec![Url::parse("https://x.test/maps/c2.xml").unwrap()]
         );
         let set =
             "<urlset><loc>/p</loc><loc>https://y.test/q</loc><loc>https://x.test/r</loc></urlset>";
-        assert_eq!(classify(set, true, &mut list, &Cell::new(0)).count(), 0);
+        assert_eq!(classify(set, &mut list, &Cell::new(0)).count(), 0);
         assert_eq!(list.finish(), "https://x.test/r");
-    }
-
-    #[test]
-    fn classify_does_not_follow_an_index_inside_an_index() {
-        let mut list = UrlList::new("https://x.test/");
-        let idx = "<sitemapindex><sitemap><loc>https://x.test/c.xml</loc></sitemap></sitemapindex>";
-        assert_eq!(classify(idx, true, &mut list, &Cell::new(0)).count(), 0);
-        assert_eq!(list.finish(), "");
     }
 
     #[test]
@@ -557,6 +555,7 @@ mod tests {
         let b = |bytes_left, deadline| Budget {
             deadline,
             bytes_left,
+            home: None,
         };
         assert_eq!(b(1, later).stop_reason(), None);
         assert_eq!(b(0, later).stop_reason(), Some("max-bytes"));

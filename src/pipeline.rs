@@ -275,6 +275,7 @@ fn fetch_options(cli: &Cli, ua: String, timeout: Duration, check_robots: bool) -
         allow_private: cli.allow_private,
         check_robots,
         allow_xml: false,
+        redirect_home: None,
     }
 }
 

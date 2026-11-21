@@ -61,6 +61,11 @@ pub struct FetchOptions {
     pub check_robots: bool,
     /// `application/xml`と`text/xml`も受ける（`--map`のsitemap取得だけで使う）。
     pub allow_xml: bool,
+    /// `Some(home)`なら、転送は今のホストか`home`へだけたどる（`--map`のsitemap取得で
+    /// 起点のホストを渡す）。悪意あるsitemapが第三者へ転送すると、sitemapの件数×転送の段数×
+    /// robots確認の分だけ第三者へ要求が届く。起点のホストは利用者が選んだ相手なので許す
+    /// （`example.com`のsitemapを`www.example.com`へ転送するサイトがある）。
+    pub redirect_home: Option<String>,
 }
 
 /// ホスト名を解決し、netguardを通した検証済みSocketAddrを返す。
@@ -306,6 +311,10 @@ fn accept_response(resp: &reqwest::Response, allow_xml: bool) -> Result<(Option<
     Ok((content_type, coding_of_response(resp)?))
 }
 
+fn redirect_allowed(home: Option<&str>, current: &Url, next: &Url) -> bool {
+    home.is_none_or(|h| next.host_str() == current.host_str() || next.host_str() == Some(h))
+}
+
 /// 静的取得を手動リダイレクト追従で行う（各ホップでnetguard再適用）。`opts.timeout`は
 /// 名前解決・robots確認・転送・本文読み込みの全体に掛ける。各段に渡すだけでは段ごとに
 /// 同じ時間を使えてしまい、転送が続くと合計が`--timeout`を超える。
@@ -339,7 +348,15 @@ async fn fetch_hops(url_str: &str, opts: &FetchOptions) -> Result<Fetched> {
         })?;
 
         if resp.status().is_redirection() {
-            current = redirect_target(&resp, &current)?;
+            let next = redirect_target(&resp, &current)?;
+            if !redirect_allowed(opts.redirect_home.as_deref(), &current, &next) {
+                return Err(WebgrabError::new(
+                    ExitCode::Network,
+                    "redirect to another host refused",
+                )
+                .with_detail(format!("from={current} to={next}")));
+            }
+            current = next;
             continue;
         }
         let (content_type, coding) = accept_response(&resp, opts.allow_xml)?;
@@ -428,6 +445,30 @@ mod tests {
     }
 
     #[test]
+    fn redirect_allowed_keeps_sitemaps_on_the_current_or_home_host() {
+        let u = |s: &str| Url::parse(s).unwrap();
+        let cur = u("https://example.com/sitemap.xml");
+        assert!(redirect_allowed(None, &cur, &u("https://third.test/x")));
+        let home = Some("www.example.com");
+        assert!(redirect_allowed(
+            home,
+            &cur,
+            &u("http://example.com:8080/s.xml")
+        ));
+        assert!(redirect_allowed(
+            home,
+            &cur,
+            &u("https://www.example.com/sitemap.xml")
+        ));
+        assert!(!redirect_allowed(home, &cur, &u("https://third.test/x")));
+        assert!(!redirect_allowed(
+            home,
+            &cur,
+            &u("https://sub.www.example.com/x")
+        ));
+    }
+
+    #[test]
     fn check_media_type_accepts_xml_only_when_allowed() {
         for ct in ["application/xml", "Text/XML; charset=utf-8"] {
             assert!(check_media_type(Some(ct), true).is_ok(), "{ct}");
@@ -469,6 +510,7 @@ mod tests {
             allow_private: false,
             check_robots: true,
             allow_xml: false,
+            redirect_home: None,
         }
     }
 
