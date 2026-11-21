@@ -98,6 +98,7 @@ EXIT CODES:
   2  usage / invalid URL
   3  network failure (DNS/connect/timeout/TLS/redirect loop; retryable)
   4  HTTP error (4xx/5xx), size over, non-HTML, processing past --timeout
+     (--auto-render falls back to the static result instead)
   5  blocked by robots.txt
   6  empty body (0 chars extracted; see hint= on stderr)
   7  JS render failure (Chrome missing/launch/CDP/timeout)
