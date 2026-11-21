@@ -421,15 +421,16 @@ async fn read_capped(
             Err(e) => {
                 return Err(WebgrabError::new(ExitCode::Network, "stream read failed")
                     .with_detail(e.to_string())
-                    .with_consumed(decoder.decoded_len()));
+                    .with_consumed(decoder.abort()));
             }
         };
         if let Err(e) = decoder.push(&chunk) {
-            return Err(decode_err(e, decoder.decoded_len()));
+            return Err(decode_err(e, decoder.abort()));
         }
     }
-    let decoded = decoder.decoded_len();
-    decoder.finish().map_err(|e| decode_err(e, decoded))
+    decoder
+        .finish_counted()
+        .map_err(|(e, decoded)| decode_err(e, decoded))
 }
 
 #[cfg(test)]
