@@ -441,6 +441,28 @@ fn spawn_plain_server(count: usize, body: &str, content_type: &str) -> u16 {
 }
 
 #[test]
+fn processing_after_the_fetch_is_bounded_by_timeout() {
+    // 入れ子の上限は下回るが、深い位置に要素が多く、抽出に長い時間がかかるページ。
+    let html = format!(
+        "<html><body>{}{}</body></html>",
+        "<div>".repeat(980),
+        "<b>x</b>".repeat(20_000)
+    );
+    let port = spawn_plain_server(2, &html, "text/html; charset=utf-8");
+    let url = format!("http://127.0.0.1:{port}/slow");
+    let start = std::time::Instant::now();
+    let (code, _stdout, stderr) =
+        run_webgrab(&[&url, "--allow-private", "--no-robots", "--timeout", "2"]);
+    let elapsed = start.elapsed();
+    assert_eq!(code, 4, "stderr={stderr}");
+    assert!(
+        stderr.contains("html processing exceeded --timeout"),
+        "stderr={stderr}"
+    );
+    assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
+}
+
+#[test]
 fn raw_conversion_of_too_deep_nesting_exits_4_instead_of_aborting() {
     let n = 5_000;
     let html = format!(
