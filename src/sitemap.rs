@@ -29,9 +29,7 @@ pub async fn collect(
     };
     let relative = Cell::new(0);
     let mut pending = Pending::default();
-    for url in initial_sitemaps(&start, &mut budget, base, &relative).await {
-        pending.offer(url, false, 0);
-    }
+    initial_sitemaps(&start, &mut budget, base, &relative, &mut pending).await;
     let mut fetched = 0;
     let mut nested_indexes = 0;
     let mut stopped = false;
@@ -114,26 +112,27 @@ impl Pending {
 
 /// robots.txtの`Sitemap:`行が指すsitemap。robots.txtはこの行を読むためだけに取得する
 /// （robots.txt自身はrobotsの判定対象にしない）。値は`<loc>`と同じく完全なURLだけを読む。
-/// 行が無いか読めなければ`/sitemap.xml`を見る。
+/// 行が無いか読めなければ`/sitemap.xml`を見る。宣言は1件ずつ`pending`へ渡し、件数の上限を
+/// 超えた分は数だけ持つ（大量の`Sitemap:`行をすべて抱えないため）。
 async fn initial_sitemaps(
     start: &Url,
     budget: &mut Budget,
     base: &FetchOptions,
     relative: &Cell<usize>,
-) -> Vec<Url> {
-    let mut declared = Vec::new();
+    pending: &mut Pending,
+) {
+    let mut declared = false;
     if let Ok(robots_url) = start.join("/robots.txt")
         && let Ok(text) = budget.get(&robots_url, base, false, true).await
     {
-        declared = robots_sitemaps(&text)
-            .iter()
-            .filter_map(|s| absolute(s, relative))
-            .collect();
+        for url in robots_sitemaps(&text).filter_map(|s| absolute(s, relative)) {
+            declared = true;
+            pending.offer(url, false, 0);
+        }
     }
-    if declared.is_empty() {
-        declared.extend(start.join("/sitemap.xml").ok());
+    if !declared && let Ok(url) = start.join("/sitemap.xml") {
+        pending.offer(url, false, 0);
     }
-    declared
 }
 
 /// sitemapの本文を読む。urlsetのURLは`list`へ入れ、indexなら子sitemapを返す。`<loc>`は
@@ -216,16 +215,12 @@ fn warn_failed(url: &Url, e: &WebgrabError) {
 }
 
 /// robots.txtの`Sitemap:`行の値を出現順に返す。
-pub fn robots_sitemaps(robots: &str) -> Vec<String> {
-    robots
-        .lines()
-        .filter_map(|line| {
-            let (key, value) = line.split_once(':')?;
-            let value = value.trim();
-            (key.trim().eq_ignore_ascii_case("sitemap") && !value.is_empty())
-                .then(|| value.to_string())
-        })
-        .collect()
+pub fn robots_sitemaps(robots: &str) -> impl Iterator<Item = &str> {
+    robots.lines().filter_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        let value = value.trim();
+        (key.trim().eq_ignore_ascii_case("sitemap") && !value.is_empty()).then_some(value)
+    })
 }
 
 /// sitemapの種類。
@@ -434,7 +429,7 @@ mod tests {
     fn robots_sitemaps_reads_every_sitemap_line_case_insensitively() {
         let txt = "User-agent: *\nDisallow: /a\nSitemap: https://x.test/s1.xml\nsitemap:https://x.test/s2.xml  \r\nSITEMAP : https://cdn.test/s3.xml\n";
         assert_eq!(
-            robots_sitemaps(txt),
+            robots_sitemaps(txt).collect::<Vec<_>>(),
             vec![
                 "https://x.test/s1.xml",
                 "https://x.test/s2.xml",
@@ -447,7 +442,7 @@ mod tests {
     fn robots_sitemaps_ignores_empty_values_and_other_keys() {
         let txt =
             "Sitemap:\nSitemaps: https://x.test/no.xml\nDisallow: /sitemap.xml\nno colon line\n";
-        assert!(robots_sitemaps(txt).is_empty());
+        assert_eq!(robots_sitemaps(txt).count(), 0);
     }
 
     fn parse(xml: &str) -> (Kind, Vec<String>) {
