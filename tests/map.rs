@@ -138,6 +138,26 @@ fn map_does_not_carry_allow_private_to_a_sitemap_on_another_origin() {
 }
 
 #[test]
+fn map_does_not_carry_allow_private_to_an_index_child_on_another_origin() {
+    let other = common::start(vec![
+        ok_robots(),
+        xml("/internal.xml", urlset(&["/leak".into()])),
+    ]);
+    let s = common::start(vec![
+        ok_robots(),
+        Route::html("/", PAGE),
+        xml("/sitemap.xml", index(&[other.url("/internal.xml")])),
+    ]);
+    let (code, stdout, stderr) = run(&[&s.url("/"), "--allow-private", "--map"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(lines(&stdout), vec![s.url("/nav"), s.url("/a")]);
+    assert!(
+        stderr.contains("webgrab: warn=sitemap-failed\n"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
 fn map_with_zero_urls_exits_0_with_empty_body() {
     let s = common::start(vec![
         ok_robots(),

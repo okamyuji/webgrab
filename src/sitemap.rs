@@ -9,48 +9,74 @@ use url::Url;
 /// 取得するsitemapの上限（sitemap indexそのものも1つと数える）。
 pub const MAX_SITEMAPS: usize = 20;
 
-/// `start`のホストのsitemapから`<loc>`のURLを集める。sitemapの失敗は警告にして続け、
+/// `start`のホストのsitemapから`<loc>`のURLを`list`へ入れる。sitemapの失敗は警告にして続け、
 /// 期限・`bytes_left`・件数の上限に達したら残りを打ち切る。
 pub async fn collect(
     start: &str,
     base: &FetchOptions,
     deadline: Instant,
     bytes_left: u64,
-) -> Vec<String> {
+    list: &mut UrlList,
+) {
     let Ok(start) = Url::parse(start) else {
-        return Vec::new();
+        return;
     };
     let mut budget = Budget {
         deadline,
         bytes_left,
     };
-    let first = initial_sitemaps(&start, &mut budget, base).await;
-    let mut queue: VecDeque<(Url, bool)> = first.into_iter().map(|u| (u, false)).collect();
-    let mut urls = Vec::new();
+    let mut pending = Pending::default();
+    for url in initial_sitemaps(&start, &mut budget, base).await {
+        pending.offer(url, false, 0);
+    }
     let mut fetched = 0;
-    while let Some((url, nested)) = queue.pop_front() {
-        if let Some(reason) = budget.stop_reason(fetched) {
-            eprintln!(
-                "webgrab: warn=sitemap-skipped reason={reason} remaining={}",
-                queue.len() + 1
-            );
-            break;
-        }
-        if url.path().to_ascii_lowercase().ends_with(".gz") {
-            eprintln!("webgrab: warn=sitemap-skipped reason=gzip");
-            continue;
+    while let Some((url, nested)) = pending.queue.pop_front() {
+        if let Some(reason) = budget.stop_reason() {
+            warn_skipped(reason, pending.remaining() + 1);
+            return;
         }
         fetched += 1;
         let same_origin = url.origin() == start.origin();
         match budget.get(&url, base, base.check_robots, same_origin).await {
-            Ok(xml) => match classify(&url, &xml, nested) {
-                Found::Children(c) => queue.extend(c.into_iter().map(|u| (u, true))),
-                Found::Urls(u) => urls.extend(u),
-            },
+            Ok(xml) => {
+                for child in classify(&url, &xml, nested, list) {
+                    pending.offer(child, true, fetched);
+                }
+            }
             Err(e) => warn_failed(&url, &e),
         }
     }
-    urls
+    if pending.dropped > 0 {
+        warn_skipped("limit", pending.dropped);
+    }
+}
+
+fn warn_skipped(reason: &str, remaining: usize) {
+    eprintln!("webgrab: warn=sitemap-skipped reason={reason} remaining={remaining}");
+}
+
+/// 取得を待つsitemap。件数の上限に入りきらない分は数だけ持つ（巨大なindexの子をすべて
+/// 抱えないため）。
+#[derive(Default)]
+struct Pending {
+    queue: VecDeque<(Url, bool)>,
+    dropped: usize,
+}
+
+impl Pending {
+    fn offer(&mut self, url: Url, nested: bool, fetched: usize) {
+        if url.path().to_ascii_lowercase().ends_with(".gz") {
+            eprintln!("webgrab: warn=sitemap-skipped reason=gzip");
+        } else if fetched + self.queue.len() >= MAX_SITEMAPS {
+            self.dropped += 1;
+        } else {
+            self.queue.push_back((url, nested));
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        self.queue.len() + self.dropped
+    }
 }
 
 /// robots.txtの`Sitemap:`行が指すsitemap。robots.txtはこの行を読むためだけに取得する
@@ -71,28 +97,29 @@ async fn initial_sitemaps(start: &Url, budget: &mut Budget, base: &FetchOptions)
     declared
 }
 
-/// 1つのsitemapから得たもの。
-#[derive(Debug, PartialEq, Eq)]
-enum Found {
-    /// sitemap indexが指す子sitemap。
-    Children(Vec<Url>),
-    /// ページのURL。
-    Urls(Vec<String>),
-}
-
-/// sitemapの本文を分類する。`<loc>`は`url`基準で解決する。indexの子がまたindexなら
-/// たどらない（1段だけ）。
-fn classify(url: &Url, xml: &str, nested: bool) -> Found {
-    let (kind, locs) = parse(xml);
-    let resolved = locs.iter().filter_map(|l| url.join(l).ok());
-    match kind {
+/// sitemapの本文を読む。urlsetのURLは`list`へ入れ、indexなら子sitemapを返す。`<loc>`は
+/// `url`基準で解決する。indexの子がまたindexならたどらない（1段だけ）。
+fn classify<'a>(
+    url: &'a Url,
+    xml: &'a str,
+    nested: bool,
+    list: &mut UrlList,
+) -> impl Iterator<Item = Url> + 'a {
+    let resolved = locs(xml).filter_map(move |l| url.join(&l).ok());
+    let children = match kind(xml) {
         Kind::Index if nested => {
             eprintln!("webgrab: warn=sitemap-skipped reason=nested-index");
-            Found::Urls(Vec::new())
+            None
         }
-        Kind::Index => Found::Children(resolved.collect()),
-        Kind::UrlSet => Found::Urls(resolved.map(String::from).collect()),
-    }
+        Kind::Index => Some(resolved),
+        Kind::UrlSet => {
+            for u in resolved {
+                list.push(u.as_str());
+            }
+            None
+        }
+    };
+    children.into_iter().flatten()
 }
 
 /// 全体の期限と`--max-bytes`の残り。
@@ -103,10 +130,8 @@ struct Budget {
 
 impl Budget {
     /// 次のsitemapを取得してはいけない理由。
-    fn stop_reason(&self, fetched: usize) -> Option<&'static str> {
-        if fetched >= MAX_SITEMAPS {
-            Some("limit")
-        } else if self.bytes_left == 0 {
+    fn stop_reason(&self) -> Option<&'static str> {
+        if self.bytes_left == 0 {
             Some("max-bytes")
         } else if Instant::now() >= self.deadline {
             Some("timeout")
@@ -175,23 +200,28 @@ pub enum Kind {
     Index,
 }
 
-/// sitemapのXMLから`<loc>`の値を出現順に取り出す。XMLパーサーは使わず`<loc>`だけを
-/// 前から1回走査する（巨大・深い入れ子の文書でも線形時間で終わる）。
-pub fn parse(xml: &str) -> (Kind, Vec<String>) {
-    let kind = if xml.contains("<sitemapindex") {
+/// sitemapの種類を見る。
+pub fn kind(xml: &str) -> Kind {
+    if xml.contains("<sitemapindex") {
         Kind::Index
     } else {
         Kind::UrlSet
-    };
-    let mut locs = Vec::new();
-    let mut rest = xml;
-    while let Some((value, after)) = next_loc(rest) {
-        if let Some(v) = value {
-            locs.push(v);
-        }
-        rest = after;
     }
-    (kind, locs)
+}
+
+/// sitemapのXMLから`<loc>`の値を出現順に1件ずつ取り出す。XMLパーサーは使わず`<loc>`だけを
+/// 前から1回走査する（巨大・深い入れ子の文書でも線形時間で終わり、全件を同時には持たない）。
+pub fn locs(xml: &str) -> impl Iterator<Item = String> + '_ {
+    let mut rest = xml;
+    std::iter::from_fn(move || {
+        loop {
+            let (value, after) = next_loc(rest)?;
+            rest = after;
+            if value.is_some() {
+                return value;
+            }
+        }
+    })
 }
 
 /// 次の`<loc>`要素を探す。`(値, 残り)`を返し、値が空なら`None`を入れる。
@@ -279,26 +309,48 @@ fn reference(name: &str) -> Option<char> {
     (c != '\0').then_some(c)
 }
 
-/// 候補URLのうち`start`と同じホストのhttp/httpsだけを、fragment除去・重複除去して1行1件に並べる。
-pub fn same_host_list(start: &str, candidates: impl IntoIterator<Item = String>) -> String {
-    let Some(host) = Url::parse(start)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_string))
-    else {
-        return String::new();
-    };
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for c in candidates {
-        let Some(url) = crate::links::resolve(None, &c) else {
-            continue;
-        };
-        let same = Url::parse(&url).is_ok_and(|u| u.host_str() == Some(host.as_str()));
-        if same && seen.insert(url.clone()) {
-            out.push(url);
+/// `start`と同じホストのhttp/httpsのURLを、fragment除去・重複除去して受け取った順に並べる。
+/// 候補は1件ずつ受け、条件に合うものだけを持つ。
+pub struct UrlList {
+    host: Option<String>,
+    seen: HashSet<String>,
+    out: String,
+}
+
+impl UrlList {
+    pub fn new(start: &str) -> Self {
+        let host = Url::parse(start)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string));
+        Self {
+            host,
+            seen: HashSet::new(),
+            out: String::new(),
         }
     }
-    out.join("\n")
+
+    pub fn push(&mut self, candidate: &str) {
+        let Some(host) = self.host.as_deref() else {
+            return;
+        };
+        let Some(url) = crate::links::resolve(None, candidate) else {
+            return;
+        };
+        let same = Url::parse(&url).is_ok_and(|u| u.host_str() == Some(host));
+        if !same || self.seen.contains(&url) {
+            return;
+        }
+        if !self.out.is_empty() {
+            self.out.push('\n');
+        }
+        self.out.push_str(&url);
+        self.seen.insert(url);
+    }
+
+    /// 1行1件の一覧。
+    pub fn finish(self) -> String {
+        self.out
+    }
 }
 
 #[cfg(test)]
@@ -323,6 +375,10 @@ mod tests {
         let txt =
             "Sitemap:\nSitemaps: https://x.test/no.xml\nDisallow: /sitemap.xml\nno colon line\n";
         assert!(robots_sitemaps(txt).is_empty());
+    }
+
+    fn parse(xml: &str) -> (Kind, Vec<String>) {
+        (kind(xml), locs(xml).collect())
     }
 
     #[test]
@@ -396,69 +452,85 @@ mod tests {
         assert!(parse("<urlset><loc").1.is_empty());
     }
 
+    fn same_host_list(start: &str, candidates: &[&str]) -> String {
+        let mut list = UrlList::new(start);
+        for c in candidates {
+            list.push(c);
+        }
+        list.finish()
+    }
+
     #[test]
-    fn same_host_list_keeps_same_host_http_urls_deduplicated_in_order() {
+    fn url_list_keeps_same_host_http_urls_deduplicated_in_order() {
         let got = same_host_list(
             "https://x.test/start",
-            [
-                "https://x.test/b#frag".to_string(),
-                "http://x.test/a".to_string(),
-                "https://x.test/b".to_string(),
-                "https://other.test/c".to_string(),
-                "https://sub.x.test/d".to_string(),
-                "mailto:a@x.test".to_string(),
-                "relative/path".to_string(),
+            &[
+                "https://x.test/b#frag",
+                "http://x.test/a",
+                "https://x.test/b",
+                "https://other.test/c",
+                "https://sub.x.test/d",
+                "mailto:a@x.test",
+                "relative/path",
             ],
         );
         assert_eq!(got, "https://x.test/b\nhttp://x.test/a");
     }
 
     #[test]
+    fn url_list_is_empty_for_unparsable_start() {
+        assert_eq!(same_host_list("not a url", &["https://x.test/a"]), "");
+    }
+
+    #[test]
     fn classify_resolves_locs_against_the_sitemap_url() {
         let base = Url::parse("https://x.test/maps/s.xml").unwrap();
+        let mut list = UrlList::new("https://x.test/");
         let idx = "<sitemapindex><sitemap><loc>c1.xml</loc></sitemap></sitemapindex>";
         assert_eq!(
-            classify(&base, idx, false),
-            Found::Children(vec![Url::parse("https://x.test/maps/c1.xml").unwrap()])
+            classify(&base, idx, false, &mut list).collect::<Vec<_>>(),
+            vec![Url::parse("https://x.test/maps/c1.xml").unwrap()]
         );
-        assert_eq!(
-            classify(
-                &base,
-                "<urlset><loc>/p</loc><loc>https://y.test/q</loc></urlset>",
-                true
-            ),
-            Found::Urls(vec!["https://x.test/p".into(), "https://y.test/q".into()])
-        );
+        let set = "<urlset><loc>/p</loc><loc>https://y.test/q</loc><loc>/r</loc></urlset>";
+        assert_eq!(classify(&base, set, true, &mut list).count(), 0);
+        assert_eq!(list.finish(), "https://x.test/p\nhttps://x.test/r");
     }
 
     #[test]
     fn classify_does_not_follow_an_index_inside_an_index() {
         let base = Url::parse("https://x.test/s.xml").unwrap();
+        let mut list = UrlList::new("https://x.test/");
         let idx = "<sitemapindex><sitemap><loc>/c.xml</loc></sitemap></sitemapindex>";
-        assert_eq!(classify(&base, idx, true), Found::Urls(Vec::new()));
+        assert_eq!(classify(&base, idx, true, &mut list).count(), 0);
+        assert_eq!(list.finish(), "");
     }
 
     #[test]
-    fn stop_reason_checks_limit_then_bytes_then_deadline() {
+    fn pending_holds_up_to_the_limit_and_counts_the_rest() {
+        let u = |p: &str| Url::parse(&format!("https://x.test/{p}")).unwrap();
+        let mut pending = Pending::default();
+        pending.offer(u("a.xml.GZ"), false, 0);
+        assert_eq!(pending.remaining(), 0);
+        for i in 0..MAX_SITEMAPS {
+            pending.offer(u(&format!("{i}.xml")), true, 1);
+        }
+        assert_eq!(pending.queue.len(), MAX_SITEMAPS - 1);
+        assert_eq!(pending.dropped, 1);
+        assert_eq!(pending.remaining(), MAX_SITEMAPS);
+        assert_eq!(pending.queue.front(), Some(&(u("0.xml"), true)));
+    }
+
+    #[test]
+    fn stop_reason_checks_bytes_then_deadline() {
         let later = Instant::now() + std::time::Duration::from_secs(60);
         let b = |bytes_left, deadline| Budget {
             deadline,
             bytes_left,
         };
-        assert_eq!(b(1, later).stop_reason(MAX_SITEMAPS - 1), None);
-        assert_eq!(b(1, later).stop_reason(MAX_SITEMAPS), Some("limit"));
-        assert_eq!(b(0, later).stop_reason(MAX_SITEMAPS), Some("limit"));
-        assert_eq!(b(0, later).stop_reason(0), Some("max-bytes"));
+        assert_eq!(b(1, later).stop_reason(), None);
+        assert_eq!(b(0, later).stop_reason(), Some("max-bytes"));
         let past = Instant::now();
-        assert_eq!(b(0, past).stop_reason(0), Some("max-bytes"));
-        assert_eq!(b(1, past).stop_reason(0), Some("timeout"));
-    }
-
-    #[test]
-    fn same_host_list_is_empty_for_unparsable_start() {
-        assert_eq!(
-            same_host_list("not a url", ["https://x.test/a".to_string()]),
-            ""
-        );
+        assert_eq!(b(0, past).stop_reason(), Some("max-bytes"));
+        assert_eq!(b(1, past).stop_reason(), Some("timeout"));
     }
 }

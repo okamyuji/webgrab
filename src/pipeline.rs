@@ -321,9 +321,12 @@ async fn map_phase(
     let acq = static_phase(&page_cli, ua.clone(), timeout, deadline).await?;
     let fopts = fetch_options(cli, ua, timeout, !cli.no_robots);
     let left = cli.max_bytes.saturating_sub(acq.consumed);
-    let found = sitemap::collect(&acq.final_url, &fopts, deadline, left).await;
-    let page_links = acq.stage.body.lines().map(str::to_string);
-    let body = sitemap::same_host_list(&acq.final_url, found.into_iter().chain(page_links));
+    let mut list = sitemap::UrlList::new(&acq.final_url);
+    sitemap::collect(&acq.final_url, &fopts, deadline, left, &mut list).await;
+    for link in acq.stage.body.lines() {
+        list.push(link);
+    }
+    let body = list.finish();
     Ok(Acquired {
         stage: Stage {
             title: None,
