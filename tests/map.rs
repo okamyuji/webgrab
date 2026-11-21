@@ -167,16 +167,24 @@ fn map_does_not_carry_allow_private_to_an_index_child_on_another_origin() {
 }
 
 #[test]
-fn map_ignores_relative_sitemap_lines_in_robots() {
+fn map_ignores_and_counts_relative_sitemap_urls() {
     let s = common::start(vec![
         robots("Sitemap: /declared.xml\n"),
         Route::html("/", "<html><body>x</body></html>"),
         xml("/declared.xml", urlset(&["/from-relative".into()])),
-        xml("/sitemap.xml", urlset(&["/from-default".into()])),
+        xml(
+            "/sitemap.xml",
+            "<urlset><url><loc>{origin}/from-default</loc></url><url><loc>rel</loc></url></urlset>",
+        ),
     ]);
     let (code, stdout, stderr) = run(&[&s.url("/"), "--allow-private", "--map"]);
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(lines(&stdout), vec![s.url("/from-default")]);
+    // robots.txtの相対行1件と<loc>の相対値1件を、黙って捨てずに数で知らせる。
+    assert!(
+        stderr.contains("webgrab: warn=sitemap-skipped reason=relative-url remaining=2\n"),
+        "stderr={stderr}"
+    );
 }
 
 #[test]

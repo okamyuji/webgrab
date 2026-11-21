@@ -2,6 +2,7 @@
 
 use crate::error::{WebgrabError, sanitize_detail};
 use crate::fetch::{self, FetchOptions};
+use std::cell::Cell;
 use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
 use url::Url;
@@ -25,8 +26,9 @@ pub async fn collect(
         deadline,
         bytes_left,
     };
+    let relative = Cell::new(0);
     let mut pending = Pending::default();
-    for url in initial_sitemaps(&start, &mut budget, base).await {
+    for url in initial_sitemaps(&start, &mut budget, base, &relative).await {
         pending.offer(url, false, 0);
     }
     let mut fetched = 0;
@@ -41,7 +43,7 @@ pub async fn collect(
         let same_origin = url.origin() == start.origin();
         match budget.get(&url, base, base.check_robots, same_origin).await {
             Ok(xml) => {
-                for child in classify(&xml, nested, list) {
+                for child in classify(&xml, nested, list, &relative) {
                     pending.offer(child, true, fetched);
                 }
             }
@@ -53,6 +55,22 @@ pub async fn collect(
     }
     if pending.gzip > 0 {
         warn_skipped("gzip", pending.gzip);
+    }
+    if relative.get() > 0 {
+        warn_skipped("relative-url", relative.get());
+    }
+}
+
+/// `Sitemap:`行と`<loc>`の値を完全なURLとして読む。相対URLは捨てるが、規約どおりでない
+/// サイトで一覧が減った理由が分かるように数える。
+fn absolute(value: &str, relative: &Cell<usize>) -> Option<Url> {
+    match Url::parse(value) {
+        Ok(url) => Some(url),
+        Err(url::ParseError::RelativeUrlWithoutBase) => {
+            relative.set(relative.get() + 1);
+            None
+        }
+        Err(_) => None,
     }
 }
 
@@ -88,14 +106,19 @@ impl Pending {
 /// robots.txtの`Sitemap:`行が指すsitemap。robots.txtはこの行を読むためだけに取得する
 /// （robots.txt自身はrobotsの判定対象にしない）。値は`<loc>`と同じく完全なURLだけを読む。
 /// 行が無いか読めなければ`/sitemap.xml`を見る。
-async fn initial_sitemaps(start: &Url, budget: &mut Budget, base: &FetchOptions) -> Vec<Url> {
+async fn initial_sitemaps(
+    start: &Url,
+    budget: &mut Budget,
+    base: &FetchOptions,
+    relative: &Cell<usize>,
+) -> Vec<Url> {
     let mut declared = Vec::new();
     if let Ok(robots_url) = start.join("/robots.txt")
         && let Ok(text) = budget.get(&robots_url, base, false, true).await
     {
         declared = robots_sitemaps(&text)
             .iter()
-            .filter_map(|s| Url::parse(s).ok())
+            .filter_map(|s| absolute(s, relative))
             .collect();
     }
     if declared.is_empty() {
@@ -108,8 +131,13 @@ async fn initial_sitemaps(start: &Url, budget: &mut Budget, base: &FetchOptions)
 /// またindexならたどらない（1段だけ）。`<loc>`は完全なURLだけを読む（sitemaps.orgの規約）。
 /// 相対URLを解決すると、長いsitemapのURLを基準に短い`<loc>`が何倍にも膨らみ、
 /// `--max-bytes`に収まる入力から際限なくメモリを使わせられる。
-fn classify<'a>(xml: &'a str, nested: bool, list: &mut UrlList) -> impl Iterator<Item = Url> + 'a {
-    let resolved = locs(xml).filter_map(|l| Url::parse(&l).ok());
+fn classify<'a>(
+    xml: &'a str,
+    nested: bool,
+    list: &mut UrlList,
+    relative: &'a Cell<usize>,
+) -> impl Iterator<Item = Url> + 'a {
+    let resolved = locs(xml).filter_map(|l| absolute(&l, relative));
     let children = match kind(xml) {
         Kind::Index if nested => {
             eprintln!("webgrab: warn=sitemap-skipped reason=nested-index");
@@ -491,12 +519,12 @@ mod tests {
         let mut list = UrlList::new("https://x.test/");
         let idx = "<sitemapindex><sitemap><loc>c1.xml</loc></sitemap><sitemap><loc>https://x.test/maps/c2.xml</loc></sitemap></sitemapindex>";
         assert_eq!(
-            classify(idx, false, &mut list).collect::<Vec<_>>(),
+            classify(idx, false, &mut list, &Cell::new(0)).collect::<Vec<_>>(),
             vec![Url::parse("https://x.test/maps/c2.xml").unwrap()]
         );
         let set =
             "<urlset><loc>/p</loc><loc>https://y.test/q</loc><loc>https://x.test/r</loc></urlset>";
-        assert_eq!(classify(set, true, &mut list).count(), 0);
+        assert_eq!(classify(set, true, &mut list, &Cell::new(0)).count(), 0);
         assert_eq!(list.finish(), "https://x.test/r");
     }
 
@@ -504,7 +532,7 @@ mod tests {
     fn classify_does_not_follow_an_index_inside_an_index() {
         let mut list = UrlList::new("https://x.test/");
         let idx = "<sitemapindex><sitemap><loc>https://x.test/c.xml</loc></sitemap></sitemapindex>";
-        assert_eq!(classify(idx, true, &mut list).count(), 0);
+        assert_eq!(classify(idx, true, &mut list, &Cell::new(0)).count(), 0);
         assert_eq!(list.finish(), "");
     }
 

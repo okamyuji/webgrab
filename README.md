@@ -53,7 +53,7 @@ webgrab https://raw.githubusercontent.com/<owner>/<repo>/main/README.md   # text
 
 `--auto-render`は既定off。静的取得の本文が空または200文字未満のとき、同一プロセス内でJSレンダリングへ切り替えます。切替・失敗・skipはstderrと`--format json`の`render_status`（`static`/`rendered`/`failed`/`no-gain`/`skipped`）で分かります。`--wait-ms`（既定5000、`--render`/`--auto-render`時のみ有効）はrender取得の上限ミリ秒です。ネットワーク静止・DOM安定・可視テキスト200文字以上を満たせば上限前に終了します。
 
-`--map`は本文の代わりに、起点と同じホストのURLを1行1件で返します。並び順はsitemapのURLが先、起点ページのリンクが後で、重複とfragmentは除かれます。sitemapの入口はrobots.txtの`Sitemap:`行で、行が無いときは`/sitemap.xml`です。sitemap indexは1段だけたどり、gzipのsitemapは読みません。`Sitemap:`行と`<loc>`は完全なURLだけを読み、相対URLは無視します（sitemaps.orgの規約）。sitemapの取得は20件が上限で、本文の取得は残りの`--timeout`と`--max-bytes`の範囲に収めます。打ち切りや取得失敗はstderrの`warn=sitemap-skipped`と`warn=sitemap-failed`に出ますが、その場合も起点ページのリンクで結果を返します。URL一覧にも本文と同じ`--max-chars`の上限がかかり、続きは`--start-index`で取ります。続きを取るたびにsitemapを最初から取り直すので、大きなサイトの全件を一度に取るときは`--max-chars`を大きくしてください（`0`はメタ情報だけを返します）。`--render`・`--auto-render`・`--raw`・`--wait-ms`とは併用できません。
+`--map`は本文の代わりに、起点と同じホストのURLを1行1件で返します。並び順はsitemapのURLが先、起点ページのリンクが後で、重複とfragmentは除かれます。sitemapの入口はrobots.txtの`Sitemap:`行で、行が無いときは`/sitemap.xml`です。sitemap indexは1段だけたどり、gzipのsitemapは読みません。`Sitemap:`行と`<loc>`は完全なURLだけを読みます（sitemaps.orgの規約）。読まなかった相対URLの件数は`warn=sitemap-skipped reason=relative-url`に出ます。sitemapの取得は20件が上限で、本文の取得は残りの`--timeout`と`--max-bytes`の範囲に収めます。打ち切りや取得失敗はstderrの`warn=sitemap-skipped`と`warn=sitemap-failed`に出ますが、その場合も起点ページのリンクで結果を返します。URL一覧にも本文と同じ`--max-chars`の上限がかかり、続きは`--start-index`で取ります。続きを取るたびにsitemapを最初から取り直すので、大きなサイトの全件を一度に取るときは`--max-chars`を大きくしてください（`0`はメタ情報だけを返します）。`--render`・`--auto-render`・`--raw`・`--wait-ms`とは併用できません。
 
 デフォルトのmarkdown形式の出力を次に示します。
 
