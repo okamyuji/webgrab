@@ -42,6 +42,8 @@ pub struct WebgrabError {
     pub detail: Option<String>,
     /// 先頭行に付加する機械可読トークン（例: `hint=--render/--raw`）。
     pub tokens: Vec<(&'static str, String)>,
+    /// 失敗するまでに本文として受け取ったバイト数。`--max-bytes`の残りから引くために使う。
+    pub consumed: u64,
 }
 
 const DETAIL_MAX_BYTES: usize = 512;
@@ -128,7 +130,13 @@ impl WebgrabError {
             message: message.into(),
             detail: None,
             tokens: Vec::new(),
+            consumed: 0,
         }
+    }
+
+    pub fn with_consumed(mut self, consumed: u64) -> Self {
+        self.consumed = consumed;
+        self
     }
 
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {

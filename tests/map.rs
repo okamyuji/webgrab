@@ -230,6 +230,94 @@ fn map_does_not_follow_a_robots_redirect_to_another_host_for_sitemaps() {
 }
 
 #[test]
+fn map_counts_bytes_read_before_a_sitemap_stream_breaks() {
+    let cut: Vec<String> = (0..100).map(|i| format!("/cut-page-{i:04}")).collect();
+    let good: Vec<String> = (0..60).map(|i| format!("/good-page-{i:04}")).collect();
+    let s = common::start(vec![
+        robots("Sitemap: {origin}/bad.xml\nSitemap: {origin}/good.xml\n"),
+        Route::html("/", "<html><body>x</body></html>"),
+        Route {
+            declared_len: Some(1_000_000),
+            ..xml("/bad.xml", urlset(&cut))
+        },
+        xml("/good.xml", urlset(&good)),
+    ]);
+    let (code, stdout, stderr) = run(&[
+        &s.url("/"),
+        "--allow-private",
+        "--map",
+        "--max-bytes",
+        "7000",
+    ]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    // bad.xmlで読んだ約5,000バイトを残りから引くので、約3,000バイトのgood.xmlは収まらない。
+    assert_eq!(stdout.trim(), "", "stderr={stderr}");
+    assert!(stderr.contains("stream read failed"), "stderr={stderr}");
+    assert!(stderr.contains("exceeds --max-bytes"), "stderr={stderr}");
+}
+
+#[test]
+fn map_counts_decoded_bytes_of_a_truncated_gzip_sitemap() {
+    use std::io::Write;
+    let cut: Vec<String> = (0..100)
+        .map(|i| format!("https://cut.invalid/page-{i:04}"))
+        .collect();
+    let good: Vec<String> = (0..60).map(|i| format!("/good-page-{i:04}")).collect();
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(urlset(&cut).as_bytes()).unwrap();
+    let mut gz = gz.finish().unwrap();
+    // 末尾の検査値を欠かせて、展開はできるが完了しない応答にする。
+    gz.truncate(gz.len() - 4);
+    let s = common::start(vec![
+        robots("Sitemap: {origin}/bad.xml\nSitemap: {origin}/good.xml\n"),
+        Route::html("/", "<html><body>x</body></html>"),
+        Route {
+            body: gz,
+            headers: vec![("Content-Encoding", "gzip".to_string())],
+            ..xml("/bad.xml", "")
+        },
+        xml("/good.xml", urlset(&good)),
+    ]);
+    let (code, stdout, stderr) = run(&[
+        &s.url("/"),
+        "--allow-private",
+        "--map",
+        "--max-bytes",
+        "7000",
+    ]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    // 回線上は数百バイトでも、展開した約5,000バイトを残りから引くので、good.xmlは収まらない。
+    assert_eq!(stdout.trim(), "", "stderr={stderr}");
+    assert!(stderr.contains("stream read failed"), "stderr={stderr}");
+    assert!(stderr.contains("exceeds --max-bytes"), "stderr={stderr}");
+}
+
+#[test]
+fn map_keeps_reading_sitemaps_after_a_brotli_sitemap_connection_breaks() {
+    let br = include_bytes!("fixtures/article.html.br");
+    let half = br[..br.len() / 2].to_vec();
+    let good: Vec<String> = (0..3).map(|i| format!("/good-page-{i}")).collect();
+    let s = common::start(vec![
+        robots("Sitemap: {origin}/bad.xml\nSitemap: {origin}/good.xml\n"),
+        Route::html("/", "<html><body>x</body></html>"),
+        Route {
+            // 宣言より短い本文で接続を閉じ、通信が途中で切れた形にする。
+            declared_len: Some(br.len() * 10),
+            body: half,
+            headers: vec![("Content-Encoding", "br".to_string())],
+            ..xml("/bad.xml", "")
+        },
+        xml("/good.xml", urlset(&good)),
+    ]);
+    let (code, stdout, stderr) = run(&[&s.url("/"), "--allow-private", "--map"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(stderr.contains("stream read failed"), "stderr={stderr}");
+    // 通信の切断では残りを使い切らないので、次のsitemapも読む。
+    let want: Vec<String> = good.iter().map(|p| s.url(p)).collect();
+    assert_eq!(lines(&stdout), want, "stderr={stderr}");
+}
+
+#[test]
 fn map_with_zero_urls_exits_0_with_empty_body() {
     let s = common::start(vec![
         ok_robots(),

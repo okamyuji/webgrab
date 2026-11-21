@@ -15,6 +15,8 @@ pub struct Route {
     pub content_type: &'static str,
     pub headers: Vec<(&'static str, String)>,
     pub delay_ms: u64,
+    /// `Content-Length`を本文の長さと別に宣言する（本文の途中で切れる応答を作る）。
+    pub declared_len: Option<usize>,
     /// ステータス行のステータス部（例: `302 Found`）。
     pub status: &'static str,
 }
@@ -27,6 +29,7 @@ impl Route {
             content_type: "text/html; charset=utf-8",
             headers: vec![],
             delay_ms: 0,
+            declared_len: None,
             status: "200 OK",
         }
     }
@@ -39,6 +42,7 @@ impl Route {
             content_type: "text/html; charset=utf-8",
             headers: vec![("Location", location.into())],
             delay_ms: 0,
+            declared_len: None,
             status,
         }
     }
@@ -136,7 +140,7 @@ fn serve_one(mut stream: TcpStream, routes: &[Route]) {
             let mut head = format!(
                 "HTTP/1.1 {}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n",
                 r.status,
-                body.len()
+                r.declared_len.unwrap_or(body.len())
             );
             for (k, v) in headers {
                 head.push_str(&format!("{k}: {v}\r\n"));
@@ -253,6 +257,7 @@ pub fn csr_xhr() -> Vec<Route> {
         content_type: "text/html; charset=utf-8",
         headers: vec![],
         delay_ms: 1000,
+        declared_len: None,
         status: "200 OK",
     };
     vec![page, api]
@@ -286,6 +291,7 @@ pub fn big_gzip() -> Route {
         content_type: "text/html; charset=utf-8",
         headers: vec![("Content-Encoding", "gzip".to_string())],
         delay_ms: 0,
+        declared_len: None,
         status: "200 OK",
     }
 }

@@ -29,9 +29,7 @@ pub async fn collect(
     };
     let relative = Cell::new(0);
     let mut pending = Pending::default();
-    for url in initial_sitemaps(&start, &mut budget, base, &relative).await {
-        pending.offer(url, false, 0);
-    }
+    initial_sitemaps(&start, &mut budget, base, &relative, &mut pending).await;
     let mut fetched = 0;
     let mut nested_indexes = 0;
     let mut stopped = false;
@@ -114,26 +112,27 @@ impl Pending {
 
 /// robots.txtの`Sitemap:`行が指すsitemap。robots.txtはこの行を読むためだけに取得する
 /// （robots.txt自身はrobotsの判定対象にしない）。値は`<loc>`と同じく完全なURLだけを読む。
-/// 行が無いか読めなければ`/sitemap.xml`を見る。
+/// 行が無いか読めなければ`/sitemap.xml`を見る。宣言は1件ずつ`pending`へ渡し、件数の上限を
+/// 超えた分は数だけ持つ（大量の`Sitemap:`行をすべて抱えないため）。
 async fn initial_sitemaps(
     start: &Url,
     budget: &mut Budget,
     base: &FetchOptions,
     relative: &Cell<usize>,
-) -> Vec<Url> {
-    let mut declared = Vec::new();
+    pending: &mut Pending,
+) {
+    let mut declared = false;
     if let Ok(robots_url) = start.join("/robots.txt")
         && let Ok(text) = budget.get(&robots_url, base, false, true).await
     {
-        declared = robots_sitemaps(&text)
-            .iter()
-            .filter_map(|s| absolute(s, relative))
-            .collect();
+        for url in robots_sitemaps(&text).filter_map(|s| absolute(s, relative)) {
+            declared = true;
+            pending.offer(url, false, 0);
+        }
     }
-    if declared.is_empty() {
-        declared.extend(start.join("/sitemap.xml").ok());
+    if !declared && let Ok(url) = start.join("/sitemap.xml") {
+        pending.offer(url, false, 0);
     }
-    declared
 }
 
 /// sitemapの本文を読む。urlsetのURLは`list`へ入れ、indexなら子sitemapを返す。`<loc>`は
@@ -202,10 +201,7 @@ impl Budget {
                 Ok(String::from_utf8_lossy(&f.body).into_owned())
             }
             Err(e) => {
-                // 上限を超えた取得は残りをすべて読み終えている。次の取得に残りは無い。
-                if e.message.starts_with("response exceeds --max-bytes") {
-                    self.bytes_left = 0;
-                }
+                self.bytes_left = self.bytes_left.saturating_sub(e.consumed);
                 Err(e)
             }
         }
@@ -219,16 +215,12 @@ fn warn_failed(url: &Url, e: &WebgrabError) {
 }
 
 /// robots.txtの`Sitemap:`行の値を出現順に返す。
-pub fn robots_sitemaps(robots: &str) -> Vec<String> {
-    robots
-        .lines()
-        .filter_map(|line| {
-            let (key, value) = line.split_once(':')?;
-            let value = value.trim();
-            (key.trim().eq_ignore_ascii_case("sitemap") && !value.is_empty())
-                .then(|| value.to_string())
-        })
-        .collect()
+pub fn robots_sitemaps(robots: &str) -> impl Iterator<Item = &str> {
+    robots.lines().filter_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        let value = value.trim();
+        (key.trim().eq_ignore_ascii_case("sitemap") && !value.is_empty()).then_some(value)
+    })
 }
 
 /// sitemapの種類。
@@ -238,22 +230,54 @@ pub enum Kind {
     Index,
 }
 
-/// sitemapの種類を見る。
+/// sitemapの種類を最初の要素の名前で見る（`<s:sitemapindex>`のような接頭辞付きも同じ）。
 pub fn kind(xml: &str) -> Kind {
-    if xml.contains("<sitemapindex") {
-        Kind::Index
-    } else {
-        Kind::UrlSet
+    match root_name(xml).map(local_name) {
+        Some("sitemapindex") => Kind::Index,
+        _ => Kind::UrlSet,
     }
+}
+
+/// 最初の要素の名前。XML宣言・コメント・DOCTYPEは読み飛ばす。
+fn root_name(xml: &str) -> Option<&str> {
+    let mut rest = xml;
+    loop {
+        let tag = &rest[rest.find('<')?..];
+        let skip = if tag.starts_with("<?") {
+            tag.find("?>")? + 2
+        } else if tag.starts_with("<!--") {
+            tag.find("-->")? + 3
+        } else if tag.starts_with("<!") {
+            tag.find('>')? + 1
+        } else {
+            let name = &tag[1..];
+            let end = name
+                .find(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/')
+                .unwrap_or(name.len());
+            return Some(&name[..end]);
+        };
+        rest = &tag[skip..];
+    }
+}
+
+fn local_name(name: &str) -> &str {
+    name.rsplit_once(':').map_or(name, |(_, local)| local)
 }
 
 /// sitemapのXMLから`<loc>`の値を出現順に1件ずつ取り出す。XMLパーサーは使わず`<loc>`だけを
 /// 前から1回走査する（巨大・深い入れ子の文書でも線形時間で終わり、全件を同時には持たない）。
+/// 最初の要素が`<s:urlset>`のように接頭辞付きなら`<s:loc>`を読む。`<image:loc>`のような
+/// 拡張の要素は別の接頭辞なので読まない。
 pub fn locs(xml: &str) -> impl Iterator<Item = String> + '_ {
+    let tag = match root_name(xml).and_then(|n| n.rsplit_once(':')) {
+        Some((prefix, _)) => format!("{prefix}:loc"),
+        None => "loc".to_string(),
+    };
+    let (open, close) = (format!("<{tag}"), format!("</{tag}"));
     let mut rest = xml;
     std::iter::from_fn(move || {
         loop {
-            let (value, after) = next_loc(rest)?;
+            let (value, after) = next_loc(rest, &open, &close)?;
             rest = after;
             if value.is_some() {
                 return value;
@@ -262,13 +286,13 @@ pub fn locs(xml: &str) -> impl Iterator<Item = String> + '_ {
     })
 }
 
-/// 次の`<loc>`要素を探す。`(値, 残り)`を返し、値が空なら`None`を入れる。
-/// 閉じタグが無ければ走査を終える。
-fn next_loc(xml: &str) -> Option<(Option<String>, &str)> {
+/// 次の`open`（`<loc`など）で始まる要素を探す。`(値, 残り)`を返し、値が空なら`None`を入れる。
+/// 閉じタグ`close`が無ければ走査を終える。
+fn next_loc<'a>(xml: &'a str, open: &str, close: &str) -> Option<(Option<String>, &'a str)> {
     let mut rest = xml;
     loop {
-        let at = rest.find("<loc")?;
-        let after_name = &rest[at + 4..];
+        let at = rest.find(open)?;
+        let after_name = &rest[at + open.len()..];
         // `<location>`のような別名のタグを除く。
         if !after_name.starts_with(|c: char| c == '>' || c.is_ascii_whitespace()) {
             rest = after_name;
@@ -276,8 +300,8 @@ fn next_loc(xml: &str) -> Option<(Option<String>, &str)> {
         }
         let open_end = after_name.find('>')?;
         let body = &after_name[open_end + 1..];
-        let close = body.find("</loc")?;
-        return Some((loc_value(&body[..close]), &body[close..]));
+        let end = body.find(close)?;
+        return Some((loc_value(&body[..end]), &body[end..]));
     }
 }
 
@@ -295,7 +319,8 @@ fn loc_value(raw: &str) -> Option<String> {
 }
 
 /// `;`を探す範囲（`&`と`;`を含む）。最長の参照`&#x10FFFF;`の長さ。区切らないと`&`だけが
-/// 大量に並ぶ入力で`;`探しが末尾まで繰り返され、二乗時間になる。
+/// 大量に並ぶ入力で`;`探しが末尾まで繰り返され、二乗時間になる。文字参照の先頭のゼロは
+/// XMLで許されるので、その分だけ範囲を広げる（ゼロの並びは参照ごとに1回しか読まない）。
 const MAX_REF_LEN: usize = 10;
 
 /// XMLの定義済み実体参照5つと文字参照（`&#38;`、`&#x26;`）を前から1回で戻す。戻した文字は
@@ -306,7 +331,11 @@ fn unescape(s: &str) -> String {
     while let Some(at) = rest.find('&') {
         out.push_str(&rest[..at]);
         let tail = &rest[at..];
-        let window = &tail.as_bytes()[..tail.len().min(MAX_REF_LEN)];
+        let zeros = tail
+            .strip_prefix("&#x")
+            .or_else(|| tail.strip_prefix("&#"))
+            .map_or(0, |d| d.bytes().take_while(|&b| b == b'0').count());
+        let window = &tail.as_bytes()[..tail.len().min(MAX_REF_LEN + zeros)];
         let decoded = window
             .iter()
             .position(|&b| b == b';')
@@ -348,9 +377,10 @@ fn reference(name: &str) -> Option<char> {
 }
 
 /// `start`と同じホストのhttp/httpsのURLを、fragment除去・重複除去して受け取った順に並べる。
-/// 候補は1件ずつ受け、条件に合うものだけを持つ。
+/// 候補は1件ずつ受け、条件に合うものだけを持つ。ポートも比べる。既定のポート（httpの80と
+/// httpsの443）は`Url::port`が`None`にそろえるので、httpとhttpsが混ざったリンクは落とさない。
 pub struct UrlList {
-    host: Option<String>,
+    host: Option<(String, Option<u16>)>,
     seen: HashSet<String>,
     out: String,
 }
@@ -359,7 +389,7 @@ impl UrlList {
     pub fn new(start: &str) -> Self {
         let host = Url::parse(start)
             .ok()
-            .and_then(|u| u.host_str().map(str::to_string));
+            .and_then(|u| Some((u.host_str()?.to_string(), u.port())));
         Self {
             host,
             seen: HashSet::new(),
@@ -368,13 +398,13 @@ impl UrlList {
     }
 
     pub fn push(&mut self, candidate: &str) {
-        let Some(host) = self.host.as_deref() else {
+        let Some((host, port)) = &self.host else {
             return;
         };
         let Some(url) = crate::links::resolve(None, candidate) else {
             return;
         };
-        let same = Url::parse(&url).is_ok_and(|u| u.host_str() == Some(host));
+        let same = Url::parse(&url).is_ok_and(|u| u.host_str() == Some(host) && u.port() == *port);
         if !same || self.seen.contains(&url) {
             return;
         }
@@ -399,7 +429,7 @@ mod tests {
     fn robots_sitemaps_reads_every_sitemap_line_case_insensitively() {
         let txt = "User-agent: *\nDisallow: /a\nSitemap: https://x.test/s1.xml\nsitemap:https://x.test/s2.xml  \r\nSITEMAP : https://cdn.test/s3.xml\n";
         assert_eq!(
-            robots_sitemaps(txt),
+            robots_sitemaps(txt).collect::<Vec<_>>(),
             vec![
                 "https://x.test/s1.xml",
                 "https://x.test/s2.xml",
@@ -412,7 +442,7 @@ mod tests {
     fn robots_sitemaps_ignores_empty_values_and_other_keys() {
         let txt =
             "Sitemap:\nSitemaps: https://x.test/no.xml\nDisallow: /sitemap.xml\nno colon line\n";
-        assert!(robots_sitemaps(txt).is_empty());
+        assert_eq!(robots_sitemaps(txt).count(), 0);
     }
 
     fn parse(xml: &str) -> (Kind, Vec<String>) {
@@ -446,9 +476,50 @@ mod tests {
     }
 
     #[test]
+    fn kind_reads_the_root_element_not_any_mention() {
+        let commented = "<?xml version=\"1.0\"?><!-- <sitemapindex> --><urlset></urlset>";
+        assert_eq!(kind(commented), Kind::UrlSet);
+        let cdata =
+            "<urlset><url><loc><![CDATA[https://x.test/<sitemapindex>]]></loc></url></urlset>";
+        assert_eq!(kind(cdata), Kind::UrlSet);
+        let prefixed = "<s:sitemapindex xmlns:s=\"http://www.sitemaps.org/schemas/sitemap/0.9\">";
+        assert_eq!(kind(prefixed), Kind::Index);
+        let doctype = "<!DOCTYPE s [<!ENTITY a \"b\">]><sitemapindex></sitemapindex>";
+        assert_eq!(kind(doctype), Kind::Index);
+    }
+
+    #[test]
+    fn locs_follow_the_root_namespace_prefix_and_skip_extensions() {
+        let prefixed = "<s:urlset xmlns:s=\"http://www.sitemaps.org/schemas/sitemap/0.9\"><s:url><s:loc>https://x.test/a</s:loc><image:loc>https://x.test/i.png</image:loc></s:url></s:urlset>";
+        assert_eq!(parse(prefixed).1, vec!["https://x.test/a".to_string()]);
+        let plain = "<urlset><url><loc>https://x.test/b</loc><image:image><image:loc>https://x.test/i.png</image:loc></image:image></url></urlset>";
+        assert_eq!(parse(plain).1, vec!["https://x.test/b".to_string()]);
+    }
+
+    #[test]
+    fn unescape_accepts_leading_zeros_in_character_references() {
+        assert_eq!(unescape("a=1&#00000000038;b=2"), "a=1&b=2");
+        assert_eq!(unescape("&#x0000000041;"), "A");
+        assert_eq!(unescape("&#0000000000;"), "&#0000000000;");
+    }
+
+    #[test]
+    fn url_list_treats_a_different_port_as_another_host() {
+        let got = same_host_list(
+            "https://x.test:8443/",
+            &[
+                "https://x.test/a",
+                "https://x.test:8443/b",
+                "http://x.test:8443/c",
+            ],
+        );
+        assert_eq!(got, "https://x.test:8443/b\nhttp://x.test:8443/c");
+    }
+
+    #[test]
     fn unescape_reads_references_up_to_the_longest_code_point_only() {
         assert_eq!(unescape("&#x10FFFF;"), "\u{10FFFF}");
-        assert_eq!(unescape("&#x110000;&#x010FFFF;"), "&#x110000;&#x010FFFF;");
+        assert_eq!(unescape("&#x110000;&#x010FFFF;"), "&#x110000;\u{10FFFF}");
         assert_eq!(unescape("&&;&#;&#x;&#+1;&amp"), "&&;&#;&#x;&#+1;&amp");
     }
 

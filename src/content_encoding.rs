@@ -125,6 +125,7 @@ pub struct Decoder {
     inner: Inner,
     over: Arc<AtomicBool>,
     received: bool,
+    cap: u64,
 }
 
 const BROTLI_BUFFER: usize = 4096;
@@ -154,6 +155,7 @@ impl Decoder {
             inner,
             over,
             received: false,
+            cap,
         }
     }
 
@@ -177,30 +179,74 @@ impl Decoder {
         r.map_err(|e| self.classify(e))
     }
 
+    /// 通信が途中で切れたときに、それまでに展開器が書き出せたバイト数を返す。
+    pub fn abort(self) -> u64 {
+        if !self.received {
+            return 0;
+        }
+        match close_inner(self.inner) {
+            Ok(s) => s.buf.len() as u64,
+            Err((_, n)) => n,
+        }
+    }
+
+    /// `push`がデータの破損で失敗したときに、使ったとみなすバイト数を返す。
+    pub fn abort_corrupt(self) -> u64 {
+        match self.inner {
+            Inner::Br(_) => self.cap,
+            _ => self.abort(),
+        }
+    }
+
     /// 末尾まで展開し、展開後の本文を返す。途中で切れた圧縮データは`Corrupt`になる。
     /// 1バイトも届かなかった本文は、符号化の指定があっても空の本文として返す。
     pub fn finish(self) -> Result<Vec<u8>, DecodeError> {
+        self.finish_counted().map_err(|(e, _)| e)
+    }
+
+    /// `finish`と同じだが、失敗したときはそれまでに展開できたバイト数も返す。
+    /// gzipとbrotliの展開器は出力を内部に貯めるので、閉じて吐き出させてから数える。
+    pub fn finish_counted(self) -> Result<Vec<u8>, (DecodeError, u64)> {
         if !self.received {
             return Ok(Vec::new());
         }
-        let over = Arc::clone(&self.over);
-        let done = match self.inner {
-            Inner::Identity(s) => Ok(s),
-            Inner::Gzip(d) => d.finish(),
-            Inner::Deflate(d) if d.ended => Ok(d.out),
-            Inner::Deflate(_) => Err(io::Error::other("truncated deflate stream")),
-            Inner::Br(mut d) => d.close().and_then(|()| {
-                d.into_inner()
-                    .map_err(|_| io::Error::other("brotli writer was not closed"))
-            }),
-        };
-        done.map(|s| s.buf).map_err(|e| {
-            if over.load(Ordering::Relaxed) {
+        let over = &self.over;
+        // shortcut: brotliは壊れたり途中で終わったりすると、展開済みの出力を窓（最大16MiB）の中に
+        // 残したまま書き出さない。正確に数えられないので上限まで使ったとみなす。
+        let cap = matches!(self.inner, Inner::Br(_)).then_some(self.cap);
+        close_inner(self.inner).map(|s| s.buf).map_err(|(e, n)| {
+            let e = if over.load(Ordering::Relaxed) {
                 DecodeError::OverCap
             } else {
                 DecodeError::Corrupt(e.to_string())
-            }
+            };
+            (e, cap.unwrap_or(n))
         })
+    }
+}
+
+/// 展開器を閉じて出力先を取り出す。失敗したときは、それまでに書き出せたバイト数を添える。
+fn close_inner(inner: Inner) -> Result<CappedSink, (io::Error, u64)> {
+    let len = |s: &CappedSink| s.buf.len() as u64;
+    match inner {
+        Inner::Identity(s) => Ok(s),
+        Inner::Gzip(mut d) => match d.try_finish() {
+            Ok(()) => {
+                let n = len(d.get_ref());
+                d.finish().map_err(|e| (e, n))
+            }
+            Err(e) => Err((e, len(d.get_ref()))),
+        },
+        Inner::Deflate(d) if d.ended => Ok(d.out),
+        Inner::Deflate(d) => Err((io::Error::other("truncated deflate stream"), len(&d.out))),
+        // closeはエラーを返す前に、展開器に残った出力を書き出す。
+        Inner::Br(mut d) => match d.close() {
+            Ok(()) => d.into_inner().map_err(|s| {
+                let n = len(&s);
+                (io::Error::other("brotli writer was not closed"), n)
+            }),
+            Err(e) => Err((e, len(d.get_ref()))),
+        },
     }
 }
 
@@ -310,6 +356,84 @@ mod tests {
         // 本文の無い応答にもContent-Encodingを付けるサーバーがある。
         for c in [Coding::Gzip, Coding::Deflate, Coding::Br] {
             assert_eq!(decode(c, b"", 1 << 20), Ok(Vec::new()), "{c:?}");
+        }
+    }
+
+    const CAP: u64 = 1 << 20;
+
+    #[test]
+    fn failed_streams_report_everything_decoded_so_far() {
+        use std::io::Read;
+        let text = b"<p>truncated</p>".repeat(500);
+        for c in [Coding::Gzip, Coding::Deflate, Coding::Br] {
+            let full = compress(c, &text);
+            for cut in (1..full.len()).step_by(13).map(|n| &full[..n]) {
+                // 参照の展開器が途中で失敗するまでに返した量が、展開できた全量。
+                let mut decodable = Vec::new();
+                let _ = match c {
+                    Coding::Gzip => {
+                        flate2::read::MultiGzDecoder::new(cut).read_to_end(&mut decodable)
+                    }
+                    Coding::Deflate => {
+                        flate2::read::ZlibDecoder::new(cut).read_to_end(&mut decodable)
+                    }
+                    _ => brotli_decompressor::Decompressor::new(cut, 4096)
+                        .read_to_end(&mut decodable),
+                };
+                let decodable = decodable.len() as u64;
+                let push_all = || {
+                    let mut d = Decoder::new(c, CAP);
+                    for chunk in cut.chunks(16384) {
+                        d.push(chunk).unwrap();
+                    }
+                    d
+                };
+                let at = cut.len();
+                // 応答は終わったのに圧縮データが途中で終わった。brotliは数えきれないので上限とみなす。
+                let expected = if c == Coding::Br { CAP } else { decodable };
+                match push_all().finish_counted() {
+                    Err((DecodeError::Corrupt(_), n)) => assert_eq!(n, expected, "{c:?} cut={at}"),
+                    other => panic!("{c:?} cut={at}: {:?}", other.map(|b| b.len())),
+                }
+                // 通信が途中で切れた。どの方式も、書き出せた量だけを数える。
+                let n = push_all().abort();
+                if c == Coding::Br {
+                    assert!(n <= decodable, "{c:?} cut={at}: {n} > {decodable}");
+                } else {
+                    assert_eq!(n, decodable, "{c:?} cut={at}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn brotli_that_fails_while_pushing_counts_the_cap() {
+        let mut bad = compress(Coding::Br, b"");
+        let mid = bad.len() / 2;
+        bad[mid..].iter_mut().for_each(|b| *b ^= 0xA5);
+        let mut d = Decoder::new(Coding::Br, CAP);
+        let failed = bad.chunks(16384).find_map(|chunk| d.push(chunk).err());
+        assert!(
+            matches!(failed, Some(DecodeError::Corrupt(_))),
+            "{failed:?}"
+        );
+        assert_eq!(d.abort_corrupt(), CAP);
+    }
+
+    #[test]
+    fn gzip_and_deflate_that_fail_while_pushing_count_what_was_written() {
+        let text = b"<p>corrupt</p>".repeat(500);
+        for c in [Coding::Gzip, Coding::Deflate] {
+            let mut bad = compress(c, &text);
+            let mid = bad.len() / 2;
+            bad[mid..].iter_mut().for_each(|b| *b ^= 0xA5);
+            let mut d = Decoder::new(c, CAP);
+            let failed = bad.chunks(16384).find_map(|chunk| d.push(chunk).err());
+            assert!(
+                matches!(failed, Some(DecodeError::Corrupt(_))),
+                "{c:?}: {failed:?}"
+            );
+            assert!(d.abort_corrupt() <= text.len() as u64, "{c:?}");
         }
     }
 

@@ -400,22 +400,37 @@ async fn read_capped(
     coding: Coding,
     max_bytes: u64,
 ) -> Result<Vec<u8>> {
-    let decode_err = |e: DecodeError| match e {
+    // 失敗したときも、それまでに展開した量を呼び出し側の残りから引けるよう返す。
+    // --max-bytes は展開後の量なので、回線上の量ではなく展開後の量で数える。
+    // 上限を超えた取得は上限まで読み終えている。
+    let decode_err = |e: DecodeError, decoded: u64| match e {
         DecodeError::OverCap => WebgrabError::new(
             ExitCode::Http,
             format!("response exceeds --max-bytes ({max_bytes})"),
-        ),
-        DecodeError::Corrupt(d) => {
-            WebgrabError::new(ExitCode::Network, "stream read failed").with_detail(d)
-        }
+        )
+        .with_consumed(max_bytes),
+        DecodeError::Corrupt(d) => WebgrabError::new(ExitCode::Network, "stream read failed")
+            .with_detail(d)
+            .with_consumed(decoded),
     };
     let mut decoder = Decoder::new(coding, max_bytes);
-    while let Some(chunk) = resp.chunk().await.map_err(|e| {
-        WebgrabError::new(ExitCode::Network, "stream read failed").with_detail(e.to_string())
-    })? {
-        decoder.push(&chunk).map_err(decode_err)?;
+    loop {
+        let chunk = match resp.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(e) => {
+                return Err(WebgrabError::new(ExitCode::Network, "stream read failed")
+                    .with_detail(e.to_string())
+                    .with_consumed(decoder.abort()));
+            }
+        };
+        if let Err(e) = decoder.push(&chunk) {
+            return Err(decode_err(e, decoder.abort_corrupt()));
+        }
     }
-    decoder.finish().map_err(decode_err)
+    decoder
+        .finish_counted()
+        .map_err(|(e, decoded)| decode_err(e, decoded))
 }
 
 #[cfg(test)]
