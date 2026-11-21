@@ -54,6 +54,10 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub raw: bool,
 
+    /// 本文の代わりに、同じホストのURL一覧を出す（sitemapと起点ページのリンクから集める）
+    #[arg(long, default_value_t = false, conflicts_with_all = ["render", "auto_render", "raw", "wait_ms"])]
+    pub map: bool,
+
     /// 全体タイムアウト（秒）
     #[arg(long, default_value_t = 30)]
     pub timeout: u64,
@@ -146,6 +150,7 @@ fn content_flags(cli: &Cli, render_path: bool) -> Vec<String> {
     }
     for (on, flag) in [
         (cli.raw, "--raw"),
+        (cli.map, "--map"),
         (cli.no_tokens, "--no-tokens"),
         (cli.fence, "--fence"),
         (cli.allow_private, "--allow-private"),
@@ -350,5 +355,16 @@ mod tests {
         for absent in ["format", "fence", "max-bytes"] {
             assert!(!g.iter().any(|s| s.contains(absent)), "{absent}: {g:?}");
         }
+    }
+
+    #[test]
+    fn map_is_kept_in_the_continuation_flags_and_conflicts_with_wait_ms() {
+        let cli = Cli::try_parse_from(["webgrab", "https://x.test", "--map"]).unwrap();
+        assert!(extra_flags(&cli, RenderStatus::Static).contains(&"--map".to_string()));
+        let plain = Cli::try_parse_from(["webgrab", "https://x.test"]).unwrap();
+        assert!(!extra_flags(&plain, RenderStatus::Static).contains(&"--map".to_string()));
+        assert!(
+            Cli::try_parse_from(["webgrab", "https://x.test", "--map", "--wait-ms", "1"]).is_err()
+        );
     }
 }

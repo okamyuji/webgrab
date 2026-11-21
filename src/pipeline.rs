@@ -5,7 +5,7 @@ use crate::error::{ExitCode, Result, WebgrabError};
 use crate::fetch::{self, FetchOptions};
 use crate::output::{self, Format, Meta, RenderStatus};
 use crate::render::{self, RenderOptions};
-use crate::{budget, cli, convert, decode, extract, links, tokens};
+use crate::{budget, cli, convert, decode, extract, links, sitemap, tokens};
 use std::time::{Duration, Instant};
 
 const SHORT_CONTENT_CHARS: usize = 200;
@@ -89,6 +89,15 @@ pub fn hint_for(status: RenderStatus) -> (&'static str, &'static str) {
         RenderStatus::Rendered | RenderStatus::Failed(_) | RenderStatus::NoGain => {
             ("--raw", "--raw")
         }
+    }
+}
+
+/// `--map`の既定（markdown）は1行1URLの一覧にする。json等の明示はそのまま使う。
+fn output_format(cli: &Cli) -> Format {
+    if cli.map && cli.format == FormatArg::Markdown {
+        Format::Links
+    } else {
+        to_format(cli.format)
     }
 }
 
@@ -265,6 +274,7 @@ fn fetch_options(cli: &Cli, ua: String, timeout: Duration, check_robots: bool) -
         max_bytes: cli.max_bytes,
         allow_private: cli.allow_private,
         check_robots,
+        allow_xml: false,
     }
 }
 
@@ -292,6 +302,37 @@ async fn static_phase(
         stage,
         final_url: fetched.final_url,
         consumed: fetched.consumed_bytes,
+    })
+}
+
+/// `--map`のフェーズ。起点ページは`--raw --format links`と同じ経路でリンクを取り、
+/// sitemapのURLを先に、ページのリンクを後に並べて同じホストだけを残す。
+async fn map_phase(
+    cli: &Cli,
+    ua: String,
+    timeout: Duration,
+    deadline: Instant,
+) -> Result<Acquired> {
+    let page_cli = Cli {
+        raw: true,
+        format: FormatArg::Links,
+        ..cli.clone()
+    };
+    let acq = static_phase(&page_cli, ua.clone(), timeout, deadline).await?;
+    let fopts = fetch_options(cli, ua, timeout, !cli.no_robots);
+    let left = cli.max_bytes.saturating_sub(acq.consumed);
+    let found = sitemap::collect(&acq.final_url, &fopts, deadline, left).await;
+    let page_links = acq.stage.body.lines().map(str::to_string);
+    let body = sitemap::same_host_list(&acq.final_url, found.into_iter().chain(page_links));
+    Ok(Acquired {
+        stage: Stage {
+            title: None,
+            published: None,
+            visible: body.chars().count(),
+            body,
+            route: Route::Links,
+        },
+        ..acq
     })
 }
 
@@ -438,7 +479,7 @@ fn assemble(cli: &Cli, acq: Acquired, status: RenderStatus, chars: CharCounts) -
     };
     let extra = cli::extra_flags(cli, status);
     Ok(output::render(
-        to_format(cli.format),
+        output_format(cli),
         &meta,
         &slice,
         cli.max_chars == 0,
@@ -464,7 +505,14 @@ pub async fn run(cli: &Cli) -> Result<String> {
     let deadline = start + timeout;
     warn_ignored_flags(cli);
 
-    let (mut acq, mut status, mut chars) = if cli.render {
+    let (mut acq, mut status, mut chars) = if cli.map {
+        let acq = map_phase(cli, ua, timeout, deadline).await?;
+        let chars = CharCounts {
+            static_chars: Some(acq.stage.visible),
+            rendered_chars: None,
+        };
+        (acq, RenderStatus::Static, chars)
+    } else if cli.render {
         let acq = render_phase(cli, ua, timeout, deadline).await?;
         let chars = CharCounts {
             static_chars: None,
@@ -568,6 +616,16 @@ mod tests {
     fn cli_for(args: &[&str]) -> Cli {
         use clap::Parser;
         Cli::try_parse_from(["webgrab", "https://x.test"].iter().chain(args)).unwrap()
+    }
+
+    #[test]
+    fn map_prints_a_plain_list_unless_another_format_is_named() {
+        assert_eq!(output_format(&cli_for(&["--map"])), Format::Links);
+        assert_eq!(
+            output_format(&cli_for(&["--map", "--format", "json"])),
+            Format::Json
+        );
+        assert_eq!(output_format(&cli_for(&[])), Format::Markdown);
     }
 
     #[test]

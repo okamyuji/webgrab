@@ -59,6 +59,8 @@ pub struct FetchOptions {
     pub max_bytes: u64,
     pub allow_private: bool,
     pub check_robots: bool,
+    /// `application/xml`と`text/xml`も受ける（`--map`のsitemap取得だけで使う）。
+    pub allow_xml: bool,
 }
 
 /// ホスト名を解決し、netguardを通した検証済みSocketAddrを返す。
@@ -258,12 +260,14 @@ fn coding_of_response(resp: &reqwest::Response) -> Result<Coding> {
 }
 
 /// メディアタイプが対応外なら`ExitCode::Http`で拒否する（メディアタイプは大小無視: RFC 9110 §8.3.1）。
-fn check_media_type(content_type: Option<&str>) -> Result<()> {
+fn check_media_type(content_type: Option<&str>, allow_xml: bool) -> Result<()> {
     let Some(ct) = content_type else {
         return Ok(());
     };
     let main = ct.split(';').next().unwrap_or("").trim();
-    if !is_supported_media_type(main) {
+    let xml = allow_xml
+        && (main.eq_ignore_ascii_case("application/xml") || main.eq_ignore_ascii_case("text/xml"));
+    if !xml && !is_supported_media_type(main) {
         return Err(WebgrabError::new(
             ExitCode::Http,
             format!("unsupported content-type: {main}"),
@@ -285,7 +289,7 @@ fn redirect_target(resp: &reqwest::Response, current: &Url) -> Result<Url> {
 }
 
 /// 非3xx応答を本文読み込みの前に検査し、Content-Typeと展開方式を返す。
-fn accept_response(resp: &reqwest::Response) -> Result<(Option<String>, Coding)> {
+fn accept_response(resp: &reqwest::Response, allow_xml: bool) -> Result<(Option<String>, Coding)> {
     let status = resp.status();
     if status.is_client_error() || status.is_server_error() {
         return Err(WebgrabError::new(
@@ -298,7 +302,7 @@ fn accept_response(resp: &reqwest::Response) -> Result<(Option<String>, Coding)>
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    check_media_type(content_type.as_deref())?;
+    check_media_type(content_type.as_deref(), allow_xml)?;
     Ok((content_type, coding_of_response(resp)?))
 }
 
@@ -327,7 +331,7 @@ pub async fn fetch(url_str: &str, opts: &FetchOptions) -> Result<Fetched> {
             current = redirect_target(&resp, &current)?;
             continue;
         }
-        let (content_type, coding) = accept_response(&resp)?;
+        let (content_type, coding) = accept_response(&resp, opts.allow_xml)?;
 
         // ストリーミング読み込みで max_bytes を展開後サイズに適用
         let body = read_capped(resp, coding, opts.max_bytes).await?;
@@ -404,12 +408,23 @@ mod tests {
 
     #[test]
     fn check_media_type_rejects_unsupported_with_exit_4() {
-        assert!(check_media_type(None).is_ok());
-        assert!(check_media_type(Some("text/html; charset=utf-8")).is_ok());
-        assert!(check_media_type(Some("text/plain")).is_ok());
-        let e = check_media_type(Some("application/pdf; q=1")).unwrap_err();
+        assert!(check_media_type(None, false).is_ok());
+        assert!(check_media_type(Some("text/html; charset=utf-8"), false).is_ok());
+        assert!(check_media_type(Some("text/plain"), false).is_ok());
+        let e = check_media_type(Some("application/pdf; q=1"), false).unwrap_err();
         assert_eq!(e.code, ExitCode::Http);
         assert_eq!(e.message, "unsupported content-type: application/pdf");
+    }
+
+    #[test]
+    fn check_media_type_accepts_xml_only_when_allowed() {
+        for ct in ["application/xml", "Text/XML; charset=utf-8"] {
+            assert!(check_media_type(Some(ct), true).is_ok(), "{ct}");
+            assert!(check_media_type(Some(ct), false).is_err(), "{ct}");
+        }
+        assert!(check_media_type(Some("text/html"), true).is_ok());
+        assert!(check_media_type(Some("application/pdf"), true).is_err());
+        assert!(check_media_type(Some("application/rss+xml"), true).is_err());
     }
 
     #[test]
@@ -442,6 +457,7 @@ mod tests {
             max_bytes: 1024,
             allow_private: false,
             check_robots: true,
+            allow_xml: false,
         }
     }
 

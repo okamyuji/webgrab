@@ -16,4 +16,5 @@ pub mod pipeline;
 pub mod render;
 pub mod renderproxy;
 pub mod robots;
+pub mod sitemap;
 pub mod tokens;
