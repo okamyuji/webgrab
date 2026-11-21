@@ -32,10 +32,19 @@ fn robots(body: impl Into<String>) -> Route {
     typed("/robots.txt", body, "text/plain")
 }
 
+/// sitemapの`<loc>`は完全なURLに限るので、`/`で始まるパスは試験用サーバの`{origin}`を付ける。
+fn absolute(u: &str) -> String {
+    if u.starts_with('/') {
+        format!("{{origin}}{u}")
+    } else {
+        u.to_string()
+    }
+}
+
 fn urlset(urls: &[String]) -> String {
     let items: String = urls
         .iter()
-        .map(|u| format!("<url><loc>{u}</loc></url>"))
+        .map(|u| format!("<url><loc>{}</loc></url>", absolute(u)))
         .collect();
     format!("<?xml version=\"1.0\"?><urlset>{items}</urlset>")
 }
@@ -43,7 +52,7 @@ fn urlset(urls: &[String]) -> String {
 fn index(urls: &[String]) -> String {
     let items: String = urls
         .iter()
-        .map(|u| format!("<sitemap><loc>{u}</loc></sitemap>"))
+        .map(|u| format!("<sitemap><loc>{}</loc></sitemap>", absolute(u)))
         .collect();
     format!("<sitemapindex>{items}</sitemapindex>")
 }

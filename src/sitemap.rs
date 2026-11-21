@@ -41,7 +41,7 @@ pub async fn collect(
         let same_origin = url.origin() == start.origin();
         match budget.get(&url, base, base.check_robots, same_origin).await {
             Ok(xml) => {
-                for child in classify(&url, &xml, nested, list) {
+                for child in classify(&xml, nested, list) {
                     pending.offer(child, true, fetched);
                 }
             }
@@ -103,15 +103,12 @@ async fn initial_sitemaps(start: &Url, budget: &mut Budget, base: &FetchOptions)
     declared
 }
 
-/// sitemapの本文を読む。urlsetのURLは`list`へ入れ、indexなら子sitemapを返す。`<loc>`は
-/// `url`基準で解決する。indexの子がまたindexならたどらない（1段だけ）。
-fn classify<'a>(
-    url: &'a Url,
-    xml: &'a str,
-    nested: bool,
-    list: &mut UrlList,
-) -> impl Iterator<Item = Url> + 'a {
-    let resolved = locs(xml).filter_map(move |l| url.join(&l).ok());
+/// sitemapの本文を読む。urlsetのURLは`list`へ入れ、indexなら子sitemapを返す。indexの子が
+/// またindexならたどらない（1段だけ）。`<loc>`は完全なURLだけを読む（sitemaps.orgの規約）。
+/// 相対URLを解決すると、長いsitemapのURLを基準に短い`<loc>`が何倍にも膨らみ、
+/// `--max-bytes`に収まる入力から際限なくメモリを使わせられる。
+fn classify<'a>(xml: &'a str, nested: bool, list: &mut UrlList) -> impl Iterator<Item = Url> + 'a {
+    let resolved = locs(xml).filter_map(|l| Url::parse(&l).ok());
     let children = match kind(xml) {
         Kind::Index if nested => {
             eprintln!("webgrab: warn=sitemap-skipped reason=nested-index");
@@ -489,25 +486,24 @@ mod tests {
     }
 
     #[test]
-    fn classify_resolves_locs_against_the_sitemap_url() {
-        let base = Url::parse("https://x.test/maps/s.xml").unwrap();
+    fn classify_reads_only_absolute_locs() {
         let mut list = UrlList::new("https://x.test/");
-        let idx = "<sitemapindex><sitemap><loc>c1.xml</loc></sitemap></sitemapindex>";
+        let idx = "<sitemapindex><sitemap><loc>c1.xml</loc></sitemap><sitemap><loc>https://x.test/maps/c2.xml</loc></sitemap></sitemapindex>";
         assert_eq!(
-            classify(&base, idx, false, &mut list).collect::<Vec<_>>(),
-            vec![Url::parse("https://x.test/maps/c1.xml").unwrap()]
+            classify(idx, false, &mut list).collect::<Vec<_>>(),
+            vec![Url::parse("https://x.test/maps/c2.xml").unwrap()]
         );
-        let set = "<urlset><loc>/p</loc><loc>https://y.test/q</loc><loc>/r</loc></urlset>";
-        assert_eq!(classify(&base, set, true, &mut list).count(), 0);
-        assert_eq!(list.finish(), "https://x.test/p\nhttps://x.test/r");
+        let set =
+            "<urlset><loc>/p</loc><loc>https://y.test/q</loc><loc>https://x.test/r</loc></urlset>";
+        assert_eq!(classify(set, true, &mut list).count(), 0);
+        assert_eq!(list.finish(), "https://x.test/r");
     }
 
     #[test]
     fn classify_does_not_follow_an_index_inside_an_index() {
-        let base = Url::parse("https://x.test/s.xml").unwrap();
         let mut list = UrlList::new("https://x.test/");
-        let idx = "<sitemapindex><sitemap><loc>/c.xml</loc></sitemap></sitemapindex>";
-        assert_eq!(classify(&base, idx, true, &mut list).count(), 0);
+        let idx = "<sitemapindex><sitemap><loc>https://x.test/c.xml</loc></sitemap></sitemapindex>";
+        assert_eq!(classify(idx, true, &mut list).count(), 0);
         assert_eq!(list.finish(), "");
     }
 
