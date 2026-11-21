@@ -293,6 +293,31 @@ fn map_counts_decoded_bytes_of_a_truncated_gzip_sitemap() {
 }
 
 #[test]
+fn map_keeps_reading_sitemaps_after_a_brotli_sitemap_connection_breaks() {
+    let br = include_bytes!("fixtures/article.html.br");
+    let half = br[..br.len() / 2].to_vec();
+    let good: Vec<String> = (0..3).map(|i| format!("/good-page-{i}")).collect();
+    let s = common::start(vec![
+        robots("Sitemap: {origin}/bad.xml\nSitemap: {origin}/good.xml\n"),
+        Route::html("/", "<html><body>x</body></html>"),
+        Route {
+            // 宣言より短い本文で接続を閉じ、通信が途中で切れた形にする。
+            declared_len: Some(br.len() * 10),
+            body: half,
+            headers: vec![("Content-Encoding", "br".to_string())],
+            ..xml("/bad.xml", "")
+        },
+        xml("/good.xml", urlset(&good)),
+    ]);
+    let (code, stdout, stderr) = run(&[&s.url("/"), "--allow-private", "--map"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(stderr.contains("stream read failed"), "stderr={stderr}");
+    // 通信の切断では残りを使い切らないので、次のsitemapも読む。
+    let want: Vec<String> = good.iter().map(|p| s.url(p)).collect();
+    assert_eq!(lines(&stdout), want, "stderr={stderr}");
+}
+
+#[test]
 fn map_with_zero_urls_exits_0_with_empty_body() {
     let s = common::start(vec![
         ok_robots(),

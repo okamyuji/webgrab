@@ -425,7 +425,7 @@ async fn read_capped(
             }
         };
         if let Err(e) = decoder.push(&chunk) {
-            return Err(decode_err(e, decoder.abort()));
+            return Err(decode_err(e, decoder.abort_corrupt()));
         }
     }
     decoder
