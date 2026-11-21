@@ -86,7 +86,8 @@ impl Pending {
 }
 
 /// robots.txtの`Sitemap:`行が指すsitemap。robots.txtはこの行を読むためだけに取得する
-/// （robots.txt自身はrobotsの判定対象にしない）。行が無いか読めなければ`/sitemap.xml`を見る。
+/// （robots.txt自身はrobotsの判定対象にしない）。値は`<loc>`と同じく完全なURLだけを読む。
+/// 行が無いか読めなければ`/sitemap.xml`を見る。
 async fn initial_sitemaps(start: &Url, budget: &mut Budget, base: &FetchOptions) -> Vec<Url> {
     let mut declared = Vec::new();
     if let Ok(robots_url) = start.join("/robots.txt")
@@ -94,7 +95,7 @@ async fn initial_sitemaps(start: &Url, budget: &mut Budget, base: &FetchOptions)
     {
         declared = robots_sitemaps(&text)
             .iter()
-            .filter_map(|s| robots_url.join(s).ok())
+            .filter_map(|s| Url::parse(s).ok())
             .collect();
     }
     if declared.is_empty() {

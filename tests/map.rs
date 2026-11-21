@@ -70,7 +70,7 @@ fn ok_robots() -> Route {
 #[test]
 fn map_lists_sitemap_urls_first_then_page_links_on_the_same_host() {
     let s = common::start(vec![
-        robots("User-agent: *\nSitemap: /index.xml\n"),
+        robots("User-agent: *\nSitemap: {origin}/index.xml\n"),
         Route::html("/", PAGE),
         xml("/index.xml", index(&["/s1.xml".into()])),
         xml(
@@ -167,6 +167,19 @@ fn map_does_not_carry_allow_private_to_an_index_child_on_another_origin() {
 }
 
 #[test]
+fn map_ignores_relative_sitemap_lines_in_robots() {
+    let s = common::start(vec![
+        robots("Sitemap: /declared.xml\n"),
+        Route::html("/", "<html><body>x</body></html>"),
+        xml("/declared.xml", urlset(&["/from-relative".into()])),
+        xml("/sitemap.xml", urlset(&["/from-default".into()])),
+    ]);
+    let (code, stdout, stderr) = run(&[&s.url("/"), "--allow-private", "--map"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(lines(&stdout), vec![s.url("/from-default")]);
+}
+
+#[test]
 fn map_with_zero_urls_exits_0_with_empty_body() {
     let s = common::start(vec![
         ok_robots(),
@@ -181,7 +194,7 @@ fn map_with_zero_urls_exits_0_with_empty_body() {
 #[test]
 fn map_skips_gzip_sitemaps_and_nested_indexes() {
     let s = common::start(vec![
-        robots("Sitemap: /top.xml\nSitemap: /s.xml.GZ\n"),
+        robots("Sitemap: {origin}/top.xml\nSitemap: {origin}/s.xml.GZ\n"),
         Route::html("/", "<html><body>x</body></html>"),
         xml(
             "/top.xml",
@@ -209,7 +222,7 @@ fn map_skips_gzip_sitemaps_and_nested_indexes() {
 fn map_fetches_at_most_twenty_sitemaps() {
     let children: Vec<String> = (0..25).map(|i| format!("/c{i:02}.xml")).collect();
     let mut routes = vec![
-        robots("Sitemap: /index.xml\n"),
+        robots("Sitemap: {origin}/index.xml\n"),
         Route::html("/", "<html><body>x</body></html>"),
         xml("/index.xml", index(&children)),
     ];
@@ -236,7 +249,7 @@ fn map_cut_short_reports_one_remaining_count_including_children_over_the_limit()
         .map(|i| format!("/long-page-name-{i:04}"))
         .collect();
     let s = common::start(vec![
-        robots("Sitemap: /index.xml\n"),
+        robots("Sitemap: {origin}/index.xml\n"),
         Route::html("/", "<html><body>x</body></html>"),
         xml("/index.xml", index(&children)),
         xml("/c00.xml", urlset(&big)),
@@ -289,7 +302,7 @@ fn map_stops_fetching_sitemaps_when_max_bytes_is_used_up() {
         .map(|i| format!("/long-page-name-{i:04}"))
         .collect();
     let s = common::start(vec![
-        robots("Sitemap: /big.xml\nSitemap: /small.xml\n"),
+        robots("Sitemap: {origin}/big.xml\nSitemap: {origin}/small.xml\n"),
         Route::html("/", "<html><body>x</body></html>"),
         xml("/big.xml", urlset(&big)),
         xml("/small.xml", urlset(&["/small".into()])),
