@@ -824,6 +824,7 @@ fn encoded(path: &'static str, body: &[u8], encoding: &str) -> common::Route {
         content_type: "text/html; charset=utf-8",
         headers: vec![("Content-Encoding", encoding.to_string())],
         delay_ms: 0,
+        declared_len: None,
         status: "200 OK",
     }
 }

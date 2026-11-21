@@ -230,6 +230,33 @@ fn map_does_not_follow_a_robots_redirect_to_another_host_for_sitemaps() {
 }
 
 #[test]
+fn map_counts_bytes_read_before_a_sitemap_stream_breaks() {
+    let cut: Vec<String> = (0..100).map(|i| format!("/cut-page-{i:04}")).collect();
+    let good: Vec<String> = (0..60).map(|i| format!("/good-page-{i:04}")).collect();
+    let s = common::start(vec![
+        robots("Sitemap: {origin}/bad.xml\nSitemap: {origin}/good.xml\n"),
+        Route::html("/", "<html><body>x</body></html>"),
+        Route {
+            declared_len: Some(1_000_000),
+            ..xml("/bad.xml", urlset(&cut))
+        },
+        xml("/good.xml", urlset(&good)),
+    ]);
+    let (code, stdout, stderr) = run(&[
+        &s.url("/"),
+        "--allow-private",
+        "--map",
+        "--max-bytes",
+        "7000",
+    ]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    // bad.xmlで読んだ約5,000バイトを残りから引くので、約3,000バイトのgood.xmlは収まらない。
+    assert_eq!(stdout.trim(), "", "stderr={stderr}");
+    assert!(stderr.contains("stream read failed"), "stderr={stderr}");
+    assert!(stderr.contains("exceeds --max-bytes"), "stderr={stderr}");
+}
+
+#[test]
 fn map_with_zero_urls_exits_0_with_empty_body() {
     let s = common::start(vec![
         ok_robots(),

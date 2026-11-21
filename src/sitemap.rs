@@ -202,10 +202,7 @@ impl Budget {
                 Ok(String::from_utf8_lossy(&f.body).into_owned())
             }
             Err(e) => {
-                // 上限を超えた取得は残りをすべて読み終えている。次の取得に残りは無い。
-                if e.message.starts_with("response exceeds --max-bytes") {
-                    self.bytes_left = 0;
-                }
+                self.bytes_left = self.bytes_left.saturating_sub(e.consumed);
                 Err(e)
             }
         }
