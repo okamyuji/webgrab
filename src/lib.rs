@@ -2,6 +2,7 @@
 
 pub mod budget;
 pub mod cli;
+pub mod content_encoding;
 pub mod convert;
 pub mod decode;
 pub mod error;

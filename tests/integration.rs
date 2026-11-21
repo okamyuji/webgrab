@@ -684,10 +684,46 @@ fn body_fetch_offers_gzip_and_brotli_but_not_zstd() {
     assert_eq!(code, 0, "stderr={stderr}");
 
     let ae = seen.lock().unwrap().clone().unwrap_or_default();
-    for enc in ["gzip", "br"] {
+    for enc in ["gzip", "deflate", "br"] {
         assert!(ae.contains(enc), "accept-encoding={ae}");
     }
     assert!(!ae.contains("zstd"), "accept-encoding={ae}");
+}
+
+#[test]
+fn deflate_encoded_response_is_decoded() {
+    use std::io::Write;
+    let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    z.write_all(ARTICLE.as_bytes()).unwrap();
+    let s = common::start(vec![encoded("/deflate", &z.finish().unwrap(), "deflate")]);
+    let (code, stdout, stderr) =
+        run_webgrab(&[&s.url("/deflate"), "--allow-private", "--no-robots"]);
+    assert_eq!(code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(stdout.contains("統合テスト記事"), "stdout={stdout}");
+}
+
+#[test]
+fn supported_encoding_followed_by_another_header_line_is_rejected_with_exit_4() {
+    // 展開できる値が1行目にあっても、2行目の値を捨てて展開してはならない。
+    use std::io::Write;
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(ARTICLE.as_bytes()).unwrap();
+    let gz = gz.finish().unwrap();
+    for (first, body) in [
+        ("br", &include_bytes!("fixtures/article.html.br")[..]),
+        ("gzip", &gz[..]),
+    ] {
+        let mut route = encoded("/stacked", body, first);
+        route.headers.push(("Content-Encoding", "zstd".to_string()));
+        let s = common::start(vec![route]);
+        let (code, stdout, stderr) =
+            run_webgrab(&[&s.url("/stacked"), "--allow-private", "--no-robots"]);
+        assert_eq!(code, 4, "first={first} stderr={stderr} stdout={stdout}");
+        assert!(
+            stderr.contains(&format!("unsupported content-encoding: {first}, zstd")),
+            "first={first} stderr={stderr}"
+        );
+    }
 }
 
 #[test]
