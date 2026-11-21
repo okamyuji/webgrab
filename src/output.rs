@@ -1,4 +1,4 @@
-//! 出力整形（設計§6、5形式）。
+//! 出力整形（設計§6）。
 
 use crate::budget::{self, Slice};
 use serde_json::json;
@@ -10,6 +10,7 @@ pub enum Format {
     Json,
     Text,
     Html,
+    Links,
 }
 
 /// 取得経路の状態（設計§4.4）。JSON/frontmatterの`render_status`と自己記述行に使う。
@@ -86,7 +87,9 @@ pub fn render(
         Format::Markdown => render_markdown(meta, slice, false, max_chars_zero, extra_flags),
         Format::Frontmatter => render_markdown(meta, slice, true, max_chars_zero, extra_flags),
         Format::Json => render_json(meta, slice, max_chars_zero, extra_flags),
-        Format::Text | Format::Html => render_plain(fmt, meta, slice, max_chars_zero, extra_flags),
+        Format::Text | Format::Links | Format::Html => {
+            render_plain(fmt, meta, slice, max_chars_zero, extra_flags)
+        }
     }
 }
 
@@ -466,6 +469,21 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["tokens"].is_null());
         assert_eq!(v["chars"], 4);
+    }
+
+    #[test]
+    fn links_renders_like_text_with_footer_and_fence() {
+        let m = Meta {
+            fence: true,
+            ..meta()
+        };
+        let s = slc("https://a.test/x", true, false, 100);
+        let links = render(Format::Links, &m, &s, false, &["--format links".into()]);
+        let text = render(Format::Text, &m, &s, false, &["--format links".into()]);
+        assert_eq!(links, text);
+        assert!(links.contains("https://a.test/x"));
+        assert!(links.contains("--format links"));
+        assert!(!links.contains("<!--"));
     }
 
     #[test]

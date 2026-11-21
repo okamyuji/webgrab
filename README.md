@@ -43,6 +43,7 @@ webgrab https://example.com/article
 webgrab https://spa.example.com --render          # JSレンダリング
 webgrab https://spa.example.com --auto-render     # 本文が空か200文字未満のときだけJSレンダリングへ自動切替
 webgrab https://example.com --format json         # プログラム連携用
+webgrab https://example.com --format links        # ページ内リンクを絶対URLで1行ずつ（--rawでページ全体）
 webgrab https://example.com --max-chars 8000      # 量を絞る
 webgrab https://example.com --start-index 8000    # 続きを取る
 webgrab https://example.com --format json --fence # エージェント用途の推奨（本文分離＋境界明示）

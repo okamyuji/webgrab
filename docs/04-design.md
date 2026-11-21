@@ -78,7 +78,7 @@ URL → [netguard] → [robots] → [fetch | render] → 生バイト+ヘッダ 
 - extract（src/extract.rs）はdom_smoothieで本文・title・公開日時を抽出。--raw指定時はスキップし、代わりにconvertの`strip_non_content`で`<script>`/`<style>`/`<noscript>`だけを除去する（JSコード・CSSの本文混入を防ぐ）。一覧/インデックスページなど本文抽出が向かないページは--raw（JS描画なら--render併用）を使う
 - convert（src/convert.rs）はhtmdでMarkdown化。クリックでスクリプトが走りうる実行系スキーム（javascript:・vbscript:・data:text/html・data:image/svg+xml）のリンク先は`unsafe-`接頭辞で無害化する。通常URLや非実行データURL（data:image/png等）はそのまま残す
 - budget（src/budget.rs）は--start-index/--max-charsで文字スライスし、tiktoken-rsで出力スライスの概算トークン数を計測（--no-tokens時は省略）。切り詰め発生時は自己記述フッタを付与
-- output（src/output.rs）は形式（markdown / frontmatter / json / text / html）に整形。本文はプロンプトインジェクション緩和として、端末制御文字を除去し、webgrab自身の制御マーカー`[webgrab:`の偽造を`[quoted-webgrab:`へ無害化する。完全防御はツール単体では不可能で、消費側エージェントの権限分離・自動実行禁止・人間確認が前提（信頼モデルはREADME/SKILL参照）
+- output（src/output.rs）は形式（markdown / frontmatter / json / text / html / links）に整形。本文はプロンプトインジェクション緩和として、端末制御文字を除去し、webgrab自身の制御マーカー`[webgrab:`の偽造を`[quoted-webgrab:`へ無害化する。完全防御はツール単体では不可能で、消費側エージェントの権限分離・自動実行禁止・人間確認が前提（信頼モデルはREADME/SKILL参照）
 
 ### モジュール構成
 
@@ -86,6 +86,7 @@ URL → [netguard] → [robots] → [fetch | render] → 生バイト+ヘッダ 
 src/
 ├── main.rs      # エントリ、終了コード変換のみ
 ├── cli.rs       # clap定義
+├── links.rs     # --format links用のリンク抽出（dom_query）
 ├── error.rs     # WebgrabError（手書きのError/Display実装）と終了コード対応表
 ├── netguard.rs
 ├── robots.rs
@@ -114,7 +115,7 @@ webgrab <URL> [OPTIONS]
 | フラグ | 型 | デフォルト | 挙動 |
 |---|---|---|---|
 | `<URL>` | 必須位置引数 | なし | http/httpsのみ受理。それ以外は終了コード2 |
-| --format | markdown \| frontmatter \| json \| text \| html | markdown | 出力形式（6章） |
+| --format | markdown \| frontmatter \| json \| text \| html \| links | markdown | 出力形式（6章） |
 | --max-chars | usize | 24000 | 本文（変換後Markdown）の最大文字数の上限。Claude CodeのBash 30,000文字制限の内側。0を指定した場合はメタデータヘッダのみ出力し終了コード0。切り詰め位置は範囲後半の最後の改行の直後まで戻すため出力が上限より短くなることがある。フッタ・`chars`・継続コマンドの`--start-index`は実際の終端を指す |
 | --start-index | usize | 0 | 本文の開始文字オフセット（続き取得用）。総文字数以上を指定した場合は空本文+ヘッダ+終端フッタ`[webgrab:end total N chars]`で終了コード0 |
 | --render | フラグ | off | chromiumoxideでJSレンダリング後のDOMを取得 |
@@ -189,9 +190,15 @@ Markdown Content:
 
 textはMarkdown変換のかわりにタグ除去テキスト、htmlは抽出後（--raw時は取得まま）のHTMLを出す。メタデータヘッダは付けない。text/plainはこのhtml形式の定義の例外で、抽出やタグ除去を経ないため、既定・--raw・text・htmlのどの形式でも同じ素通しテキストを出す。切り詰め時はmarkdownと同じ`[webgrab:truncated ...]`行を末尾に付ける（htmlではHTMLコメントとして付ける）。終端フッタ`[webgrab:end ...]`も同様に末尾（htmlはコメント）に付ける。--max-chars=0はtext/htmlでは本文が空になるため、`[webgrab:meta-only total N chars]`の1行（htmlはコメント）を出しstderrにも注記する。ただしこの1行の直後に`[webgrab:render-status ...]`行が続きうる（`render_status`が`failed`/`no-gain`/`skipped`のとき）ため、text/htmlのstdout末尾が必ず1行だけとは限らない。
 
+### links
+
+本文の代わりに、本文HTMLの`<a href>`を絶対URLにして1行に1件出す。メタデータヘッダは付けず、切り詰め・継続コマンド・`--fence`・トークン計測・`render-status`マーカーはtextと同じ形で効く。リンクの取得元は既定では抽出本文、`--raw`では`<script>`/`<style>`/`<noscript>`を除いたページ全体である。相対URLはそのフェーズの最終URL（render経路ではrender後URL）を基準に解決する。http/httpsだけを残し、`javascript:`・`mailto:`・`data:`などの他スキーム、`#`だけのページ内アンカー、解決できないhrefは捨てる。fragmentを外し、初出順を保って重複を除く。
+
+リンクが0件でも終了コードは6にならず、short-contentも通知しない。終了コードは0で本文は空になる。`--auto-render`の判定は他の形式と同じく本文HTMLの可視テキスト長で行う。text/plainの応答にはリンクの概念がないため、本文を空にしてstderrに`warn=links-unsupported reason=text-plain`を1行出し、終了コード0で終える。
+
 ### render_status行と`[webgrab:render-status ...]`
 
-JSONエンベロープとfrontmatterに`render_status`（`static`/`rendered`/`failed`/`no-gain`/`skipped`）と、可視テキスト長`static_chars`/`rendered_chars`を追加する。markdown/text/htmlでは`render_status`が`failed`/`no-gain`/`skipped`のときだけ、既存マーカーと同じ書式の`[webgrab:render-status <status> reason=<token>]`（`reason`は`failed`が`render|max-bytes|extract`、`skipped`が`timeout|max-bytes`、`no-gain`が`shorter`）を1行付ける（htmlはコメント。本文側の閉じ忘れ`<!--`にマーカーが飲み込まれないよう、マーカー群の直前に`-->`を1つ出す）。位置は`--fence`の閉じ行の外側で、出力順は「本文（フェンス内） → フェンス閉じ → `[webgrab:truncated ...]`または`[webgrab:end ...]` → `[webgrab:short-content ...]` → `[webgrab:render-status ...]`」に固定する。webgrab自身が生成する行なので偽造無害化の対象外（本文側の同名文字列は従来どおり`[quoted-webgrab:`になる）。--max-chars=0でもこの行は出す。`static`/`rendered`では行を増やさない。`-o`でファイル出力した場合はstdoutが空になるため、この行は出力ファイル側に入り、経路の判別はstderrか出力ファイルで行う。
+JSONエンベロープとfrontmatterに`render_status`（`static`/`rendered`/`failed`/`no-gain`/`skipped`）と、可視テキスト長`static_chars`/`rendered_chars`を追加する。markdown/text/html/linksでは`render_status`が`failed`/`no-gain`/`skipped`のときだけ、既存マーカーと同じ書式の`[webgrab:render-status <status> reason=<token>]`（`reason`は`failed`が`render|max-bytes|extract`、`skipped`が`timeout|max-bytes`、`no-gain`が`shorter`）を1行付ける（htmlはコメント。本文側の閉じ忘れ`<!--`にマーカーが飲み込まれないよう、マーカー群の直前に`-->`を1つ出す）。位置は`--fence`の閉じ行の外側で、出力順は「本文（フェンス内） → フェンス閉じ → `[webgrab:truncated ...]`または`[webgrab:end ...]` → `[webgrab:short-content ...]` → `[webgrab:render-status ...]`」に固定する。webgrab自身が生成する行なので偽造無害化の対象外（本文側の同名文字列は従来どおり`[quoted-webgrab:`になる）。--max-chars=0でもこの行は出す。`static`/`rendered`では行を増やさない。`-o`でファイル出力した場合はstdoutが空になるため、この行は出力ファイル側に入り、経路の判別はstderrか出力ファイルで行う。
 
 ### --no-tokensとchars/totalの保持
 

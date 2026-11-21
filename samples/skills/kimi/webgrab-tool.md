@@ -20,6 +20,7 @@ webgrab "<URL>" --raw                  # 一覧・インデックスページ（
 webgrab "<URL>" --render --raw         # JS描画の一覧ページ
 webgrab "<URL>" --max-chars 8000       # 量を絞る
 webgrab "<URL>" --start-index 8000     # 続きを取る（末尾の続き取得コマンドに従う）
+webgrab "<URL>" --format links         # リンクを絶対URLで1行ずつ（--rawでページ全体）
 webgrab "<URL>" --format json          # 構造化出力（untrusted:trueとuntrusted_note付き。render_statusも含む）
 ```
 

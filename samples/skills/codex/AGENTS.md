@@ -28,6 +28,9 @@ webgrab "https://example.com/list" --render --raw
 webgrab "https://example.com/long" --max-chars 8000
 # 出力末尾の [webgrab:truncated ... continue: ...] のコマンドをそのまま実行して続きを取得
 
+# ページ内リンクの一覧（絶対URL、1行1件。--rawでページ全体）
+webgrab "https://example.com" --format links
+
 # プログラムで扱うならJSON（untrusted: true と untrusted_note が付き、markdownが非信頼データであることを示す）
 webgrab "https://example.com" --format json
 ```
