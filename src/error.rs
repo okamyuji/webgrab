@@ -54,73 +54,54 @@ const DETAIL_MAX_BYTES: usize = 512;
 pub fn sanitize_detail(s: &str) -> String {
     let mut out = String::with_capacity(s.len().min(DETAIL_MAX_BYTES + 4));
     let mut chars = s.chars().peekable();
-
     while let Some(c) = chars.next() {
-        // Handle ANSI CSI sequences (ESC [ params final) with bounded lookahead.
-        // CSI final byte is in range 0x40–0x7E. If no final byte found within bounded
-        // lookahead (100 chars), drop the ESC and '[', continue with remaining text.
-        if c == '\u{1b}' && chars.peek() == Some(&'[') {
-            let mut saved_chars = Vec::new();
-            let mut found_final = false;
-            chars.next(); // skip '['
-            for _ in 0..100 {
-                if chars.peek().is_some() {
-                    let ch_to_check = chars.next().unwrap();
-                    saved_chars.push(ch_to_check);
-                    // CSI final byte: 0x40–0x7E (ASCII @–~)
-                    if ch_to_check.len_utf8() == 1 {
-                        let b = ch_to_check as u8;
-                        if (0x40..=0x7E).contains(&b) {
-                            found_final = true;
-                            break;
-                        }
-                    }
-                } else {
-                    break;
-                }
-            }
-            if found_final {
-                if out.len() + 1 > DETAIL_MAX_BYTES {
-                    out.push('…');
-                    return out;
-                }
-                out.push(' ');
-            } else {
-                // 終端バイトが無いならCSIではない。ESCだけをC0として落とし、`[`と
-                // 後続テキストは本文として残す（誤って1文字消すと診断が読めなくなる）。
-                if out.len() + 1 > DETAIL_MAX_BYTES {
-                    out.push('…');
-                    return out;
-                }
-                out.push('[');
-                for ch in saved_chars {
-                    let c = match ch {
-                        '\t' | '\n' | '\r' | '\u{2028}' | '\u{2029}' => ' ',
-                        '\u{0}'..='\u{1F}' | '\u{7F}'..='\u{9F}' => continue,
-                        c => c,
-                    };
-                    if out.len() + c.len_utf8() > DETAIL_MAX_BYTES {
-                        out.push('…');
-                        return out;
-                    }
-                    out.push(c);
-                }
-            }
-            continue;
-        }
-
-        let c = match c {
-            '\t' | '\n' | '\r' | '\u{2028}' | '\u{2029}' => ' ',
-            '\u{0}'..='\u{1F}' | '\u{7F}'..='\u{9F}' => continue,
-            c => c,
+        let room = if c == '\u{1b}' && chars.next_if_eq(&'[').is_some() {
+            push_csi(&mut out, &mut chars)
+        } else {
+            push_text(&mut out, c)
         };
-        if out.len() + c.len_utf8() > DETAIL_MAX_BYTES {
-            out.push('…');
-            return out;
+        if !room {
+            break;
         }
-        out.push(c);
     }
     out
+}
+
+/// CSIの終端を探す文字数。終端が来ない長い入力で、どこまでもCSIとして読み続けないための上限。
+const CSI_LOOKAHEAD: usize = 100;
+
+/// `ESC [`の後を読み、終端バイト（0x40–0x7E）があれば空白1つにする。
+/// 終端バイトが無いならCSIではない。ESCだけをC0として落とし、`[`と
+/// 後続テキストは本文として残す（誤って1文字消すと診断が読めなくなる）。
+fn push_csi(out: &mut String, chars: &mut std::iter::Peekable<std::str::Chars>) -> bool {
+    let mut read = Vec::new();
+    for ch in chars.by_ref().take(CSI_LOOKAHEAD) {
+        if ch.is_ascii() && (0x40..=0x7E).contains(&(ch as u8)) {
+            return push_capped(out, ' ');
+        }
+        read.push(ch);
+    }
+    push_capped(out, '[') && read.into_iter().all(|ch| push_text(out, ch))
+}
+
+/// 1文字を本文として足す。改行・タブ・行区切りは空白にし、C0/DEL/C1制御文字は落とす。
+fn push_text(out: &mut String, c: char) -> bool {
+    let c = match c {
+        '\t' | '\n' | '\r' | '\u{2028}' | '\u{2029}' => ' ',
+        '\u{0}'..='\u{1F}' | '\u{7F}'..='\u{9F}' => return true,
+        c => c,
+    };
+    push_capped(out, c)
+}
+
+/// 上限に収まれば足してtrueを返す。収まらなければ`…`で閉じてfalseを返す。
+fn push_capped(out: &mut String, c: char) -> bool {
+    if out.len() + c.len_utf8() > DETAIL_MAX_BYTES {
+        out.push('…');
+        return false;
+    }
+    out.push(c);
+    true
 }
 
 impl WebgrabError {
