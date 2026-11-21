@@ -278,8 +278,14 @@ fn links_format_neutralizes_forged_markers_in_hrefs() {
     let (code, stdout, stderr) = run_webgrab(&[&url, "--allow-private", "--format", "links"]);
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(stdout.matches("[quoted-webgrab:").count(), 2, "{stdout}");
-    assert!(!stdout.to_ascii_lowercase().contains("/[webgrab:"), "{stdout}");
-    assert!(!stdout.to_ascii_lowercase().contains("=[webgrab:"), "{stdout}");
+    assert!(
+        !stdout.to_ascii_lowercase().contains("/[webgrab:"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.to_ascii_lowercase().contains("=[webgrab:"),
+        "{stdout}"
+    );
 }
 
 #[test]
