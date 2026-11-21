@@ -220,6 +220,40 @@ fn map_fetches_at_most_twenty_sitemaps() {
 }
 
 #[test]
+fn map_cut_short_reports_one_remaining_count_including_children_over_the_limit() {
+    let mut children = vec!["/z.xml.gz".to_string()];
+    children.extend((0..25).map(|i| format!("/c{i:02}.xml")));
+    let big: Vec<String> = (0..200)
+        .map(|i| format!("/long-page-name-{i:04}"))
+        .collect();
+    let s = common::start(vec![
+        robots("Sitemap: /index.xml\n"),
+        Route::html("/", "<html><body>x</body></html>"),
+        xml("/index.xml", index(&children)),
+        xml("/c00.xml", urlset(&big)),
+    ]);
+    let (code, stdout, stderr) = run(&[
+        &s.url("/"),
+        "--allow-private",
+        "--map",
+        "--max-bytes",
+        "3000",
+    ]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout.trim(), "");
+    // indexの取得後は19件が待ち、6件が上限外。c00で使い切り、c01の手前で打ち切る。
+    assert!(
+        stderr.contains("webgrab: warn=sitemap-skipped reason=max-bytes remaining=24\n"),
+        "stderr={stderr}"
+    );
+    assert!(!stderr.contains("reason=limit"), "stderr={stderr}");
+    assert!(
+        stderr.contains("webgrab: warn=sitemap-skipped reason=gzip remaining=1\n"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
 fn map_obeys_robots_for_sitemaps_unless_no_robots() {
     let routes = || {
         vec![
