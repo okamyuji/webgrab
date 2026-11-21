@@ -161,6 +161,11 @@ async fn robots_allowed(url: &Url, addr: SocketAddr, opts: &FetchOptions) -> Res
             let Some(next) = robots_redirect_target(&resp, &target) else {
                 return Ok(true);
             };
+            // 本文の転送と同じ制限を掛ける。たどれない転送は取得失敗と同じく許可扱い。
+            let from = Url::parse(&target).ok();
+            if from.is_none_or(|f| !redirect_allowed(opts.redirect_home.as_deref(), &f, &next)) {
+                return Ok(true);
+            }
             let host = next.host_str().unwrap_or_default().to_string();
             let port = next.port_or_known_default().unwrap_or(80);
             // 追従先を再解決・再検証（内部アドレスなら拒否）

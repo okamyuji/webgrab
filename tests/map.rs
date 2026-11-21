@@ -193,6 +193,42 @@ fn map_ignores_and_counts_relative_sitemap_urls() {
     );
 }
 
+/// `localhost`が`::1`と`127.0.0.1`のどちらに解決されても届くよう、両方で待ち受けて
+/// 同じtext/plainを返す第三者のサーバ。ポートを返す。
+fn dual_stack_text(body: &'static str) -> u16 {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("[::]:0").expect("dual-stack bind");
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+        }
+    });
+    port
+}
+
+#[test]
+fn map_does_not_follow_a_robots_redirect_to_another_host_for_sitemaps() {
+    let third = dual_stack_text("User-agent: *\nDisallow: /sitemap.xml\n");
+    let away = format!("http://localhost:{third}/robots.txt");
+    let s = common::start(vec![
+        Route::redirect("/robots.txt", "302 Found", away),
+        Route::html("/", "<html><body>x</body></html>"),
+        xml("/sitemap.xml", urlset(&["/listed".into()])),
+    ]);
+    let (code, stdout, stderr) = run(&[&s.url("/"), "--allow-private", "--map"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    // 第三者のrobots.txtを読みに行かないので、その`Disallow`にも従わない。
+    assert_eq!(lines(&stdout), vec![s.url("/listed")], "stderr={stderr}");
+}
+
 #[test]
 fn map_with_zero_urls_exits_0_with_empty_body() {
     let s = common::start(vec![
