@@ -30,10 +30,12 @@ pub async fn collect(
         pending.offer(url, false, 0);
     }
     let mut fetched = 0;
+    let mut stopped = false;
     while let Some((url, nested)) = pending.queue.pop_front() {
         if let Some(reason) = budget.stop_reason() {
             warn_skipped(reason, pending.remaining() + 1);
-            return;
+            stopped = true;
+            break;
         }
         fetched += 1;
         let same_origin = url.origin() == start.origin();
@@ -46,8 +48,11 @@ pub async fn collect(
             Err(e) => warn_failed(&url, &e),
         }
     }
-    if pending.dropped > 0 {
+    if !stopped && pending.dropped > 0 {
         warn_skipped("limit", pending.dropped);
+    }
+    if pending.gzip > 0 {
+        warn_skipped("gzip", pending.gzip);
     }
 }
 
@@ -55,18 +60,19 @@ fn warn_skipped(reason: &str, remaining: usize) {
     eprintln!("webgrab: warn=sitemap-skipped reason={reason} remaining={remaining}");
 }
 
-/// 取得を待つsitemap。件数の上限に入りきらない分は数だけ持つ（巨大なindexの子をすべて
-/// 抱えないため）。
+/// 取得を待つsitemap。件数の上限に入りきらない分と読まないgzipは数だけ持つ（巨大なindexの子を
+/// すべて抱えず、警告も1行にまとめるため）。
 #[derive(Default)]
 struct Pending {
     queue: VecDeque<(Url, bool)>,
     dropped: usize,
+    gzip: usize,
 }
 
 impl Pending {
     fn offer(&mut self, url: Url, nested: bool, fetched: usize) {
         if url.path().to_ascii_lowercase().ends_with(".gz") {
-            eprintln!("webgrab: warn=sitemap-skipped reason=gzip");
+            self.gzip += 1;
         } else if fetched + self.queue.len() >= MAX_SITEMAPS {
             self.dropped += 1;
         } else {
@@ -510,7 +516,7 @@ mod tests {
         let u = |p: &str| Url::parse(&format!("https://x.test/{p}")).unwrap();
         let mut pending = Pending::default();
         pending.offer(u("a.xml.GZ"), false, 0);
-        assert_eq!(pending.remaining(), 0);
+        assert_eq!((pending.remaining(), pending.gzip), (0, 1));
         for i in 0..MAX_SITEMAPS {
             pending.offer(u(&format!("{i}.xml")), true, 1);
         }

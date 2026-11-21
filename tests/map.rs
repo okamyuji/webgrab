@@ -176,7 +176,7 @@ fn map_skips_gzip_sitemaps_and_nested_indexes() {
         Route::html("/", "<html><body>x</body></html>"),
         xml(
             "/top.xml",
-            index(&["/inner.xml".into(), "/leaf.xml".into()]),
+            index(&["/inner.xml".into(), "/c.xml.gz".into(), "/leaf.xml".into()]),
         ),
         xml("/inner.xml", index(&["/deep.xml".into()])),
         xml("/deep.xml", urlset(&["/deep-page".into()])),
@@ -186,9 +186,10 @@ fn map_skips_gzip_sitemaps_and_nested_indexes() {
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(lines(&stdout), vec![s.url("/leaf-page")]);
     assert!(
-        stderr.contains("webgrab: warn=sitemap-skipped reason=gzip\n"),
+        stderr.contains("webgrab: warn=sitemap-skipped reason=gzip remaining=2\n"),
         "stderr={stderr}"
     );
+    assert_eq!(stderr.matches("reason=gzip").count(), 1, "stderr={stderr}");
     assert!(
         stderr.contains("webgrab: warn=sitemap-skipped reason=nested-index\n"),
         "stderr={stderr}"
