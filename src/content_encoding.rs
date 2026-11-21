@@ -124,6 +124,7 @@ enum Inner {
 pub struct Decoder {
     inner: Inner,
     over: Arc<AtomicBool>,
+    received: bool,
 }
 
 const BROTLI_BUFFER: usize = 4096;
@@ -149,7 +150,11 @@ impl Decoder {
                 BROTLI_BUFFER,
             ))),
         };
-        Decoder { inner, over }
+        Decoder {
+            inner,
+            over,
+            received: false,
+        }
     }
 
     fn classify(&self, e: io::Error) -> DecodeError {
@@ -162,6 +167,7 @@ impl Decoder {
 
     /// 1チャンクを展開する。
     pub fn push(&mut self, chunk: &[u8]) -> Result<(), DecodeError> {
+        self.received |= !chunk.is_empty();
         let r = match &mut self.inner {
             Inner::Identity(s) => s.write_all(chunk),
             Inner::Gzip(d) => d.write_all(chunk),
@@ -172,7 +178,11 @@ impl Decoder {
     }
 
     /// 末尾まで展開し、展開後の本文を返す。途中で切れた圧縮データは`Corrupt`になる。
+    /// 1バイトも届かなかった本文は、符号化の指定があっても空の本文として返す。
     pub fn finish(self) -> Result<Vec<u8>, DecodeError> {
+        if !self.received {
+            return Ok(Vec::new());
+        }
         let over = Arc::clone(&self.over);
         let done = match self.inner {
             Inner::Identity(s) => Ok(s),
@@ -293,6 +303,14 @@ mod tests {
         }
         let br = compress(Coding::Br, b"");
         assert_eq!(decode(Coding::Br, &br, 10), Err(DecodeError::OverCap));
+    }
+
+    #[test]
+    fn decoder_returns_empty_body_when_no_bytes_arrive() {
+        // 本文の無い応答にもContent-Encodingを付けるサーバーがある。
+        for c in [Coding::Gzip, Coding::Deflate, Coding::Br] {
+            assert_eq!(decode(c, b"", 1 << 20), Ok(Vec::new()), "{c:?}");
+        }
     }
 
     #[test]
