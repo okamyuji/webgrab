@@ -1040,3 +1040,26 @@ fn unknown_encoding_after_identity_in_repeated_headers_is_rejected_with_exit_4()
         "stderr={stderr}"
     );
 }
+
+#[test]
+fn timeout_bounds_the_whole_redirect_chain_not_each_hop() {
+    let slow = |r: common::Route| common::Route { delay_ms: 700, ..r };
+    let s = common::start(vec![
+        slow(common::Route::redirect("/a", "302 Found", "/b")),
+        slow(common::Route::redirect("/b", "302 Found", "/c")),
+        slow(common::Route::html(
+            "/c",
+            "<html><body><p>end</p></body></html>",
+        )),
+    ]);
+    let (code, _stdout, stderr) = run_webgrab(&[
+        &s.url("/a"),
+        "--allow-private",
+        "--no-robots",
+        "--timeout",
+        "1",
+    ]);
+    // 各ホップは1s未満で返るので、段ごとの期限だけでは打ち切られない。
+    assert_eq!(code, 3, "stderr={stderr}");
+    assert!(stderr.contains("request timed out"), "stderr={stderr}");
+}

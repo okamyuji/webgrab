@@ -306,8 +306,19 @@ fn accept_response(resp: &reqwest::Response, allow_xml: bool) -> Result<(Option<
     Ok((content_type, coding_of_response(resp)?))
 }
 
-/// 静的取得を手動リダイレクト追従で行う（各ホップでnetguard再適用）。
+/// 静的取得を手動リダイレクト追従で行う（各ホップでnetguard再適用）。`opts.timeout`は
+/// 名前解決・robots確認・転送・本文読み込みの全体に掛ける。各段に渡すだけでは段ごとに
+/// 同じ時間を使えてしまい、転送が続くと合計が`--timeout`を超える。
 pub async fn fetch(url_str: &str, opts: &FetchOptions) -> Result<Fetched> {
+    tokio::time::timeout(opts.timeout, fetch_hops(url_str, opts))
+        .await
+        .unwrap_or_else(|_| {
+            Err(WebgrabError::new(ExitCode::Network, "request timed out")
+                .with_detail(format!("url={url_str} timeout={:?}", opts.timeout)))
+        })
+}
+
+async fn fetch_hops(url_str: &str, opts: &FetchOptions) -> Result<Fetched> {
     let mut current = Url::parse(url_str).map_err(|e| {
         WebgrabError::new(ExitCode::Usage, "invalid URL").with_detail(e.to_string())
     })?;
