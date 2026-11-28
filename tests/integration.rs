@@ -1085,6 +1085,10 @@ fn block_server() -> common::Server {
     common::start(vec![
         common::block_page(),
         common::long_captcha_article(),
+        common::body_only_wall(),
+        common::link_wall(),
+        common::tag_heavy_wall(),
+        common::alt_only_page(),
         common::Route {
             content_type: "text/plain; charset=utf-8",
             ..common::Route::html("/denied.txt", "Access denied")
@@ -1099,7 +1103,7 @@ fn block_page_warns_but_returns_body() {
         run_webgrab(&[&s.url("/blocked"), "--allow-private", "--no-robots"]);
     assert_eq!(code, 0, "stderr={stderr}");
     assert!(
-        stderr.contains("webgrab: warn=suspected-block-page marker=just a moment..."),
+        stderr.contains("webgrab: warn=suspected-block-page marker=\"just a moment...\""),
         "stderr={stderr}"
     );
     assert!(stdout.contains("verify you are human"), "stdout={stdout}");
@@ -1127,20 +1131,85 @@ fn block_page_json_field() {
     }
 }
 
+fn block_run(s: &common::Server, path: &str, extra: &[&str]) -> (i32, String, String) {
+    let url = s.url(path);
+    let mut args = vec![url.as_str(), "--allow-private", "--no-robots"];
+    args.extend_from_slice(extra);
+    run_webgrab(&args)
+}
+
 #[test]
 fn block_page_judged_on_whole_body() {
     let s = block_server();
-    let (code, _, stderr) = run_webgrab(&[
-        &s.url("/blocked"),
-        "--allow-private",
-        "--no-robots",
-        "--start-index",
-        "100",
-    ]);
+    let (code, stdout, stderr) = block_run(&s, "/body-only", &["--start-index", "100"]);
     assert_eq!(code, 0, "stderr={stderr}");
+    assert!(!stdout.contains("Sign in to continue"), "stdout={stdout}");
     assert!(
-        stderr.contains("warn=suspected-block-page"),
+        stderr.contains("marker=\"sign in to continue\""),
         "stderr={stderr}"
+    );
+}
+
+#[test]
+fn long_article_sliced_not_flagged() {
+    let s = block_server();
+    let (code, stdout, stderr) = block_run(&s, "/captcha-article", &["--max-chars", "300"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(stdout.contains("checking your browser"), "stdout={stdout}");
+    assert!(!stderr.contains("suspected-block-page"), "stderr={stderr}");
+}
+
+#[test]
+fn link_split_phrase_detected() {
+    let s = block_server();
+    for f in ["markdown", "text", "html"] {
+        let (code, _, stderr) = block_run(&s, "/link-wall", &["--format", f]);
+        assert_eq!(code, 0, "stderr={stderr}");
+        assert!(
+            stderr.contains("marker=\"log in to continue\""),
+            "{f} stderr={stderr}"
+        );
+    }
+}
+
+#[test]
+fn html_format_judged_on_visible_text() {
+    let s = block_server();
+    let (code, stdout, stderr) =
+        block_run(&s, "/tag-heavy", &["--format", "html", "--max-chars", "0"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let total: usize = stdout
+        .split("total ")
+        .nth(1)
+        .and_then(|t| t.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .expect("meta-only total");
+    assert!(
+        total >= 2000,
+        "fixture must exceed 2000 chars as HTML: {stdout}"
+    );
+    assert!(
+        stderr.contains("marker=\"log in to continue\""),
+        "stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("[webgrab:suspected-block-page"),
+        "stdout={stdout}"
+    );
+}
+
+#[test]
+fn alt_text_and_links_route_not_flagged() {
+    let s = block_server();
+    let (code, _, stderr) = block_run(&s, "/alt-only", &[]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(!stderr.contains("suspected-block-page"), "stderr={stderr}");
+    let (code, stdout, stderr) = block_run(&s, "/blocked", &["--format", "links"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(!stderr.contains("suspected-block-page"), "stderr={stderr}");
+    assert!(
+        !stdout.contains("[webgrab:suspected-block-page"),
+        "stdout={stdout}"
     );
 }
 

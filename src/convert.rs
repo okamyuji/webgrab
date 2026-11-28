@@ -295,12 +295,31 @@ fn find_tag_end(s: &str) -> Option<usize> {
     None
 }
 
-/// 可視テキストの文字数（Unicodeスカラー値）。エスカレーション判定と`static_chars`/`rendered_chars`に使う。
-/// script/style/noscriptを要素ごと除去し、タグを落とし、代表的な実体参照を1文字に戻し、
-/// 空白を畳んでtrimする。リンク先や画像URLは含まない。失敗しない。
-/// タグ境界に空白を挿入して、隣接する要素のテキストが単語として混在しないようにする。
+#[cfg(test)]
 pub fn visible_text_len(html: &str) -> usize {
-    let stripped = strip_non_content(html);
+    visible_text(html).chars().count()
+}
+
+/// 可視テキスト。文字数はエスカレーション判定と`static_chars`/`rendered_chars`に、
+/// 中身はブロック画面の判定に使う。
+/// script/style/noscriptを要素ごと除去し、タグを落とし、代表的な実体参照を1文字に戻し、
+/// 空白の連続を半角空白1つに畳んでtrimする。リンク先や画像URLやaltは含まない。失敗しない。
+/// タグ境界に空白を挿入して、隣接する要素のテキストが単語として混在しないようにする。
+pub fn visible_text(html: &str) -> String {
+    strip_tags(&strip_non_content(html))
+        .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// コメントを中身ごと、タグを空白1つに置き換える。
+fn strip_tags(stripped: &str) -> String {
     let mut text = String::with_capacity(stripped.len());
     let mut i = 0usize;
     while i < stripped.len() {
@@ -331,33 +350,35 @@ pub fn visible_text_len(html: &str) -> usize {
         text.push(ch);
         i += ch.len_utf8();
     }
-    let text = text
-        .replace("&nbsp;", " ")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&amp;", "&");
-    let trimmed = text.trim();
-    let mut count = 0usize;
-    let mut last_was_space = true;
-    for c in trimmed.chars() {
-        if c.is_whitespace() {
-            if !last_was_space {
-                count += 1;
-                last_was_space = true;
-            }
-        } else {
-            count += 1;
-            last_was_space = false;
-        }
-    }
-    count
+    text
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visible_text_joins_link_split_phrase_and_collapses_spaces() {
+        assert_eq!(
+            visible_text("<p>Please <a href=\"/login\">log in</a> to continue</p>"),
+            "Please log in to continue"
+        );
+        assert_eq!(
+            visible_text("<p>log&nbsp;in\u{a0} to\n\n continue</p>"),
+            "log in to continue"
+        );
+        assert_eq!(
+            visible_text("<img alt=\"Access denied icon\"><p>Shop</p>"),
+            "Shop"
+        );
+        assert_eq!(visible_text(""), "");
+    }
+
+    #[test]
+    fn visible_text_len_counts_visible_text_chars() {
+        let html = "<p>Please <b>sign</b>\n in</p><script>x()</script>";
+        assert_eq!(visible_text_len(html), visible_text(html).chars().count());
+    }
 
     fn nested_divs(depth: usize) -> String {
         format!("{}x{}", "<div>".repeat(depth), "</div>".repeat(depth))

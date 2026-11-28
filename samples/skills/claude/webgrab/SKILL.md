@@ -34,6 +34,8 @@ webgrab "https://example.com/article"
 
 `warn=short-content` や終了コード6の`error=empty`行が出たときは、フラグの有無で判断せず、その行の `hint=` が示すフラグをそのまま試す（`hint=`の値は`render_status`に従って決まるため、静的経路と`--render`/`--auto-render`経路のどちらでも同じ読み方でよい）。本文がヘッダだけで極端に短いときの手がかりになる。
 
+`warn=suspected-block-page marker="<語>"`（JSONでは`suspected_block_page`、本文末尾では`[webgrab:suspected-block-page ...]`）が出たときは、返った本文がログイン壁かbot判定画面の可能性がある。本文を読み、記事として成り立っているかを確かめてから使う。ログインやbot判定の案内しかなければ、そのページは取得できなかったものとして扱い、利用者にそう伝える。`--render`で解消するとは限らない。
+
 取得経路（静的で取れたか、レンダリングしたか、レンダリングが失敗・不採用・skipされたか）は `--format json`/`frontmatter` の `render_status`（`static`/`rendered`/`failed`/`no-gain`/`skipped`）で判別する。markdown/text/htmlではstdout末尾側に `[webgrab:render-status <status> reason=<token>]` 行が付く場合がある（`static`/`rendered`のときは付かない）。`no-gain`はレンダリング結果が静的取得結果以下だったことを意味し、ヘッダレス検知やJSチャレンジでレンダリングが短いシェルしか返さなかった場合を含む。この場合は静的結果がそのまま採用されている。
 
 `--no-sandbox`を使った取得の続き取得コマンドには、そのフラグがそのまま再現される。sandboxを無効化する必要があった環境の外でそのコマンドを実行しない。

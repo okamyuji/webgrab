@@ -315,6 +315,67 @@ pub fn long_captcha_article() -> Route {
     )
 }
 
+const FILLER: &str = "Members get early access to new chapters, a reading list that syncs across devices, \
+                      and a weekly digest of stories picked by our editors. ";
+
+/// タイトルに語が無く、本文の先頭だけに語があるログイン壁。
+pub fn body_only_wall() -> Route {
+    Route::html(
+        "/body-only",
+        page(
+            "The Weekly Story",
+            &format!(
+                "<main><p>Sign in to continue reading this story.</p><p>{}</p></main>",
+                FILLER.repeat(3)
+            ),
+        ),
+    )
+}
+
+/// 定型句の途中にリンクがあるログイン壁。markdownでは`[log in](url)`に分かれる。
+pub fn link_wall() -> Route {
+    Route::html(
+        "/link-wall",
+        page(
+            "Members",
+            &format!(
+                "<main><p>Please <a href=\"/login\">log in</a> to continue reading.</p><p>{}</p></main>",
+                FILLER.repeat(2)
+            ),
+        ),
+    )
+}
+
+/// 可視テキストは2,000字未満だが、タグを含めたHTMLは2,000字を超えるログイン壁。
+pub fn tag_heavy_wall() -> Route {
+    let rows = "<tr><td><span class=\"plan-name\"><em>Plan</em></span></td><td><span class=\"plan-price\"><em>$5</em></span></td></tr>"
+        .repeat(40);
+    Route::html(
+        "/tag-heavy",
+        page(
+            "Account",
+            &format!(
+                "<main><p>You need to log in to continue. {}</p><table>{rows}</table></main>",
+                FILLER.repeat(2)
+            ),
+        ),
+    )
+}
+
+/// 画像のaltにだけ定型句がある普通の短いページ。
+pub fn alt_only_page() -> Route {
+    Route::html(
+        "/alt-only",
+        page(
+            "Shop",
+            &format!(
+                "<main><img src=\"/i.png\" alt=\"Are you a robot illustration\"><p>{}</p></main>",
+                FILLER.repeat(3)
+            ),
+        ),
+    )
+}
+
 pub fn big_gzip() -> Route {
     Route {
         path: "/big_gzip",

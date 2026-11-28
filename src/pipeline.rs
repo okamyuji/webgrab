@@ -130,6 +130,8 @@ struct Stage {
     body: String,
     visible: usize,
     route: Route,
+    /// ログイン壁・bot判定画面と疑ったときのマーカー語（抽出経路のみ）。
+    block_word: Option<&'static str>,
 }
 
 fn build_stage(cli: &Cli, html: &str, final_url: &str) -> Result<Stage> {
@@ -145,17 +147,25 @@ fn build_stage(cli: &Cli, html: &str, final_url: &str) -> Result<Stage> {
         Format::Links => links::extract_links(&body_html, final_url),
         _ => convert::to_markdown(&body_html)?,
     };
-    let visible = convert::visible_text_len(&body_html);
+    let text = convert::visible_text(&body_html);
+    let route = match (cli.format, cli.raw) {
+        (FormatArg::Links, _) => Route::Links,
+        (_, true) => Route::Raw,
+        (_, false) => Route::Extracted,
+    };
+    // 形式ごとの本文ではなく可視テキストで判定する。記法やタグで定型句が分かれても、
+    // --formatやスライスで結果が変わらないようにするため。
+    let block_word = match route {
+        Route::Extracted => blockpage::detect(title.as_deref(), &text),
+        _ => None,
+    };
     Ok(Stage {
         title,
         published,
         body,
-        visible,
-        route: match (cli.format, cli.raw) {
-            (FormatArg::Links, _) => Route::Links,
-            (_, true) => Route::Raw,
-            (_, false) => Route::Extracted,
-        },
+        visible: text.chars().count(),
+        route,
+        block_word,
     })
 }
 
@@ -219,6 +229,7 @@ fn plain_stage(text: &str, format: FormatArg) -> Stage {
         visible,
         body,
         route: Route::Plain,
+        block_word: None,
     }
 }
 
@@ -336,6 +347,7 @@ async fn map_phase(
             visible: body.chars().count(),
             body,
             route: Route::Links,
+            block_word: None,
         },
         ..acq
     })
@@ -441,16 +453,6 @@ fn is_short_content(route: Route, content_len: usize, total: usize) -> bool {
     route == Route::Extracted && content_len > 0 && total < SHORT_CONTENT_CHARS
 }
 
-/// 判定はスライス前の本文全体で行う。`--start-index`で続きを取っても結果を変えないため。
-fn block_page_warning(route: Route, title: Option<&str>, body: &str) -> Option<&'static str> {
-    if route != Route::Extracted {
-        return None;
-    }
-    let word = blockpage::detect(title, body)?;
-    eprintln!("webgrab: warn=suspected-block-page marker={word}");
-    Some(word)
-}
-
 /// 6〜8. 空本文チェック・文字量制御・通知・出力の組み立て。
 fn assemble(cli: &Cli, acq: Acquired, status: RenderStatus, chars: CharCounts) -> Result<String> {
     let stage = acq.stage;
@@ -486,7 +488,9 @@ fn assemble(cli: &Cli, acq: Acquired, status: RenderStatus, chars: CharCounts) -
             (None, "")
         };
 
-    let suspected_block_page = block_page_warning(stage.route, stage.title.as_deref(), &stage.body);
+    if let Some(word) = stage.block_word {
+        eprintln!("{}", blockpage::warn_line(word));
+    }
     let meta = Meta {
         title: stage.title,
         url: acq.final_url,
@@ -498,7 +502,7 @@ fn assemble(cli: &Cli, acq: Acquired, status: RenderStatus, chars: CharCounts) -
         render_status: status,
         static_chars: chars.static_chars,
         rendered_chars: chars.rendered_chars,
-        suspected_block_page,
+        suspected_block_page: stage.block_word,
     };
     let extra = cli::extra_flags(cli, status);
     Ok(output::render(
