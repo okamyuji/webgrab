@@ -1,5 +1,6 @@
 //! パイプライン結線（設計 08 §4.3）。静的フェーズ → エスカレーション判定 → renderフェーズ → 出力。
 
+use crate::blockpage;
 use crate::cli::{Cli, DEFAULT_WAIT_MS, FormatArg};
 use crate::error::{ExitCode, Result, WebgrabError};
 use crate::fetch::{self, FetchOptions};
@@ -129,6 +130,8 @@ struct Stage {
     body: String,
     visible: usize,
     route: Route,
+    /// ログイン壁・bot判定画面と疑ったときのマーカー語（抽出経路のみ）。
+    block_word: Option<&'static str>,
 }
 
 fn build_stage(cli: &Cli, html: &str, final_url: &str) -> Result<Stage> {
@@ -144,17 +147,25 @@ fn build_stage(cli: &Cli, html: &str, final_url: &str) -> Result<Stage> {
         Format::Links => links::extract_links(&body_html, final_url),
         _ => convert::to_markdown(&body_html)?,
     };
-    let visible = convert::visible_text_len(&body_html);
+    let text = convert::visible_text(&body_html);
+    let route = match (cli.format, cli.raw) {
+        (FormatArg::Links, _) => Route::Links,
+        (_, true) => Route::Raw,
+        (_, false) => Route::Extracted,
+    };
+    // 形式ごとの本文ではなく可視テキストで判定する。記法やタグで定型句が分かれても、
+    // --formatやスライスで結果が変わらないようにするため。
+    let block_word = match route {
+        Route::Extracted => blockpage::detect(title.as_deref(), &text),
+        _ => None,
+    };
     Ok(Stage {
         title,
         published,
         body,
-        visible,
-        route: match (cli.format, cli.raw) {
-            (FormatArg::Links, _) => Route::Links,
-            (_, true) => Route::Raw,
-            (_, false) => Route::Extracted,
-        },
+        visible: text.chars().count(),
+        route,
+        block_word,
     })
 }
 
@@ -218,6 +229,7 @@ fn plain_stage(text: &str, format: FormatArg) -> Stage {
         visible,
         body,
         route: Route::Plain,
+        block_word: None,
     }
 }
 
@@ -335,6 +347,7 @@ async fn map_phase(
             visible: body.chars().count(),
             body,
             route: Route::Links,
+            block_word: None,
         },
         ..acq
     })
@@ -475,6 +488,9 @@ fn assemble(cli: &Cli, acq: Acquired, status: RenderStatus, chars: CharCounts) -
             (None, "")
         };
 
+    if let Some(word) = stage.block_word {
+        eprintln!("{}", blockpage::warn_line(word));
+    }
     let meta = Meta {
         title: stage.title,
         url: acq.final_url,
@@ -486,6 +502,7 @@ fn assemble(cli: &Cli, acq: Acquired, status: RenderStatus, chars: CharCounts) -
         render_status: status,
         static_chars: chars.static_chars,
         rendered_chars: chars.rendered_chars,
+        suspected_block_page: stage.block_word,
     };
     let extra = cli::extra_flags(cli, status);
     Ok(output::render(

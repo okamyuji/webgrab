@@ -135,6 +135,7 @@ webgrab <URL> [OPTIONS]
 - stdoutには本文のみ、診断・警告・進捗はstderrのみに出す
 - stderrのエラー・警告・情報の先頭行は機械可読の固定書式とする（`error=` / `warn=` / `info=`の3種。例: `webgrab: error=http status=503 retryable=true`、`webgrab: warn=short-content chars=42 hint=--render/--raw`、`webgrab: info=auto-render reason=empty chars=0`）。`info=`は失敗を意味せず、失敗する実行では`info=`の後に必ず`error=`ブロックが続く。「先頭行」とは各メッセージブロック（`webgrab: `で始まる行とそれに続く詳細行）の1行目を指し、プロセスのstderr全体の1行目ではない（`warn=`や`info=`が`error=`に先行してよい）
 - 抽出後の本文が1文字以上200文字未満の場合、stdout本文の末尾に自己記述行`[webgrab:short-content 42 chars — if unexpected, retry with <提案>]`を付け、stderrにも同内容の警告を出す（終了コードは0）。提案は`render_status`で決める。`static`/`skipped`なら`--render/--raw`（JS描画ページか一覧ページの可能性）、`rendered`/`failed`/`no-gain`なら`--raw`（抽出が一覧等を落としている可能性。`--render`明示時も`rendered`扱い）。抑制せず通知する。0文字の場合は7章のとおり終了コード6。text/plainは`--raw`と同じく本節の対象外で、この判定もマーカーも出ない
+- 抽出経路（`--raw`・text/plain・`--format links`・`--map`以外）では、抽出本文の可視テキスト（タグ・リンク先・altを除き空白を畳んだ文字列）が2,000文字未満で、英語のログイン壁・bot判定の定型句がタイトルか可視テキストにあれば、stderrに`webgrab: warn=suspected-block-page marker="<語>"`を出し、stdout本文の末尾に`[webgrab:suspected-block-page marker="<語>" — this may be a login wall or bot check, not the page content]`を付ける（終了コードは0、本文はそのまま返す）。`--format json`では`markdown`に印を付けず、`suspected_block_page`フィールドで示す。`access denied`と`please log in`はタイトルでだけ照合する。判定は`--format`・`--start-index`・`--max-chars`に依存せず、`--max-chars 0`でも印を出す
 
 ### 終了コード表（--helpに全掲載）
 
@@ -180,15 +181,15 @@ Markdown Content:
 
 ### frontmatter
 
-同じメタデータをYAML front matter（`---`区切り、キー: title, url, published_time, tokens, chars, total_chars, truncated）にして本文Markdownを続ける。切り詰め時はtruncated: trueに加え、markdownと同じフッタ行を本文末尾に付ける。
+同じメタデータをYAML front matter（`---`区切り、キー: title, url, published_time, chars, total_chars, truncated, render_status, suspected_block_page。published_timeは値があるときだけ、suspected_block_pageは検出したときだけ出す）にして本文Markdownを続ける。切り詰め時はtruncated: trueに加え、markdownと同じフッタ行を本文末尾に付ける。
 
 ### json
 
-`{"title", "url", "published_time", "tokens", "chars", "total_chars", "truncated", "ended", "continue_command", "short_content", "untrusted", "untrusted_note", "render_status", "static_chars", "rendered_chars", "markdown"}` のFirecrawl風エンベロープ（1行JSON）。`untrusted`は常にtrue、`untrusted_note`は`markdown`が非信頼の外部データである旨の短い説明で、構造化消費者へも非信頼シグナルを渡す（テキスト形式の`--fence`に相当）。切り詰め時はtruncated=trueかつcontinue_commandに継続コマンド全文を入れる。終端（--start-index末尾超過）はended=true・markdown空文字列・truncated=falseで表す。--max-chars=0はmarkdown空文字列・total_chars入りで表す（total取得用途）。--no-tokens時もtokensキーはnullにするがchars/total_charsは常に保持する。`render_status`（`static`/`rendered`/`failed`/`no-gain`/`skipped`）はfrontmatterにも同じキーで加える。`--render`明示時は`rendered`、既定の静的経路は`static`。`static_chars`と`rendered_chars`（可視テキスト長）は、`static_chars`が静的フェーズを実行したら常に値（`--render`明示時のみnull）、`rendered_chars`がrenderを実行してDOMを得たときのみ値（`rendered`/`no-gain`、および`--render`明示時。`static`/`skipped`/`failed`ではnull）を持つ。text/plainでは抽出HTMLが存在しないため、`static_chars`は本文の文字数になる。
+`{"title", "url", "published_time", "tokens", "chars", "total_chars", "truncated", "ended", "continue_command", "short_content", "suspected_block_page", "untrusted", "untrusted_note", "render_status", "static_chars", "rendered_chars", "markdown"}` のFirecrawl風エンベロープ（1行JSON）。`untrusted`は常にtrue、`untrusted_note`は`markdown`が非信頼の外部データである旨の短い説明で、構造化消費者へも非信頼シグナルを渡す（テキスト形式の`--fence`に相当）。切り詰め時はtruncated=trueかつcontinue_commandに継続コマンド全文を入れる。終端（--start-index末尾超過）はended=true・markdown空文字列・truncated=falseで表す。--max-chars=0はmarkdown空文字列・total_chars入りで表す（total取得用途）。--no-tokens時もtokensキーはnullにするがchars/total_charsは常に保持する。`render_status`（`static`/`rendered`/`failed`/`no-gain`/`skipped`）はfrontmatterにも同じキーで加える。`--render`明示時は`rendered`、既定の静的経路は`static`。`suspected_block_page`は検出時に一致した定型句、それ以外はnullで、検出時はfrontmatterにも同じキーで加える。`static_chars`と`rendered_chars`（可視テキスト長）は、`static_chars`が静的フェーズを実行したら常に値（`--render`明示時のみnull）、`rendered_chars`がrenderを実行してDOMを得たときのみ値（`rendered`/`no-gain`、および`--render`明示時。`static`/`skipped`/`failed`ではnull）を持つ。text/plainでは抽出HTMLが存在しないため、`static_chars`は本文の文字数になる。
 
 ### text / html
 
-textはMarkdown変換のかわりにタグ除去テキスト、htmlは抽出後（--raw時は取得まま）のHTMLを出す。メタデータヘッダは付けない。text/plainはこのhtml形式の定義の例外で、抽出やタグ除去を経ないため、既定・--raw・text・htmlのどの形式でも同じ素通しテキストを出す。切り詰め時はmarkdownと同じ`[webgrab:truncated ...]`行を末尾に付ける（htmlではHTMLコメントとして付ける）。終端フッタ`[webgrab:end ...]`も同様に末尾（htmlはコメント）に付ける。--max-chars=0はtext/htmlでは本文が空になるため、`[webgrab:meta-only total N chars]`の1行（htmlはコメント）を出しstderrにも注記する。ただしこの1行の直後に`[webgrab:render-status ...]`行が続きうる（`render_status`が`failed`/`no-gain`/`skipped`のとき）ため、text/htmlのstdout末尾が必ず1行だけとは限らない。
+textはMarkdown変換のかわりにタグ除去テキスト、htmlは抽出後（--raw時は取得まま）のHTMLを出す。メタデータヘッダは付けない。text/plainはこのhtml形式の定義の例外で、抽出やタグ除去を経ないため、既定・--raw・text・htmlのどの形式でも同じ素通しテキストを出す。切り詰め時はmarkdownと同じ`[webgrab:truncated ...]`行を末尾に付ける（htmlではHTMLコメントとして付ける）。終端フッタ`[webgrab:end ...]`も同様に末尾（htmlはコメント）に付ける。--max-chars=0はtext/htmlでは本文が空になるため、`[webgrab:meta-only total N chars]`の1行（htmlはコメント）を出しstderrにも注記する。ただしこの1行の直後に`[webgrab:suspected-block-page ...]`行（ブロック画面を疑ったとき）と`[webgrab:render-status ...]`行（`render_status`が`failed`/`no-gain`/`skipped`のとき）が続きうるため、text/htmlのstdout末尾が必ず1行だけとは限らない。
 
 ### links
 
@@ -198,7 +199,7 @@ textはMarkdown変換のかわりにタグ除去テキスト、htmlは抽出後�
 
 ### render_status行と`[webgrab:render-status ...]`
 
-JSONエンベロープとfrontmatterに`render_status`（`static`/`rendered`/`failed`/`no-gain`/`skipped`）と、可視テキスト長`static_chars`/`rendered_chars`を追加する。markdown/text/html/linksでは`render_status`が`failed`/`no-gain`/`skipped`のときだけ、既存マーカーと同じ書式の`[webgrab:render-status <status> reason=<token>]`（`reason`は`failed`が`render|max-bytes|extract`、`skipped`が`timeout|max-bytes`、`no-gain`が`shorter`）を1行付ける（htmlはコメント。本文側の閉じ忘れ`<!--`にマーカーが飲み込まれないよう、マーカー群の直前に`-->`を1つ出す）。位置は`--fence`の閉じ行の外側で、出力順は「本文（フェンス内） → フェンス閉じ → `[webgrab:truncated ...]`または`[webgrab:end ...]` → `[webgrab:short-content ...]` → `[webgrab:render-status ...]`」に固定する。webgrab自身が生成する行なので偽造無害化の対象外（本文側の同名文字列は従来どおり`[quoted-webgrab:`になる）。--max-chars=0でもこの行は出す。`static`/`rendered`では行を増やさない。`-o`でファイル出力した場合はstdoutが空になるため、この行は出力ファイル側に入り、経路の判別はstderrか出力ファイルで行う。
+JSONエンベロープとfrontmatterに`render_status`（`static`/`rendered`/`failed`/`no-gain`/`skipped`）と、可視テキスト長`static_chars`/`rendered_chars`を追加する。markdown/text/html/linksでは`render_status`が`failed`/`no-gain`/`skipped`のときだけ、既存マーカーと同じ書式の`[webgrab:render-status <status> reason=<token>]`（`reason`は`failed`が`render|max-bytes|extract`、`skipped`が`timeout|max-bytes`、`no-gain`が`shorter`）を1行付ける（htmlはコメント。本文側の閉じ忘れ`<!--`にマーカーが飲み込まれないよう、マーカー群の直前に`-->`を1つ出す）。位置は`--fence`の閉じ行の外側で、出力順は「本文（フェンス内） → フェンス閉じ → `[webgrab:truncated ...]`または`[webgrab:end ...]` → `[webgrab:short-content ...]` → `[webgrab:suspected-block-page ...]` → `[webgrab:render-status ...]`」に固定する。webgrab自身が生成する行なので偽造無害化の対象外（本文側の同名文字列は従来どおり`[quoted-webgrab:`になる）。--max-chars=0でもこの行は出す。`static`/`rendered`では行を増やさない。`-o`でファイル出力した場合はstdoutが空になるため、この行は出力ファイル側に入り、経路の判別はstderrか出力ファイルで行う。
 
 ### --no-tokensとchars/totalの保持
 

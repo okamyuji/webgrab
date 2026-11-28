@@ -284,6 +284,98 @@ pub fn short_static() -> Route {
     )
 }
 
+/// 200で返るbot判定画面（約250字の英文）。
+pub fn block_page() -> Route {
+    Route::html(
+        "/blocked",
+        page(
+            "Just a moment...",
+            "<main><h1>One more step</h1><p>We need to verify you are human before you can open this page. \
+             This check runs automatically and usually finishes within a few seconds. Keep this tab open, \
+             make sure cookies and JavaScript are enabled, and the page will reload on its own as soon as \
+             the check succeeds. Contact the site owner if this keeps happening.</p></main>",
+        ),
+    )
+}
+
+/// bot判定の語を含む2,500字以上の解説記事。
+pub fn long_captcha_article() -> Route {
+    let para = "<p>Some sites show a page that says checking your browser before they let a visitor in. \
+                This article explains how those interstitial pages work, why operators deploy them, and \
+                what an automated client can do when it meets one during an ordinary fetch.</p>";
+    Route::html(
+        "/captcha-article",
+        page(
+            "How bot checks work",
+            &format!(
+                "<article><h1>How bot checks work</h1>{}</article>",
+                para.repeat(12)
+            ),
+        ),
+    )
+}
+
+const FILLER: &str = "Members get early access to new chapters, a reading list that syncs across devices, \
+                      and a weekly digest of stories picked by our editors. ";
+
+/// タイトルに語が無く、本文の先頭だけに語があるログイン壁。
+pub fn body_only_wall() -> Route {
+    Route::html(
+        "/body-only",
+        page(
+            "The Weekly Story",
+            &format!(
+                "<main><p>Sign in to continue reading this story.</p><p>{}</p></main>",
+                FILLER.repeat(3)
+            ),
+        ),
+    )
+}
+
+/// 定型句の途中にリンクがあるログイン壁。markdownでは`[log in](url)`に分かれる。
+pub fn link_wall() -> Route {
+    Route::html(
+        "/link-wall",
+        page(
+            "Members",
+            &format!(
+                "<main><p>Please <a href=\"/login\">log in</a> to continue reading.</p><p>{}</p></main>",
+                FILLER.repeat(2)
+            ),
+        ),
+    )
+}
+
+/// 可視テキストは2,000字未満だが、タグを含めたHTMLは2,000字を超えるログイン壁。
+pub fn tag_heavy_wall() -> Route {
+    let rows = "<tr><td><span class=\"plan-name\"><em>Plan</em></span></td><td><span class=\"plan-price\"><em>$5</em></span></td></tr>"
+        .repeat(40);
+    Route::html(
+        "/tag-heavy",
+        page(
+            "Account",
+            &format!(
+                "<main><p>You need to log in to continue. {}</p><table>{rows}</table></main>",
+                FILLER.repeat(2)
+            ),
+        ),
+    )
+}
+
+/// 画像のaltにだけ定型句がある普通の短いページ。
+pub fn alt_only_page() -> Route {
+    Route::html(
+        "/alt-only",
+        page(
+            "Shop",
+            &format!(
+                "<main><img src=\"/i.png\" alt=\"Are you a robot illustration\"><p>{}</p></main>",
+                FILLER.repeat(3)
+            ),
+        ),
+    )
+}
+
 pub fn big_gzip() -> Route {
     Route {
         path: "/big_gzip",
