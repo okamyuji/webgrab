@@ -1091,7 +1091,7 @@ fn block_server() -> common::Server {
         common::alt_only_page(),
         common::Route {
             content_type: "text/plain; charset=utf-8",
-            ..common::Route::html("/denied.txt", "Access denied")
+            ..common::Route::html("/denied.txt", "Just a moment...")
         },
     ])
 }
@@ -1232,7 +1232,7 @@ fn plain_and_raw_not_flagged() {
     let (code, stdout, stderr) =
         run_webgrab(&[&s.url("/denied.txt"), "--allow-private", "--no-robots"]);
     assert_eq!(code, 0, "stderr={stderr}");
-    assert!(stdout.contains("Access denied"), "stdout={stdout}");
+    assert!(stdout.contains("Just a moment..."), "stdout={stdout}");
     assert!(!stderr.contains("suspected-block-page"), "stderr={stderr}");
     let (code, stdout, stderr) = run_webgrab(&[
         &s.url("/blocked"),

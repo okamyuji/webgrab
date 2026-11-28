@@ -306,16 +306,22 @@ pub fn visible_text_len(html: &str) -> usize {
 /// 空白の連続を半角空白1つに畳んでtrimする。リンク先や画像URLやaltは含まない。失敗しない。
 /// タグ境界に空白を挿入して、隣接する要素のテキストが単語として混在しないようにする。
 pub fn visible_text(html: &str) -> String {
-    strip_tags(&strip_non_content(html))
+    let decoded = strip_tags(&strip_non_content(html))
         .replace("&nbsp;", " ")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
-        .replace("&amp;", "&")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+        .replace("&amp;", "&");
+    // 大きなページで語ごとのVecを作らないよう、畳みながら直接書き込む。
+    let mut out = String::with_capacity(decoded.len());
+    for word in decoded.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out
 }
 
 /// コメントを中身ごと、タグを空白1つに置き換える。
@@ -375,9 +381,10 @@ mod tests {
     }
 
     #[test]
-    fn visible_text_len_counts_visible_text_chars() {
-        let html = "<p>Please <b>sign</b>\n in</p><script>x()</script>";
-        assert_eq!(visible_text_len(html), visible_text(html).chars().count());
+    fn visible_text_len_collapses_unicode_spaces_and_counts_chars() {
+        assert_eq!(visible_text_len("\u{a0}a\u{a0}b "), 3);
+        assert_eq!(visible_text_len(" &nbsp; "), 0);
+        assert_eq!(visible_text_len("<p>あい\n\n う</p>"), 4);
     }
 
     fn nested_divs(depth: usize) -> String {

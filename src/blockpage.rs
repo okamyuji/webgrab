@@ -6,6 +6,7 @@ pub const MAX_CHARS: usize = 2000;
 /// タイトルと本文のどちらで一致しても検出する語。
 const MARKERS: &[&str] = &[
     "just a moment...",
+    "just a moment…",
     "checking your browser",
     "attention required! | cloudflare",
     "verify you are human",
@@ -25,7 +26,12 @@ pub fn detect(title: Option<&str>, text: &str) -> Option<&'static str> {
     if text.chars().count() >= MAX_CHARS {
         return None;
     }
-    let title = title.unwrap_or("").to_lowercase();
+    let title = title
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
     let text = text.to_lowercase();
     let anywhere = MARKERS
         .iter()
@@ -101,6 +107,28 @@ mod tests {
             detect(Some("Please log in | Example"), "x"),
             Some("please log in")
         );
+    }
+
+    #[test]
+    fn body_marker_wins_over_title_only_word() {
+        assert_eq!(
+            detect(Some("Access Denied"), "Just a moment..."),
+            Some("just a moment...")
+        );
+    }
+
+    #[test]
+    fn title_spaces_are_collapsed() {
+        assert_eq!(
+            detect(Some("Access\u{a0}Denied"), "x"),
+            Some("access denied")
+        );
+        assert_eq!(detect(Some("Please log\n  in"), "x"), Some("please log in"));
+    }
+
+    #[test]
+    fn detects_unicode_ellipsis() {
+        assert_eq!(detect(None, "Just a moment…"), Some("just a moment…"));
     }
 
     #[test]
