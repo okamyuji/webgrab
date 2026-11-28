@@ -1,5 +1,6 @@
 //! パイプライン結線（設計 08 §4.3）。静的フェーズ → エスカレーション判定 → renderフェーズ → 出力。
 
+use crate::blockpage;
 use crate::cli::{Cli, DEFAULT_WAIT_MS, FormatArg};
 use crate::error::{ExitCode, Result, WebgrabError};
 use crate::fetch::{self, FetchOptions};
@@ -440,6 +441,16 @@ fn is_short_content(route: Route, content_len: usize, total: usize) -> bool {
     route == Route::Extracted && content_len > 0 && total < SHORT_CONTENT_CHARS
 }
 
+/// 判定はスライス前の本文全体で行う。`--start-index`で続きを取っても結果を変えないため。
+fn block_page_warning(route: Route, title: Option<&str>, body: &str) -> Option<&'static str> {
+    if route != Route::Extracted {
+        return None;
+    }
+    let word = blockpage::detect(title, body)?;
+    eprintln!("webgrab: warn=suspected-block-page marker={word}");
+    Some(word)
+}
+
 /// 6〜8. 空本文チェック・文字量制御・通知・出力の組み立て。
 fn assemble(cli: &Cli, acq: Acquired, status: RenderStatus, chars: CharCounts) -> Result<String> {
     let stage = acq.stage;
@@ -475,6 +486,7 @@ fn assemble(cli: &Cli, acq: Acquired, status: RenderStatus, chars: CharCounts) -
             (None, "")
         };
 
+    let suspected_block_page = block_page_warning(stage.route, stage.title.as_deref(), &stage.body);
     let meta = Meta {
         title: stage.title,
         url: acq.final_url,
@@ -486,6 +498,7 @@ fn assemble(cli: &Cli, acq: Acquired, status: RenderStatus, chars: CharCounts) -
         render_status: status,
         static_chars: chars.static_chars,
         rendered_chars: chars.rendered_chars,
+        suspected_block_page,
     };
     let extra = cli::extra_flags(cli, status);
     Ok(output::render(

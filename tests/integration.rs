@@ -1080,3 +1080,102 @@ fn render_counts_the_robots_precheck_against_the_timeout() {
     assert_eq!(code, 3, "stderr={stderr}");
     assert!(stderr.contains("request timed out"), "stderr={stderr}");
 }
+
+fn block_server() -> common::Server {
+    common::start(vec![
+        common::block_page(),
+        common::long_captcha_article(),
+        common::Route {
+            content_type: "text/plain; charset=utf-8",
+            ..common::Route::html("/denied.txt", "Access denied")
+        },
+    ])
+}
+
+#[test]
+fn block_page_warns_but_returns_body() {
+    let s = block_server();
+    let (code, stdout, stderr) =
+        run_webgrab(&[&s.url("/blocked"), "--allow-private", "--no-robots"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(
+        stderr.contains("webgrab: warn=suspected-block-page marker=just a moment..."),
+        "stderr={stderr}"
+    );
+    assert!(stdout.contains("verify you are human"), "stdout={stdout}");
+    assert!(
+        stdout.contains("[webgrab:suspected-block-page marker=\"just a moment...\""),
+        "stdout={stdout}"
+    );
+}
+
+#[test]
+fn block_page_json_field() {
+    let s = block_server();
+    for extra in [&[][..], &["--max-chars", "0"][..]] {
+        let mut args = vec![s.url("/blocked")];
+        args.extend(["--allow-private", "--no-robots", "--format", "json"].map(String::from));
+        args.extend(extra.iter().map(|a| a.to_string()));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (code, stdout, stderr) = run_webgrab(&args);
+        assert_eq!(code, 0, "stderr={stderr}");
+        let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json");
+        assert_eq!(
+            v["suspected_block_page"], "just a moment...",
+            "{extra:?} {stdout}"
+        );
+    }
+}
+
+#[test]
+fn block_page_judged_on_whole_body() {
+    let s = block_server();
+    let (code, _, stderr) = run_webgrab(&[
+        &s.url("/blocked"),
+        "--allow-private",
+        "--no-robots",
+        "--start-index",
+        "100",
+    ]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(
+        stderr.contains("warn=suspected-block-page"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn long_article_not_flagged() {
+    let s = block_server();
+    let url = s.url("/captcha-article");
+    let (code, stdout, stderr) = run_webgrab(&[&url, "--allow-private", "--no-robots"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(stdout.contains("checking your browser"), "stdout={stdout}");
+    assert!(!stderr.contains("suspected-block-page"), "stderr={stderr}");
+    let (_, stdout, _) = run_webgrab(&[&url, "--allow-private", "--no-robots", "--format", "json"]);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json");
+    assert!(v["suspected_block_page"].is_null(), "{stdout}");
+}
+
+#[test]
+fn plain_and_raw_not_flagged() {
+    let s = block_server();
+    let (code, stdout, stderr) =
+        run_webgrab(&[&s.url("/denied.txt"), "--allow-private", "--no-robots"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(stdout.contains("Access denied"), "stdout={stdout}");
+    assert!(!stderr.contains("suspected-block-page"), "stderr={stderr}");
+    let (code, stdout, stderr) = run_webgrab(&[
+        &s.url("/blocked"),
+        "--allow-private",
+        "--no-robots",
+        "--raw",
+    ]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(stdout.contains("Just a moment..."), "stdout={stdout}");
+    assert!(!stderr.contains("suspected-block-page"), "stderr={stderr}");
+    assert!(
+        !stdout.contains("[webgrab:suspected-block-page"),
+        "stdout={stdout}"
+    );
+}

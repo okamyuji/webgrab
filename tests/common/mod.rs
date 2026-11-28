@@ -284,6 +284,37 @@ pub fn short_static() -> Route {
     )
 }
 
+/// 200で返るbot判定画面（約250字の英文）。
+pub fn block_page() -> Route {
+    Route::html(
+        "/blocked",
+        page(
+            "Just a moment...",
+            "<main><h1>One more step</h1><p>We need to verify you are human before you can open this page. \
+             This check runs automatically and usually finishes within a few seconds. Keep this tab open, \
+             make sure cookies and JavaScript are enabled, and the page will reload on its own as soon as \
+             the check succeeds. Contact the site owner if this keeps happening.</p></main>",
+        ),
+    )
+}
+
+/// bot判定の語を含む2,500字以上の解説記事。
+pub fn long_captcha_article() -> Route {
+    let para = "<p>Some sites show a page that says checking your browser before they let a visitor in. \
+                This article explains how those interstitial pages work, why operators deploy them, and \
+                what an automated client can do when it meets one during an ordinary fetch.</p>";
+    Route::html(
+        "/captcha-article",
+        page(
+            "How bot checks work",
+            &format!(
+                "<article><h1>How bot checks work</h1>{}</article>",
+                para.repeat(12)
+            ),
+        ),
+    )
+}
+
 pub fn big_gzip() -> Route {
     Route {
         path: "/big_gzip",
