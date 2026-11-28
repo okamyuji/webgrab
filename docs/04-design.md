@@ -181,7 +181,7 @@ Markdown Content:
 
 ### frontmatter
 
-同じメタデータをYAML front matter（`---`区切り、キー: title, url, published_time, tokens, chars, total_chars, truncated）にして本文Markdownを続ける。切り詰め時はtruncated: trueに加え、markdownと同じフッタ行を本文末尾に付ける。
+同じメタデータをYAML front matter（`---`区切り、キー: title, url, published_time, chars, total_chars, truncated, render_status, suspected_block_page。published_timeは値があるときだけ、suspected_block_pageは検出したときだけ出す）にして本文Markdownを続ける。切り詰め時はtruncated: trueに加え、markdownと同じフッタ行を本文末尾に付ける。
 
 ### json
 
@@ -199,7 +199,7 @@ textはMarkdown変換のかわりにタグ除去テキスト、htmlは抽出後�
 
 ### render_status行と`[webgrab:render-status ...]`
 
-JSONエンベロープとfrontmatterに`render_status`（`static`/`rendered`/`failed`/`no-gain`/`skipped`）と、可視テキスト長`static_chars`/`rendered_chars`を追加する。markdown/text/html/linksでは`render_status`が`failed`/`no-gain`/`skipped`のときだけ、既存マーカーと同じ書式の`[webgrab:render-status <status> reason=<token>]`（`reason`は`failed`が`render|max-bytes|extract`、`skipped`が`timeout|max-bytes`、`no-gain`が`shorter`）を1行付ける（htmlはコメント。本文側の閉じ忘れ`<!--`にマーカーが飲み込まれないよう、マーカー群の直前に`-->`を1つ出す）。位置は`--fence`の閉じ行の外側で、出力順は「本文（フェンス内） → フェンス閉じ → `[webgrab:truncated ...]`または`[webgrab:end ...]` → `[webgrab:short-content ...]` → `[webgrab:render-status ...]`」に固定する。webgrab自身が生成する行なので偽造無害化の対象外（本文側の同名文字列は従来どおり`[quoted-webgrab:`になる）。--max-chars=0でもこの行は出す。`static`/`rendered`では行を増やさない。`-o`でファイル出力した場合はstdoutが空になるため、この行は出力ファイル側に入り、経路の判別はstderrか出力ファイルで行う。
+JSONエンベロープとfrontmatterに`render_status`（`static`/`rendered`/`failed`/`no-gain`/`skipped`）と、可視テキスト長`static_chars`/`rendered_chars`を追加する。markdown/text/html/linksでは`render_status`が`failed`/`no-gain`/`skipped`のときだけ、既存マーカーと同じ書式の`[webgrab:render-status <status> reason=<token>]`（`reason`は`failed`が`render|max-bytes|extract`、`skipped`が`timeout|max-bytes`、`no-gain`が`shorter`）を1行付ける（htmlはコメント。本文側の閉じ忘れ`<!--`にマーカーが飲み込まれないよう、マーカー群の直前に`-->`を1つ出す）。位置は`--fence`の閉じ行の外側で、出力順は「本文（フェンス内） → フェンス閉じ → `[webgrab:truncated ...]`または`[webgrab:end ...]` → `[webgrab:short-content ...]` → `[webgrab:suspected-block-page ...]` → `[webgrab:render-status ...]`」に固定する。webgrab自身が生成する行なので偽造無害化の対象外（本文側の同名文字列は従来どおり`[quoted-webgrab:`になる）。--max-chars=0でもこの行は出す。`static`/`rendered`では行を増やさない。`-o`でファイル出力した場合はstdoutが空になるため、この行は出力ファイル側に入り、経路の判別はstderrか出力ファイルで行う。
 
 ### --no-tokensとchars/totalの保持
 
