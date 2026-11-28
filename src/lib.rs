@@ -1,5 +1,6 @@
 //! webgrab — LLM向けWeb情報取得ライブラリ（設計 docs/04-design.md v1.2）。
 
+pub mod blockpage;
 pub mod budget;
 pub mod cli;
 pub mod content_encoding;
